@@ -125,7 +125,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -A
 | 退出码 3 | `Get-NetTCPConnection -LocalPort 3091 -State Listen` 找到占用进程 |
 | 退出码 4 | 检查数据目录权限与路径是否被文件占用 |
 | 退出码 5 | 查看日志中的 `eventId=1103`，确认 `devhub.db` 未被其他进程锁死 |
-| 扩展无通知 | 确认 `lm-bridge.json` 存在、`runtime.json` 的 `apiEnabled=true` |
+| 扩展无通知 | 确认扩展设置 `devhub.notifications.enabled=true`（默认关闭）且 `runtime.json` 的 `apiEnabled=true`；上次已提醒的序号存在扩展 `globalState` 的 `devhub.noticeSeq` |
+| 扩展桥未启动（`vscode:down`） | `vscode.lm` 没有可用模型：在 VS Code 中登录 GitHub Copilot 后重载窗口，`lm-bridge.json` 才会写出 |
 
 ### 3.3 性能与体积基线（实测）
 
@@ -145,7 +146,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -A
 2. **MCP 端点无静态令牌**：Agent Plugins 规范不作用 `url`/`headers` 占位符，只能依赖"仅回环 + Host/Origin 校验"。
 3. **扩展需单独安装**：插件规范无法下发 VS Code 扩展，`vscode.lm` 桥与通知依赖 `devhub-bridge` VSIX。
 4. **真实模型调用未验证**：本机未配置 `DEVHUB_OPENAI_API_KEY`，真实 OpenAI 兼容端点回合未实测；无凭据时 `scheduler_status` 会显示 `openai:auth`，这是预期行为，不用假 provider 冒充通过。
-5. **`vscode` provider 依赖窗口**：未激活扩展时 `vscode:down`，Chat 内手动触发不可用；定时任务默认走 `openai`，不依赖窗口。
+5. **`vscode` provider 依赖窗口与模型**：未激活扩展、或 `vscode.lm` 没有可用模型（例如未登录 GitHub Copilot）时 `vscode:down`，不会写出 `lm-bridge.json`；定时任务默认走 `openai`，不依赖窗口。
 6. **未启用裁剪**：`PublishTrimmed` 与反射/序列化路径冲突，当前只评估不启用；R2R 会增大体积，未采用。
 7. **无 Web 面板**：本期只提供 MCP 工具面、技能与 VS Code 原生通知。
 
@@ -163,3 +164,31 @@ node scripts/smoke-mcp.mjs          # 真实 MCP 握手 + tools/list + tools/cal
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -Action stop
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -Action drill
 ```
+
+---
+
+## 6. 验证状态
+
+记录基线：Windows 11 + .NET SDK 10.0.401 + VS Code Stable 1.145.2，2026-11-07。
+
+### 6.1 已真实验证
+
+- `dotnet build DevHubd.sln`：0 警告 0 错误；`dotnet test`：92/92 通过（xUnit v3 + Microsoft.Testing.Platform，0 跳过）。
+- `node scripts/validate-plugin.mjs`（4 项 PASS）、`node scripts/check-encoding.mjs`（126 个文件）、`node scripts/smoke-mcp.mjs`（真实握手 + `tools/list` + `tools/call` + `resources/read`）全部通过。
+- 按 §1.1 命令自包含发布：产物 103.7 MiB，`-Action start/status/stop` 与 MCP 冒烟连续走通（`startupMs=1966`，停止后 `runtime.json` 被移除、`status` 返回 3）。
+- 退出码真机复跑：已有实例运行再启动 → 2；先占用 3091 再启动 → 3。
+- VSIX 安装到 VS Code Stable：`code --install-extension` 成功，扩展宿主日志出现 `_doActivateExtension userdrive.devhub-bridge, activationEvent: 'onStartupFinished'`，无报错。
+- 通知闭环：向 `notice` 表造 3 条新通知，VS Code 通知中心各弹一次且标题不重复；ack 后数据库 `acked_at` 写入、`globalState["devhub.noticeSeq"]` 从 0 推进到 3；随后用 `sinceSeq=0` 查询不再返回已确认项。
+- 守护进程侧 `/health` + pid 校验：发现文件 pid 与桥 pid 一致 → `providers = vscode:ready`；把发现文件 pid 改为 30929 → `provider=vscode state=down detail=发现文件 pid=30929 与桥实际 pid=30928 不一致，判定为残留文件`。
+
+### 6.2 仅单测覆盖
+
+- 退出码 4（数据目录不可写）与 5（迁移失败）：`StartupExitCodeTests` 覆盖，未在真机复现。
+- 单实例租约续期/接管、停机租约、调度扫描增量与 reconcile、队列流转、回合超时与取消、熔断状态机、路径守卫、工具 schema 快照、日志 EventId 与字段断言。
+- 性能基线（1000 任务 reconcile 约 319 ms、`queue_list` 一页约 5.5 ms）由 `P4PerformanceTests` 固化，属测试环境测量值。
+
+### 6.3 缺外部条件（未验证）
+
+- **真实 OpenAI 兼容回合**：本机无 `DEVHUB_OPENAI_API_KEY`，`scheduler_status` 显示 `openai:auth`。需要提供该环境变量（必要时同时配置 `Model:OpenAi:BaseUrl` / `Model`）后重跑一次真实回合，记录输入输出与耗时。
+- **真实 `vscode.lm` 回合桥**：扩展已安装并激活，但本机 VS Code 未登录 GitHub Copilot，`vscode.lm` 无可用模型，因此未写出 `lm-bridge.json`；上文的 `/health` + pid 校验是用本地桩端点验证守护进程侧逻辑，不代表真实桥可用。登录 Copilot 并重载窗口后可复测。
+- **插件包安装**：`Chat: Install Plugin from Source` 无法通过 CLI 自动化，未在真机执行；`plugin/` 已通过 `validate-plugin.mjs` 静态校验。
