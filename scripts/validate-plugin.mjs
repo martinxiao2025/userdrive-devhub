@@ -297,7 +297,7 @@ function validatePackageContents() {
   for (const name of forbidden) {
     if (existsSync(join(pluginDir, name))) fail(`plugin/ 不得包含 ${name}/`);
   }
-  if (existsSync(join(pluginDir, 'Devhubd.sln'))) fail('plugin/ 不得包含解决方案文件');
+  if (existsSync(join(pluginDir, 'DevHubd.sln'))) fail('plugin/ 不得包含解决方案文件');
 
   for (const entry of readdirSync(pluginDir, { withFileTypes: true })) {
     const allowedRoots = new Set(['plugin.json', 'mcp.json', 'skills']);

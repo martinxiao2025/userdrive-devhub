@@ -111,25 +111,79 @@ async function notifyInitialized() {
   });
 }
 
-/** 主流程：握手 → 列工具 → 调 scheduler_status → 断言结构。 */
+/** 期望的工具名（P3 工具面）。 */
+const EXPECTED_TOOLS = [
+  'dispatch_now',
+  'queue_get',
+  'queue_list',
+  'result_ack',
+  'result_list',
+  'scheduler_control',
+  'scheduler_status',
+];
+
+/** 期望的只读资源 URI（P3 资源面）。 */
+const EXPECTED_RESOURCES = [
+  'devhub://limits',
+  'devhub://results/unread',
+  'devhub://scheduler/queue',
+  'devhub://scheduler/status',
+  'devhub://tasks',
+];
+
+/** 摘要前缀；每个工具结果的最后一个文本块都必须是它。 */
+const DIGEST_PREFIX = '— devhub · ';
+
+/**
+ * 从 tools/call 结果中取正文（第一个文本块），并断言尾部摘要存在且不超过 240 字符。
+ * @param {any} result tools/call 的 result
+ * @param {string} toolName 工具名（用于错误信息）
+ * @returns {string} 正文文本
+ */
+function assertToolResult(result, toolName) {
+  const blocks = (result?.content ?? []).filter((item) => item.type === 'text');
+  if (blocks.length < 2) {
+    throw new Error(`${toolName} 缺少尾部摘要块（实际文本块 ${blocks.length} 个）`);
+  }
+
+  const digest = blocks[blocks.length - 1].text;
+  if (!digest.startsWith(DIGEST_PREFIX)) {
+    throw new Error(`${toolName} 摘要块格式不符：${digest.slice(0, 60)}`);
+  }
+  if (digest.length > 240) {
+    throw new Error(`${toolName} 摘要长度 ${digest.length} 超过 240`);
+  }
+
+  return blocks[0].text;
+}
+
+/** 主流程：握手 → 列工具/资源 → 调状态与队列 → 断言结构。 */
 async function main() {
   const init = await waitForServer();
   console.log(`initialize OK：server=${init?.serverInfo?.name}@${init?.serverInfo?.version} protocol=${init?.protocolVersion}`);
   await notifyInitialized();
 
   const tools = await request('tools/list', {});
-  const names = (tools?.tools ?? []).map((tool) => tool.name);
+  const names = (tools?.tools ?? []).map((tool) => tool.name).sort();
   if (names.length === 0) throw new Error('tools/list 返回空');
-  if (!names.includes('scheduler_status')) throw new Error(`缺少 scheduler_status，实际：${names.join(', ')}`);
+  if (JSON.stringify(names) !== JSON.stringify(EXPECTED_TOOLS)) {
+    throw new Error(`tools/list 不符合预期：${names.join(', ')}`);
+  }
   console.log(`tools/list OK：${names.join(', ')}`);
+
+  const resources = await request('resources/list', {});
+  const uris = (resources?.resources ?? []).map((resource) => resource.uri).sort();
+  if (JSON.stringify(uris) !== JSON.stringify(EXPECTED_RESOURCES)) {
+    throw new Error(`resources/list 不符合预期：${uris.join(', ')}`);
+  }
+  console.log(`resources/list OK：${uris.join(', ')}`);
 
   const statusTool = tools.tools.find((tool) => tool.name === 'scheduler_status');
   const verbose = statusTool?.inputSchema?.properties?.verbose;
   if (!verbose || verbose.type !== 'boolean') throw new Error('scheduler_status.inputSchema 缺少 boolean verbose');
 
   const call = await request('tools/call', { name: 'scheduler_status', arguments: {} });
-  const text = call?.content?.find((item) => item.type === 'text')?.text;
-  if (!text) throw new Error('scheduler_status 未返回 text 内容');
+  const text = assertToolResult(call, 'scheduler_status');
 
   const snapshot = JSON.parse(text);
   for (const key of ['enabled', 'mode', 'phase', 'intervalSeconds', 'queue', 'providers', 'mcp', 'host', 'unread']) {
@@ -137,9 +191,35 @@ async function main() {
   }
   if (snapshot.mcp?.port !== 3091) throw new Error(`mcp.port 应为 3091，实际：${snapshot.mcp?.port}`);
   if (snapshot.mode !== 'dispatch_only') throw new Error(`默认档位应为 dispatch_only，实际：${snapshot.mode}`);
+  if (!Array.isArray(snapshot.providers) || snapshot.providers.length !== 2) {
+    throw new Error(`providers 应包含 openai 与 vscode 两项，实际：${JSON.stringify(snapshot.providers)}`);
+  }
 
   console.log(`tools/call OK：mode=${snapshot.mode} phase=${snapshot.phase} mcp.port=${snapshot.mcp.port} schema=v${snapshot.host?.schemaVersion}`);
-  console.log(`scheduler_status = ${text}`);
+  console.log(`providers = ${snapshot.providers.map((item) => `${item.provider}:${item.state}`).join(', ')}`);
+
+  const queue = await request('tools/call', { name: 'queue_list', arguments: { limit: 5 } });
+  const page = JSON.parse(assertToolResult(queue, 'queue_list'));
+  if (!Array.isArray(page.items)) throw new Error('queue_list 返回体缺少 items 数组');
+  console.log(`queue_list OK：items=${page.items.length} nextCursor=${page.nextCursor ?? 'null'}`);
+
+  const results = await request('tools/call', { name: 'result_list', arguments: { unreadOnly: true, limit: 5 } });
+  const resultPage = JSON.parse(assertToolResult(results, 'result_list'));
+  if (!Array.isArray(resultPage.items)) throw new Error('result_list 返回体缺少 items 数组');
+  console.log(`result_list OK：items=${resultPage.items.length} nextCursor=${resultPage.nextCursor ?? 'null'}`);
+
+  const control = await request('tools/call', { name: 'scheduler_control', arguments: { action: 'status' } });
+  const controlSnapshot = JSON.parse(assertToolResult(control, 'scheduler_control'));
+  if (typeof controlSnapshot.enabled !== 'boolean') throw new Error('scheduler_control.status 缺少 enabled');
+  console.log(`scheduler_control OK：action=status enabled=${controlSnapshot.enabled} mode=${controlSnapshot.mode}`);
+
+  const statusResource = await request('resources/read', { uri: 'devhub://scheduler/status' });
+  const resourceText = statusResource?.contents?.[0]?.text;
+  if (!resourceText) throw new Error('resources/read 未返回内容');
+  const resourceSnapshot = JSON.parse(resourceText);
+  if (resourceSnapshot.mcp?.port !== 3091) throw new Error('devhub://scheduler/status 的 mcp.port 不为 3091');
+  console.log('resources/read OK：devhub://scheduler/status');
+
   console.log('\nMCP 冒烟通过。');
 }
 
