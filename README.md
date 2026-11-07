@@ -90,7 +90,88 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -A
 - **API key 只从环境变量读取**：默认变量名 `DEVHUB_OPENAI_API_KEY`（可用 `Model:OpenAi:ApiKeyEnvironmentVariable` 改名）。
 - 配置文件出现 `apiKey` 明文字段会被拒绝并记录 Warning，key 不会落盘、不会进日志。
 
-### 2.4 日志
+### 2.4 配置模型供应商
+
+模型配置**只**来自用户级配置文件与环境变量；`appsettings.json` 只有 `Logging` 与 `AllowedHosts`，不承载模型配置，写进去不会生效。
+
+#### 2.4.1 配置项（准确键名与默认值）
+
+| 键（JSON 层级） | 环境变量覆盖 | 默认值 | 必填 |
+|---|---|---|---|
+| `Model:OpenAi:BaseUrl` | `DEVHUB__Model__OpenAi__BaseUrl` | `https://api.openai.com/v1` | 否 |
+| `Model:OpenAi:Model` | `DEVHUB__Model__OpenAi__Model` | `gpt-4.1-mini` | 否 |
+| `Model:OpenAi:ApiKeyEnvironmentVariable` | `DEVHUB__Model__OpenAi__ApiKeyEnvironmentVariable` | `DEVHUB_OPENAI_API_KEY` | 否 |
+| `Model:OpenAi:RequestTimeoutSeconds` | `DEVHUB__Model__OpenAi__RequestTimeoutSeconds` | `120`（限制 5–600） | 否 |
+| **API key 值**（存放在上面那一项命名的环境变量里） | — | 无 | **是**，缺失时 `scheduler_status` 显示 `openai:auth` |
+
+- 客户端请求地址是 `{BaseUrl}/chat/completions`，因此 `BaseUrl` 必须是 OpenAI 兼容端点根地址（末尾 `/` 会被自动去掉）。
+- 空字符串会回退到默认值；`RequestTimeoutSeconds` 超出 5–600 会被收敛到边界。
+- 必填的只有 **API key 的值**；其余四项不写就用默认值。
+
+#### 2.4.2 存放位置与优先级
+
+1. **程序目录 `appsettings.json`**：只有日志与 `AllowedHosts`，**不含模型配置**。
+2. **用户级配置文件**：`%LOCALAPPDATA%\userdrive-devhub\config.json`（用 `--data-dir` 或 `DEVHUB_DATA_DIR` 改数据目录时，路径变为 `<data-dir>\config.json`）。
+3. **环境变量 `DEVHUB__...`（双下划线）**：后加载，覆盖第 2 步 JSON 中的同名键。
+4. **API key 只从环境变量读取**：配置文件出现 `apiKey` / `openAiApiKey` / `api_key` 非空字符串会被忽略并记 Warning，key 不落盘、不进日志。
+5. **改完必须重启守护进程**：配置在启动时读取一次（`reloadOnChange=false`），key 也来自进程启动时继承的环境块。
+6. 注意：`config.json` 不存在时宿主直接使用内置默认值，`DEVHUB__...` 覆盖也不会被加载；先确保该文件存在（内容至少是 `{}`）。
+
+#### 2.4.3 设置示例（可直接复制）
+
+```powershell
+# 1) 用户级 API key：把 <YOUR_API_KEY> 换成真实值，不要提交进仓库
+[Environment]::SetEnvironmentVariable('DEVHUB_OPENAI_API_KEY','<YOUR_API_KEY>','User')
+
+# 2) baseUrl / model 的用户级覆盖（不设置则使用默认值）
+[Environment]::SetEnvironmentVariable('DEVHUB__Model__OpenAi__BaseUrl','https://api.openai.com/v1','User')
+[Environment]::SetEnvironmentVariable('DEVHUB__Model__OpenAi__Model','gpt-4.1-mini','User')
+
+# 3) 用户级配置文件（必须存在，DEVHUB__ 覆盖才会被加载；UTF-8 无 BOM）
+$dir = Join-Path $env:LOCALAPPDATA 'userdrive-devhub'
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$json = @'
+{
+  "Model": {
+    "OpenAi": {
+      "BaseUrl": "https://api.openai.com/v1",
+      "Model": "gpt-4.1-mini"
+    }
+  }
+}
+'@
+[IO.File]::WriteAllText((Join-Path $dir 'config.json'), $json, (New-Object System.Text.UTF8Encoding($false)))
+
+# 4) 重启守护进程。start 用 Start-Process 继承当前进程环境：
+#    若环境变量是在本窗口启动之后才写入的，先同步到进程级，或直接开一个新窗口执行。
+$env:DEVHUB_OPENAI_API_KEY = [Environment]::GetEnvironmentVariable('DEVHUB_OPENAI_API_KEY','User')
+$env:DEVHUB__Model__OpenAi__BaseUrl = [Environment]::GetEnvironmentVariable('DEVHUB__Model__OpenAi__BaseUrl','User')
+$env:DEVHUB__Model__OpenAi__Model = [Environment]::GetEnvironmentVariable('DEVHUB__Model__OpenAi__Model','User')
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -Action stop
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -Action start
+
+# 5) 确认生效：末行应打印 providers = openai:ready, vscode:down（vscode 视扩展状态而定）
+node scripts/smoke-mcp.mjs
+```
+
+在 Copilot Chat 中也可以直接调用 `scheduler_status`，检查 `providers[]` 里 `provider=openai` 的 `state` 与 `detail`：配置前是 `auth`（detail 为“未配置环境变量 DEVHUB_OPENAI_API_KEY”），配置并重启后变为 `ready`。仍为 `auth` 时，先确认当前终端是否继承到了新变量（新开窗口最稳妥），以及占位值是否已替换。
+
+| state | 含义 | 处理 |
+|---|---|---|
+| `ready` | 探测通过，可派发 | — |
+| `auth` | 缺少 API key，或 key 被端点拒绝（HTTP 401/403） | 设置/修正环境变量后重启 |
+| `down` | 端点不可达；`vscode` 还包含扩展桥未启动或 pid 不一致 | 检查 `BaseUrl` 与网络；`vscode` 见 §4 第 5 条 |
+| `no_model` | `vscode.lm` 没有可用模型 | 登录 GitHub Copilot 或选择模型后重载窗口 |
+
+#### 2.4.4 BYOK（openai）与 vscode.lm（vscode）的启用条件与优先级
+
+- 两个 provider **同时注册**（`openai` = BYOK 直连 OpenAI 兼容端点，`vscode` = 扩展的 `vscode.lm` 桥），执行时按队列项的 `preferred_provider` **精确取用**，不存在跨通道静默兜底。
+- **定时任务固定走 `openai`**：扫描入队时 `preferred_provider` 直接写 `'openai'`，与 `vscode` 是否可用无关。
+- **手动 `dispatch_now`**：`provider=auto` 时按 `openai` → `vscode` 选第一个 `ready` 且熔断关闭的；两者都不可用时回退 `openai` 入队；显式传 `openai` / `vscode` 时若该 provider 不可用会直接拒绝（`ProviderUnavailable`），不会自动换通道。
+- **`vscode` 就绪条件**：VS Code 已安装并激活 `devhub-bridge` 扩展，且 `vscode.lm` 有可用模型（例如已登录 GitHub Copilot）→ 扩展写出 `lm-bridge.json` → 宿主 `GET /health` 成功且返回 pid 与发现文件 pid 一致。任一环节不满足即为 `down`。
+- **单独说明**：`Execution:ScheduledProvider` 虽然存在于执行配置对象中，但当前**没有任何派发路径读取它**（定时任务入队时 provider 写死为 `openai`）。写它不会改变定时任务的 provider；要让某个任务走 `vscode`，只能用 `dispatch_now(provider:"vscode")` 手动派发。
+
+### 2.5 日志
 
 `appsettings.json` 的 `Logging` 节控制级别与格式，代码中不硬编码：
 
@@ -145,7 +226,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -A
 1. **机器级单实例**：同一台机器同时只允许一个宿主；多工作区由 `workspaces.json` 承载，不是多进程。
 2. **MCP 端点无静态令牌**：Agent Plugins 规范不作用 `url`/`headers` 占位符，只能依赖"仅回环 + Host/Origin 校验"。
 3. **扩展需单独安装**：插件规范无法下发 VS Code 扩展，`vscode.lm` 桥与通知依赖 `devhub-bridge` VSIX。
-4. **真实模型调用未验证**：本机未配置 `DEVHUB_OPENAI_API_KEY`，真实 OpenAI 兼容端点回合未实测；无凭据时 `scheduler_status` 会显示 `openai:auth`，这是预期行为，不用假 provider 冒充通过。
+4. **真实模型调用未验证**：本机未填入真实 key，真实 OpenAI 兼容端点回合未实测；配置步骤见 §2.4。注意占位值（如 `CHANGE_ME`）也算“已配置”，启动探测会显示 `openai:ready`，但真实回合会因 HTTP 401 失败并转回 `openai:auth`，所以必须以一次真实回合的结果为准，不用假 provider 冒充通过。
 5. **`vscode` provider 依赖窗口与模型**：未激活扩展、或 `vscode.lm` 没有可用模型（例如未登录 GitHub Copilot）时 `vscode:down`，不会写出 `lm-bridge.json`；定时任务默认走 `openai`，不依赖窗口。
 6. **未启用裁剪**：`PublishTrimmed` 与反射/序列化路径冲突，当前只评估不启用；R2R 会增大体积，未采用。
 7. **无 Web 面板**：本期只提供 MCP 工具面、技能与 VS Code 原生通知。
@@ -189,6 +270,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -A
 
 ### 6.3 缺外部条件（未验证）
 
-- **真实 OpenAI 兼容回合**：本机无 `DEVHUB_OPENAI_API_KEY`，`scheduler_status` 显示 `openai:auth`。需要提供该环境变量（必要时同时配置 `Model:OpenAi:BaseUrl` / `Model`）后重跑一次真实回合，记录输入输出与耗时。
+- **真实 OpenAI 兼容回合**：本机只配置了占位值（`DEVHUB_OPENAI_API_KEY=CHANGE_ME`），未填入真实 key，真实回合未执行；`scheduler_status` 的探测结果会因占位值显示 `openai:ready`，但不能作为端到端通过的证据。按 §2.4 换成真实 key 后重跑一次真实回合，记录输入输出与耗时，并确认不再是 `openai:auth`。
 - **真实 `vscode.lm` 回合桥**：扩展已安装并激活，但本机 VS Code 未登录 GitHub Copilot，`vscode.lm` 无可用模型，因此未写出 `lm-bridge.json`；上文的 `/health` + pid 校验是用本地桩端点验证守护进程侧逻辑，不代表真实桥可用。登录 Copilot 并重载窗口后可复测。
 - **插件包安装**：`Chat: Install Plugin from Source` 无法通过 CLI 自动化，未在真机执行；`plugin/` 已通过 `validate-plugin.mjs` 静态校验。
