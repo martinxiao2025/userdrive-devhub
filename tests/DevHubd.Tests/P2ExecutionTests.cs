@@ -295,7 +295,7 @@ public sealed class P2ExecutionTests : IDisposable
         foreach (var workspace in loaded.Workspaces)
         {
             await _scanner.ScanAsync(workspace, cancellationToken);
-            await _queue.EnqueueReadyTasksAsync(workspace.Id, dryRun: false, cancellationToken);
+            await _queue.EnqueueReadyTasksAsync(workspace.Id, "openai", dryRun: false, cancellationToken);
         }
     }
 

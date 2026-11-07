@@ -1,7 +1,9 @@
 using System.Text;
 using System.Text.Json;
+using DevHubd.Core.Execution;
 using DevHubd.Core.Providers;
 using DevHubd.Hosting;
+using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
 namespace DevHubd.Tests;
@@ -109,6 +111,72 @@ public sealed class UserConfigTests : IDisposable
         }
 
         Assert.Null(provider.GetApiKey());
+    }
+
+    /// <summary><c>Execution:ScheduledProvider</c> 绑定到执行配置；大小写不敏感。</summary>
+    [Fact]
+    public void Load_ScheduledProviderVscode_Binds()
+    {
+        var path = Path.Combine(_directory, "config.json");
+        File.WriteAllText(
+            path,
+            """
+            { "execution": { "scheduledProvider": "VSCODE" } }
+            """,
+            new UTF8Encoding(false));
+
+        var config = DevHubUserConfig.Load(path);
+
+        Assert.Empty(config.Problems);
+        Assert.Equal("vscode", config.Execution.ScheduledProvider);
+    }
+
+    /// <summary>非法 provider 回退 openai，并写入配置问题（启动时以 Warning 记录），不静默吞掉。</summary>
+    [Fact]
+    public void Load_InvalidScheduledProvider_FallsBackAndReports()
+    {
+        var path = Path.Combine(_directory, "config.json");
+        File.WriteAllText(
+            path,
+            """
+            { "execution": { "scheduledProvider": "gemini" } }
+            """,
+            new UTF8Encoding(false));
+
+        var config = DevHubUserConfig.Load(path);
+
+        Assert.Equal("openai", config.Execution.ScheduledProvider);
+        Assert.Single(config.Problems);
+        Assert.Contains("ScheduledProvider", config.Problems[0], StringComparison.Ordinal);
+        Assert.Contains("gemini", config.Problems[0], StringComparison.Ordinal);
+    }
+
+    /// <summary>占位 key 在探测阶段判为 auth 并给出明确 detail，不阻断启动。</summary>
+    [Fact]
+    public async Task ProbeAsync_PlaceholderApiKey_ReportsAuthAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var name = $"DEVHUB_TEST_KEY_{Guid.NewGuid():N}";
+        Environment.SetEnvironmentVariable(name, "CHANGE_ME");
+        try
+        {
+            using var http = new HttpClient();
+            var client = new OpenAiCompatibleModelClient(
+                http,
+                new OpenAiModelOptions { ApiKeyEnvironmentVariable = name },
+                new EnvironmentApiKeyProvider(name),
+                NullLogger<OpenAiCompatibleModelClient>.Instance);
+
+            var health = await client.ProbeAsync(ct);
+
+            Assert.False(health.Available);
+            Assert.Equal(ProviderStates.Auth, health.State);
+            Assert.Contains("占位", health.Detail, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(name, null);
+        }
     }
 
     /// <summary>配置文件不是合法 JSON 时不抛异常，按默认值继续。</summary>

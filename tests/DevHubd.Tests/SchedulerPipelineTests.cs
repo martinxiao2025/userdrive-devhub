@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using DevHubd.Core.Data;
+using DevHubd.Core.Execution;
 using DevHubd.Core.Providers;
 using DevHubd.Core.Queue;
 using DevHubd.Core.Scheduling;
@@ -44,6 +45,7 @@ public sealed class SchedulerPipelineTests : IDisposable
             new TaskScanner(_factory),
             _queue,
             _stateStore,
+            new ExecutionOptions(),
             NullLogger<SchedulerEngine>.Instance);
     }
 
@@ -235,6 +237,64 @@ public sealed class SchedulerPipelineTests : IDisposable
 
         Assert.Equal(DispatchStatus.SchedulerPaused, outcome.Status);
     }
+
+    /// <summary>默认配置（未写 Execution:ScheduledProvider）下，定时入队写 openai，与改动前行为一致。</summary>
+    [Fact]
+    public async Task TickAsync_DefaultScheduledProvider_EnqueuesOpenAiAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "默认 provider", "ready", 10);
+
+        await _engine.TickAsync(ct);
+
+        Assert.Equal(
+            new[] { "openai" },
+            await ReadColumnAsync("SELECT preferred_provider FROM queue_item;", ct));
+    }
+
+    /// <summary>显式配置 <c>Execution:ScheduledProvider=vscode</c> 时，定时入队写 vscode。</summary>
+    [Fact]
+    public async Task TickAsync_ScheduledProviderVscode_EnqueuesVscodeAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "vscode provider", "ready", 10);
+
+        await CreateEngine(new ExecutionOptions { ScheduledProvider = "vscode" }).TickAsync(ct);
+
+        Assert.Equal(
+            new[] { "vscode" },
+            await ReadColumnAsync("SELECT preferred_provider FROM queue_item;", ct));
+    }
+
+    /// <summary>非法 provider 回退 openai（不阻断扫描，也不把非法值写进队列）。</summary>
+    [Fact]
+    public async Task TickAsync_InvalidScheduledProvider_FallsBackToOpenAiAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "非法 provider", "ready", 10);
+
+        await CreateEngine(new ExecutionOptions { ScheduledProvider = "gemini" }).TickAsync(ct);
+
+        Assert.Equal(
+            new[] { "openai" },
+            await ReadColumnAsync("SELECT preferred_provider FROM queue_item;", ct));
+    }
+
+    /// <summary>用指定执行配置创建调度引擎（共享同一数据库与工作区清单）。</summary>
+    /// <param name="options">执行配置。</param>
+    private SchedulerEngine CreateEngine(ExecutionOptions options) => new(
+        _registry,
+        new TaskScanner(_factory),
+        _queue,
+        _stateStore,
+        options,
+        NullLogger<SchedulerEngine>.Instance);
 
     /// <summary>创建工作区根目录（含 .devhub/tasks）。</summary>
     /// <param name="id">工作区 id。</param>

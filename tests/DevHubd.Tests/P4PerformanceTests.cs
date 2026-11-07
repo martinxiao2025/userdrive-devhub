@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using DevHubd.Core.Data;
+using DevHubd.Core.Execution;
 using DevHubd.Core.Queue;
 using DevHubd.Core.Scheduling;
 using DevHubd.Core.Tasks;
@@ -41,6 +42,7 @@ public sealed class P4PerformanceTests : IDisposable
             new TaskScanner(_factory),
             _queue,
             new SchedulerStateStore(_factory),
+            new ExecutionOptions(),
             NullLogger<SchedulerEngine>.Instance);
 
         PrepareWorkspace();

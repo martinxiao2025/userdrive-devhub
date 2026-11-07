@@ -102,11 +102,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -A
 | `Model:OpenAi:Model` | `DEVHUB__Model__OpenAi__Model` | `gpt-4.1-mini` | 否 |
 | `Model:OpenAi:ApiKeyEnvironmentVariable` | `DEVHUB__Model__OpenAi__ApiKeyEnvironmentVariable` | `DEVHUB_OPENAI_API_KEY` | 否 |
 | `Model:OpenAi:RequestTimeoutSeconds` | `DEVHUB__Model__OpenAi__RequestTimeoutSeconds` | `120`（限制 5–600） | 否 |
+| `Execution:ScheduledProvider` | `DEVHUB__Execution__ScheduledProvider` | `openai` | 否 |
 | **API key 值**（存放在上面那一项命名的环境变量里） | — | 无 | **是**，缺失时 `scheduler_status` 显示 `openai:auth` |
 
 - 客户端请求地址是 `{BaseUrl}/chat/completions`，因此 `BaseUrl` 必须是 OpenAI 兼容端点根地址（末尾 `/` 会被自动去掉）。
 - 空字符串会回退到默认值；`RequestTimeoutSeconds` 超出 5–600 会被收敛到边界。
-- 必填的只有 **API key 的值**；其余四项不写就用默认值。
+- `Execution:ScheduledProvider` 只接受 `openai` / `vscode`（大小写不敏感）。取值非法时**回退 `openai` 并在启动日志记 Warning**（不阻断启动），不会把非法值写进队列。
+- 必填的只有 **API key 的值**；其余项不写就用默认值。
 
 #### 2.4.2 存放位置与优先级
 
@@ -137,6 +139,9 @@ $json = @'
       "BaseUrl": "https://api.openai.com/v1",
       "Model": "gpt-4.1-mini"
     }
+  },
+  "Execution": {
+    "ScheduledProvider": "openai"
   }
 }
 '@
@@ -154,7 +159,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -A
 node scripts/smoke-mcp.mjs
 ```
 
-在 Copilot Chat 中也可以直接调用 `scheduler_status`，检查 `providers[]` 里 `provider=openai` 的 `state` 与 `detail`：配置前是 `auth`（detail 为“未配置环境变量 DEVHUB_OPENAI_API_KEY”），配置并重启后变为 `ready`。仍为 `auth` 时，先确认当前终端是否继承到了新变量（新开窗口最稳妥），以及占位值是否已替换。
+在 Copilot Chat 中也可以直接调用 `scheduler_status`，检查 `providers[]` 里 `provider=openai` 的 `state` 与 `detail`：未配置时是 `auth`（detail 为“未配置环境变量 DEVHUB_OPENAI_API_KEY”），仍填占位值（如 `CHANGE_ME`、`<YOUR_API_KEY>`）时也是 `auth`（detail 明确提示“仍是占位值”），替换为真实 key 并重启后才会变成 `ready`。仍为 `auth` 时，先确认当前终端是否继承到了新变量（新开窗口最稳妥），再确认占位值已替换。
 
 | state | 含义 | 处理 |
 |---|---|---|
@@ -166,10 +171,9 @@ node scripts/smoke-mcp.mjs
 #### 2.4.4 BYOK（openai）与 vscode.lm（vscode）的启用条件与优先级
 
 - 两个 provider **同时注册**（`openai` = BYOK 直连 OpenAI 兼容端点，`vscode` = 扩展的 `vscode.lm` 桥），执行时按队列项的 `preferred_provider` **精确取用**，不存在跨通道静默兜底。
-- **定时任务固定走 `openai`**：扫描入队时 `preferred_provider` 直接写 `'openai'`，与 `vscode` 是否可用无关。
-- **手动 `dispatch_now`**：`provider=auto` 时按 `openai` → `vscode` 选第一个 `ready` 且熔断关闭的；两者都不可用时回退 `openai` 入队；显式传 `openai` / `vscode` 时若该 provider 不可用会直接拒绝（`ProviderUnavailable`），不会自动换通道。
+- **定时任务的 provider 由 `Execution:ScheduledProvider` 决定**：扫描入队时读取该配置（默认 `openai`），写入队列项的 `preferred_provider`。只接受 `openai` / `vscode`，非法值回退 `openai` 并在启动日志记 Warning。修改后需重启守护进程，且只影响**之后新入队**的队列项；已在队列中的项保留入队时的 provider。
+- **手动 `dispatch_now`**：`provider=auto` 时按 `openai` → `vscode` 选第一个 `ready` 且熔断关闭的；两者都不可用时回退 `openai` 入队；显式传 `openai` / `vscode` 时若该 provider 不可用会直接拒绝（`ProviderUnavailable`），不会自动换通道。手动派发的 `provider` 只作用于该次入队的队列项，**不会改变** `Execution:ScheduledProvider`。
 - **`vscode` 就绪条件**：VS Code 已安装并激活 `devhub-bridge` 扩展，且 `vscode.lm` 有可用模型（例如已登录 GitHub Copilot）→ 扩展写出 `lm-bridge.json` → 宿主 `GET /health` 成功且返回 pid 与发现文件 pid 一致。任一环节不满足即为 `down`。
-- **单独说明**：`Execution:ScheduledProvider` 虽然存在于执行配置对象中，但当前**没有任何派发路径读取它**（定时任务入队时 provider 写死为 `openai`）。写它不会改变定时任务的 provider；要让某个任务走 `vscode`，只能用 `dispatch_now(provider:"vscode")` 手动派发。
 
 ### 2.5 日志
 
@@ -226,8 +230,8 @@ node scripts/smoke-mcp.mjs
 1. **机器级单实例**：同一台机器同时只允许一个宿主；多工作区由 `workspaces.json` 承载，不是多进程。
 2. **MCP 端点无静态令牌**：Agent Plugins 规范不作用 `url`/`headers` 占位符，只能依赖"仅回环 + Host/Origin 校验"。
 3. **扩展需单独安装**：插件规范无法下发 VS Code 扩展，`vscode.lm` 桥与通知依赖 `devhub-bridge` VSIX。
-4. **真实模型调用未验证**：本机未填入真实 key，真实 OpenAI 兼容端点回合未实测；配置步骤见 §2.4。注意占位值（如 `CHANGE_ME`）也算“已配置”，启动探测会显示 `openai:ready`，但真实回合会因 HTTP 401 失败并转回 `openai:auth`，所以必须以一次真实回合的结果为准，不用假 provider 冒充通过。
-5. **`vscode` provider 依赖窗口与模型**：未激活扩展、或 `vscode.lm` 没有可用模型（例如未登录 GitHub Copilot）时 `vscode:down`，不会写出 `lm-bridge.json`；定时任务默认走 `openai`，不依赖窗口。
+4. **真实模型调用未验证**：本机未填入真实 key，真实 OpenAI 兼容端点回合未实测；配置步骤见 §2.4。占位值（如 `CHANGE_ME`）不会被当成可用凭据：启动探测会显示 `openai:auth` 并提示“仍是占位值”，替换为真实 key 后才会转 `ready`。即便显示 `ready`，也应以一次真实回合的结果为准，不用假 provider 冒充通过。
+5. **`vscode` provider 依赖窗口与模型**：未激活扩展、或 `vscode.lm` 没有可用模型（例如未登录 GitHub Copilot）时 `vscode:down`，不会写出 `lm-bridge.json`；定时任务默认走 `openai`，不依赖窗口（可用 `Execution:ScheduledProvider` 改为 `vscode`，但那样同样受上述条件约束）。
 6. **未启用裁剪**：`PublishTrimmed` 与反射/序列化路径冲突，当前只评估不启用；R2R 会增大体积，未采用。
 7. **无 Web 面板**：本期只提供 MCP 工具面、技能与 VS Code 原生通知。
 
@@ -270,6 +274,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -A
 
 ### 6.3 缺外部条件（未验证）
 
-- **真实 OpenAI 兼容回合**：本机只配置了占位值（`DEVHUB_OPENAI_API_KEY=CHANGE_ME`），未填入真实 key，真实回合未执行；`scheduler_status` 的探测结果会因占位值显示 `openai:ready`，但不能作为端到端通过的证据。按 §2.4 换成真实 key 后重跑一次真实回合，记录输入输出与耗时，并确认不再是 `openai:auth`。
+- **真实 OpenAI 兼容回合**：本机只配置了占位值（`DEVHUB_OPENAI_API_KEY=CHANGE_ME`），未填入真实 key，真实回合未执行；`scheduler_status` 会把占位值判为 `openai:auth`（detail 提示“仍是占位值”），不能作为端到端通过的证据。按 §2.4 换成真实 key 后重跑一次真实回合，记录输入输出与耗时，并确认不再是 `openai:auth`。
 - **真实 `vscode.lm` 回合桥**：扩展已安装并激活，但本机 VS Code 未登录 GitHub Copilot，`vscode.lm` 无可用模型，因此未写出 `lm-bridge.json`；上文的 `/health` + pid 校验是用本地桩端点验证守护进程侧逻辑，不代表真实桥可用。登录 Copilot 并重载窗口后可复测。
 - **插件包安装**：`Chat: Install Plugin from Source` 无法通过 CLI 自动化，未在真机执行；`plugin/` 已通过 `validate-plugin.mjs` 静态校验。

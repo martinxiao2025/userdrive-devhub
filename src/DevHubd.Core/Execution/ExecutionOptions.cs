@@ -38,8 +38,23 @@ public sealed record ExecutionOptions
     /// <summary>交付档位：auto / dispatch_only。</summary>
     public string DeliveryMode { get; init; } = "dispatch_only";
 
+    /// <summary>定时派发的默认 provider。</summary>
+    public const string DefaultScheduledProvider = "openai";
+
     /// <summary>定时派发使用的 provider。</summary>
-    public string ScheduledProvider { get; init; } = "openai";
+    public string ScheduledProvider { get; init; } = DefaultScheduledProvider;
+
+    /// <summary>
+    /// 归一化定时派发 provider：大小写不敏感，仅接受 <c>openai</c> / <c>vscode</c>。
+    /// 非法值回退 <see cref="DefaultScheduledProvider"/>；调用方负责把原始值写成配置问题，
+    /// 避免配置写错后静默改变派发通道。
+    /// </summary>
+    /// <param name="value">配置中的原始取值。</param>
+    public static string NormalizeScheduledProvider(string? value) => value?.Trim().ToLowerInvariant() switch
+    {
+        "vscode" => "vscode",
+        _ => DefaultScheduledProvider,
+    };
 
     /// <summary>租约 TTL（秒）。</summary>
     public int LeaseSeconds { get; init; } = 120;
@@ -60,7 +75,7 @@ public sealed record ExecutionOptions
         DeliveryMode = string.Equals(DeliveryMode, "auto", StringComparison.OrdinalIgnoreCase)
             ? "auto"
             : "dispatch_only",
-        ScheduledProvider = string.IsNullOrWhiteSpace(ScheduledProvider) ? "openai" : ScheduledProvider,
+        ScheduledProvider = NormalizeScheduledProvider(ScheduledProvider),
         LeaseSeconds = Math.Clamp(LeaseSeconds, 30, 600),
         HeartbeatSeconds = Math.Clamp(HeartbeatSeconds, 5, 300),
     };

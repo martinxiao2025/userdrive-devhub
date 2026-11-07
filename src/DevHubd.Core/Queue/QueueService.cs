@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using DevHubd.Core.Data;
+using DevHubd.Core.Execution;
 using DevHubd.Core.Tasks;
 using Microsoft.Data.Sqlite;
 
@@ -52,14 +53,17 @@ public sealed class QueueService
 
     /// <summary>把工作区内所有 ready 任务翻译成队列项；重复调用零副作用。</summary>
     /// <param name="workspaceId">工作区 id。</param>
+    /// <param name="provider">定时派发的 provider；非法值回退 <c>openai</c>（由 <see cref="ExecutionOptions.NormalizeScheduledProvider"/> 收敛）。</param>
     /// <param name="dryRun">只统计不写入。</param>
     /// <param name="cancellationToken">取消令牌。</param>
     public async Task<EnqueueResult> EnqueueReadyTasksAsync(
         string workspaceId,
+        string provider,
         bool dryRun = false,
         CancellationToken cancellationToken = default)
     {
         var now = Now();
+        var scheduledProvider = ExecutionOptions.NormalizeScheduledProvider(provider);
         using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
         using var transaction = connection.BeginTransaction(deferred: false);
 
@@ -105,6 +109,7 @@ public sealed class QueueService
                 transaction,
                 workspaceId,
                 task,
+                scheduledProvider,
                 dedupeKey,
                 now,
                 cancellationToken).ConfigureAwait(false);
@@ -638,11 +643,20 @@ public sealed class QueueService
     }
 
     /// <summary>插入队列项；dedupe_key 冲突时返回 false（幂等）。</summary>
+    /// <param name="connection">连接。</param>
+    /// <param name="transaction">事务。</param>
+    /// <param name="workspaceId">工作区 id。</param>
+    /// <param name="task">任务投影。</param>
+    /// <param name="provider">已归一化的定时派发 provider。</param>
+    /// <param name="dedupeKey">去重键。</param>
+    /// <param name="now">当前时间。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
     private static async Task<bool> InsertAsync(
         SqliteConnection connection,
         SqliteTransaction transaction,
         string workspaceId,
         TaskRow task,
+        string provider,
         string dedupeKey,
         string now,
         CancellationToken cancellationToken)
@@ -654,7 +668,7 @@ public sealed class QueueService
               (id, workspace_id, task_id, task_hash, dedupe_key, status, priority, attempt, max_attempts,
                preferred_provider, available_at, created_at, updated_at)
             VALUES
-              ($id, $workspace, $task, $hash, $dedupe, 'pending', $priority, 0, 3, 'openai', $now, $now, $now)
+              ($id, $workspace, $task, $hash, $dedupe, 'pending', $priority, 0, 3, $provider, $now, $now, $now)
             ON CONFLICT (dedupe_key) DO NOTHING;
             """;
         command.Parameters.AddWithValue("$id", Guid.NewGuid().ToString("N"));
@@ -663,6 +677,7 @@ public sealed class QueueService
         command.Parameters.AddWithValue("$hash", task.ContentHash);
         command.Parameters.AddWithValue("$dedupe", dedupeKey);
         command.Parameters.AddWithValue("$priority", task.Priority);
+        command.Parameters.AddWithValue("$provider", provider);
         command.Parameters.AddWithValue("$now", now);
 
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;

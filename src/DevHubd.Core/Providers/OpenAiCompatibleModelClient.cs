@@ -21,6 +21,18 @@ public sealed class OpenAiCompatibleModelClient : IModelClient
 
     private static readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web);
 
+    /// <summary>常见占位符取值；只用于探测阶段给出明确 detail，不阻断启动。</summary>
+    private static readonly HashSet<string> _placeholderApiKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "CHANGE_ME",
+        "CHANGEME",
+        "REPLACE_ME",
+        "YOUR_API_KEY",
+        "<YOUR_API_KEY>",
+        "PLACEHOLDER",
+        "TODO",
+    };
+
     private readonly HttpClient _http;
     private readonly OpenAiModelOptions _options;
     private readonly IApiKeyProvider _apiKeys;
@@ -51,7 +63,8 @@ public sealed class OpenAiCompatibleModelClient : IModelClient
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        if (_apiKeys.GetApiKey() is null)
+        var apiKey = _apiKeys.GetApiKey();
+        if (apiKey is null)
         {
             return Task.FromResult(new ModelHealth(
                 false,
@@ -60,7 +73,26 @@ public sealed class OpenAiCompatibleModelClient : IModelClient
                 _options.Model));
         }
 
+        if (IsPlaceholderApiKey(apiKey))
+        {
+            // 不阻断启动：真实调用仍会走 401 路径，但状态页能直接看出"还没换真实 key"。
+            return Task.FromResult(new ModelHealth(
+                false,
+                ProviderStates.Auth,
+                $"环境变量 {_apiKeys.EnvironmentVariableName} 仍是占位值，请替换为真实 key",
+                _options.Model));
+        }
+
         return Task.FromResult(new ModelHealth(true, ProviderStates.Ready, null, _options.Model));
+    }
+
+    /// <summary>判断取值是否明显是占位符：尖括号包裹，或命中常见占位词。</summary>
+    /// <param name="apiKey">环境变量取值。</param>
+    private static bool IsPlaceholderApiKey(string apiKey)
+    {
+        var value = apiKey.Trim();
+        return _placeholderApiKeys.Contains(value) ||
+            (value.StartsWith('<') && value.EndsWith('>'));
     }
 
     /// <inheritdoc />

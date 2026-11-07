@@ -1,3 +1,4 @@
+using DevHubd.Core.Execution;
 using DevHubd.Core.Queue;
 using DevHubd.Core.Tasks;
 using DevHubd.Core.Workspaces;
@@ -34,6 +35,7 @@ public sealed class SchedulerEngine
     private readonly TaskScanner _scanner;
     private readonly QueueService _queue;
     private readonly SchedulerStateStore _stateStore;
+    private readonly ExecutionOptions _executionOptions;
     private readonly ILogger<SchedulerEngine> _logger;
 
     /// <summary>注入依赖。</summary>
@@ -41,18 +43,21 @@ public sealed class SchedulerEngine
     /// <param name="scanner">任务扫描器。</param>
     /// <param name="queue">队列服务。</param>
     /// <param name="stateStore">调度状态存取。</param>
+    /// <param name="executionOptions">执行配置（提供定时派发的 provider）。</param>
     /// <param name="logger">日志器。</param>
     public SchedulerEngine(
         WorkspaceRegistry registry,
         TaskScanner scanner,
         QueueService queue,
         SchedulerStateStore stateStore,
+        ExecutionOptions executionOptions,
         ILogger<SchedulerEngine> logger)
     {
         _registry = registry;
         _scanner = scanner;
         _queue = queue;
         _stateStore = stateStore;
+        _executionOptions = executionOptions;
         _logger = logger;
     }
 
@@ -82,6 +87,7 @@ public sealed class SchedulerEngine
         }
 
         var loaded = await _registry.LoadAsync(cancellationToken).ConfigureAwait(false);
+        var scheduledProvider = ExecutionOptions.NormalizeScheduledProvider(_executionOptions.ScheduledProvider);
         foreach (var problem in loaded.Problems)
         {
             _logger.LogWarning("工作区清单条目被跳过：{Problem}", problem);
@@ -118,7 +124,8 @@ public sealed class SchedulerEngine
                 _logger.LogWarning("任务文件被跳过：workspace={WorkspaceId} {Problem}", workspace.Id, problem);
             }
 
-            var enqueue = await _queue.EnqueueReadyTasksAsync(workspace.Id, dryRun: false, cancellationToken)
+            var enqueue = await _queue
+                .EnqueueReadyTasksAsync(workspace.Id, scheduledProvider, dryRun: false, cancellationToken)
                 .ConfigureAwait(false);
             enqueued += enqueue.Enqueued;
             deduped += enqueue.Deduped;

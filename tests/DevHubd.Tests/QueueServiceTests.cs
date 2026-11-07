@@ -51,7 +51,7 @@ public sealed class QueueServiceTests : IDisposable
         {
             await ResetQueueAsync(factory, ct);
             await InsertTaskAsync(factory, "alpha", $"T-{iteration}", "ready", "hash", 10, ct);
-            await queue.EnqueueReadyTasksAsync("alpha", dryRun: false, ct);
+            await queue.EnqueueReadyTasksAsync("alpha", "openai", dryRun: false, ct);
 
             var claims = await Task.WhenAll(Enumerable.Range(0, 8).Select(index =>
                 Task.Run(
@@ -71,7 +71,7 @@ public sealed class QueueServiceTests : IDisposable
         var queue = new QueueService(factory);
 
         await InsertTaskAsync(factory, "alpha", "T-001", "ready", "hash", 10, ct);
-        await queue.EnqueueReadyTasksAsync("alpha", dryRun: false, ct);
+        await queue.EnqueueReadyTasksAsync("alpha", "openai", dryRun: false, ct);
 
         var claimed = await queue.ClaimAsync("owner-a", TimeSpan.FromMilliseconds(1), ct);
         Assert.NotNull(claimed);
@@ -100,7 +100,7 @@ public sealed class QueueServiceTests : IDisposable
             await InsertTaskAsync(factory, "alpha", $"T-{index}", "ready", $"hash-{index}", index, ct);
         }
 
-        await queue.EnqueueReadyTasksAsync("alpha", dryRun: false, ct);
+        await queue.EnqueueReadyTasksAsync("alpha", "openai", dryRun: false, ct);
 
         var ids = new List<string>();
         string? cursor = null;
@@ -138,6 +138,34 @@ public sealed class QueueServiceTests : IDisposable
         await Assert.ThrowsAsync<ArgumentException>(() => queue.ListAsync("bogus", 20, null, ct));
     }
 
+    /// <summary>定时入队把传入的 provider 落到 <c>preferred_provider</c>。</summary>
+    [Fact]
+    public async Task EnqueueReadyTasksAsync_WritesConfiguredProviderAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var factory = await CreateMigratedFactoryAsync(ct);
+        var queue = new QueueService(factory);
+
+        await InsertTaskAsync(factory, "alpha", "T-001", "ready", "hash-1", 10, ct);
+        await queue.EnqueueReadyTasksAsync("alpha", "vscode", dryRun: false, ct);
+
+        Assert.Equal("vscode", await ReadPreferredProviderAsync(factory, "T-001", ct));
+    }
+
+    /// <summary>非法 provider 由 <c>NormalizeScheduledProvider</c> 收敛为 openai，不写非法值。</summary>
+    [Fact]
+    public async Task EnqueueReadyTasksAsync_InvalidProvider_FallsBackToOpenAiAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var factory = await CreateMigratedFactoryAsync(ct);
+        var queue = new QueueService(factory);
+
+        await InsertTaskAsync(factory, "alpha", "T-001", "ready", "hash-1", 10, ct);
+        await queue.EnqueueReadyTasksAsync("alpha", "gemini", dryRun: false, ct);
+
+        Assert.Equal("openai", await ReadPreferredProviderAsync(factory, "T-001", ct));
+    }
+
     /// <summary><c>queue_list</c> 工具层：非法 limit 返回 INVALID_LIMIT 错误信封，正常分页返回 camelCase 字段。</summary>
     [Fact]
     public async Task QueueListTool_MapsErrorsAndPagesAsync()
@@ -156,7 +184,7 @@ public sealed class QueueServiceTests : IDisposable
             await InsertTaskAsync(factory, "alpha", $"T-{index}", "ready", $"hash-{index}", index, ct);
         }
 
-        await queue.EnqueueReadyTasksAsync("alpha", dryRun: false, ct);
+        await queue.EnqueueReadyTasksAsync("alpha", "openai", dryRun: false, ct);
 
         var first = await tool.ListAsync(status: "all", limit: 2, cursor: null, cancellationToken: ct);
         using var document = JsonDocument.Parse(ReadText(first));
@@ -171,6 +199,22 @@ public sealed class QueueServiceTests : IDisposable
     /// <param name="result">工具结果。</param>
     private static string ReadText(CallToolResult result) =>
         Assert.IsType<TextContentBlock>(Assert.Single(result.Content)).Text;
+
+    /// <summary>读取指定任务的 preferred_provider。</summary>
+    /// <param name="factory">连接工厂。</param>
+    /// <param name="taskId">任务 id。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private static async Task<string> ReadPreferredProviderAsync(
+        SqliteConnectionFactory factory,
+        string taskId,
+        CancellationToken cancellationToken)
+    {
+        using var connection = await factory.OpenAsync(cancellationToken);
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT preferred_provider FROM queue_item WHERE task_id = $task;";
+        command.Parameters.AddWithValue("$task", taskId);
+        return (string)(await command.ExecuteScalarAsync(cancellationToken))!;
+    }
 
     /// <summary>创建并迁移一个独立数据库的工厂。</summary>
     /// <param name="cancellationToken">取消令牌。</param>

@@ -48,6 +48,21 @@ public sealed record DevHubUserConfig(
 
             openAi = configuration.GetSection("Model:OpenAi").Get<OpenAiModelOptions>() ?? new OpenAiModelOptions();
             execution = configuration.GetSection("Execution").Get<ExecutionOptions>() ?? new ExecutionOptions();
+
+            // 非法 provider 不阻断启动：回退默认值并记录问题，避免配置写错后静默改变派发通道。
+            var rawScheduledProvider = configuration["Execution:ScheduledProvider"];
+            if (!string.IsNullOrWhiteSpace(rawScheduledProvider))
+            {
+                var normalizedProvider = ExecutionOptions.NormalizeScheduledProvider(rawScheduledProvider);
+                if (!string.Equals(
+                        rawScheduledProvider.Trim(),
+                        normalizedProvider,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    problems.Add(
+                        $"Execution:ScheduledProvider 取值「{rawScheduledProvider}」非法，已回退 {normalizedProvider}；允许的取值：openai、vscode。");
+                }
+            }
         }
         catch (Exception exception) when (exception is InvalidDataException or FormatException or JsonException)
         {
