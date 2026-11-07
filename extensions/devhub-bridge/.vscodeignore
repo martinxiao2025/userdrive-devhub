@@ -1,0 +1,7 @@
+# 只发布编译产物与清单，源码与依赖目录不进 VSIX。
+.vscodeignore
+src/**
+tsconfig.json
+node_modules/**
+**/*.vsix
+**/*.ts

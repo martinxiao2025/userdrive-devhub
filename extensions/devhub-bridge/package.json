@@ -1,0 +1,51 @@
+{
+  "name": "devhub-bridge",
+  "displayName": "DevHub Bridge",
+  "description": "把 vscode.lm 暴露给 DevHub 定时调度器：回环回合桥 + 未读结果通知。默认全部关闭。",
+  "version": "0.1.0",
+  "publisher": "userdrive",
+  "private": true,
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "configuration": {
+      "title": "DevHub Bridge",
+      "properties": {
+        "devhub.bridge.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "启用 vscode.lm 回合桥，并把发现文件写入 DevHub 数据目录。默认关闭。"
+        },
+        "devhub.notifications.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "每小时轮询一次 DevHub 未读结果并弹出通知。默认关闭（关闭时零轮询）。"
+        },
+        "devhub.dataDir": {
+          "type": "string",
+          "default": "",
+          "description": "DevHub 数据目录；留空时使用 %LOCALAPPDATA%\\userdrive-devhub。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -w -p .",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "24.2.0",
+    "@types/vscode": "1.95.0",
+    "@vscode/vsce": "3.6.2",
+    "typescript": "5.9.3"
+  }
+}
