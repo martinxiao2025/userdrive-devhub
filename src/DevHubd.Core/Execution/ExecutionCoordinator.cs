@@ -174,8 +174,10 @@ public sealed class ExecutionCoordinator
                 }
                 finally
                 {
-                    _active.TryRemove(claimed.Item.Id, out _);
+                    // 先归还并发槽位再摘除活动记录：这样 ActiveCount 归零即可断定槽位已可用，
+                    // 观测方（调度循环与测试）不必在两者之间猜测顺序。
                     _slots.Release();
+                    _active.TryRemove(claimed.Item.Id, out _);
                 }
             },
             CancellationToken.None);

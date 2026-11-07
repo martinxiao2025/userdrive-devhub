@@ -126,11 +126,16 @@ public sealed class P2ExecutionTests : IDisposable
         var coordinator = CreateCoordinator(fake, new ExecutionOptions());
         await coordinator.PumpAsync(ct);
 
+        // 熔断状态先落库、队列回退后落库：等到两者都完成再断言，避免读到 “auth 已生效但队列仍 running” 的中间态。
         await WaitUntilAsync(
             async () => string.Equals(
-                await ScalarStringAsync("SELECT state FROM provider_state WHERE provider = 'openai';", ct),
-                "auth",
-                StringComparison.Ordinal),
+                    await ScalarStringAsync("SELECT state FROM provider_state WHERE provider = 'openai';", ct),
+                    "auth",
+                    StringComparison.Ordinal)
+                && string.Equals(
+                    await ScalarStringAsync("SELECT status FROM queue_item;", ct),
+                    "pending",
+                    StringComparison.Ordinal),
             ct);
 
         var openAi = await _providerStates.GetAsync("openai", ct);
@@ -172,8 +177,10 @@ public sealed class P2ExecutionTests : IDisposable
         var coordinator = CreateCoordinator(fake, new ExecutionOptions { MaxDurationSeconds = 1 });
         await coordinator.PumpAsync(ct);
 
+        // 队列置 dead 后又插入失败结果，等两者都落库再断言，避免读到中间态。
         await WaitUntilAsync(
-            async () => string.Equals(await ScalarStringAsync("SELECT status FROM queue_item;", ct), "dead", StringComparison.Ordinal),
+            async () => string.Equals(await ScalarStringAsync("SELECT status FROM queue_item;", ct), "dead", StringComparison.Ordinal)
+                && await CountAsync("SELECT COUNT(*) FROM result;", ct) == 1,
             ct,
             TimeSpan.FromSeconds(10));
 
@@ -209,6 +216,9 @@ public sealed class P2ExecutionTests : IDisposable
 
         Assert.Equal(1, await coordinator.PumpAsync(ct));
         await WaitUntilAsync(async () => await CountAsync("SELECT COUNT(*) FROM queue_item WHERE status = 'succeeded';", ct) == 1, ct);
+        // 队列项落终态早于并发槽位归还：等 ActiveCount 归零（此时槽位必定已释放）再发起第二次 pump，
+        // 否则会偶发读到“数据库已成功但槽位仍占用”而返回 0。
+        await WaitUntilAsync(() => Task.FromResult(coordinator.ActiveCount == 0), ct);
         Assert.Equal(1, await coordinator.PumpAsync(ct));
         await WaitUntilAsync(async () => await CountAsync("SELECT COUNT(*) FROM result;", ct) == 2, ct);
 
