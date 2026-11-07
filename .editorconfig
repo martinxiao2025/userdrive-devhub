@@ -18,5 +18,84 @@ dotnet_sort_system_directives_first = true
 dotnet_style_qualification_for_field = false:suggestion
 csharp_new_line_before_open_brace = all
 
+# ===== .NET 命名规范（分析器门禁，`EnforceCodeStyleInBuild` 生效）=====
+# 命名违规一律 warning，构建时按警告暴露；本仓库要求 0 警告。
+dotnet_diagnostic.IDE1006.severity = warning
+
+# 样式定义
+dotnet_naming_style.pascal_case.capitalization = pascal_case
+dotnet_naming_style.camel_case.capitalization = camel_case
+dotnet_naming_style.underscore_camel_case.required_prefix = _
+dotnet_naming_style.underscore_camel_case.capitalization = camel_case
+dotnet_naming_style.i_pascal_case.required_prefix = I
+dotnet_naming_style.i_pascal_case.capitalization = pascal_case
+dotnet_naming_style.t_pascal_case.required_prefix = T
+dotnet_naming_style.t_pascal_case.capitalization = pascal_case
+
+# 类型（class / struct / enum / delegate）：PascalCase
+dotnet_naming_rule.named_types_pascal_case.severity = warning
+dotnet_naming_rule.named_types_pascal_case.symbols = named_types
+dotnet_naming_rule.named_types_pascal_case.style = pascal_case
+dotnet_naming_symbols.named_types.applicable_kinds = class, struct, enum, delegate
+
+# 接口：I 前缀 + PascalCase
+dotnet_naming_rule.interfaces_i_prefix.severity = warning
+dotnet_naming_rule.interfaces_i_prefix.symbols = interfaces
+dotnet_naming_rule.interfaces_i_prefix.style = i_pascal_case
+dotnet_naming_symbols.interfaces.applicable_kinds = interface
+
+# 方法：PascalCase
+dotnet_naming_rule.methods_pascal_case.severity = warning
+dotnet_naming_rule.methods_pascal_case.symbols = methods
+dotnet_naming_rule.methods_pascal_case.style = pascal_case
+dotnet_naming_symbols.methods.applicable_kinds = method
+
+# 属性 / 事件：PascalCase
+dotnet_naming_rule.members_pascal_case.severity = warning
+dotnet_naming_rule.members_pascal_case.symbols = properties_and_events
+dotnet_naming_rule.members_pascal_case.style = pascal_case
+dotnet_naming_symbols.properties_and_events.applicable_kinds = property, event
+
+# 常量字段：PascalCase
+dotnet_naming_rule.constants_pascal_case.severity = warning
+dotnet_naming_rule.constants_pascal_case.symbols = const_fields
+dotnet_naming_rule.constants_pascal_case.style = pascal_case
+dotnet_naming_symbols.const_fields.applicable_kinds = field
+dotnet_naming_symbols.const_fields.required_modifiers = const
+
+# 私有字段：_camelCase
+dotnet_naming_rule.private_fields_underscore_camel_case.severity = warning
+dotnet_naming_rule.private_fields_underscore_camel_case.symbols = private_fields
+dotnet_naming_rule.private_fields_underscore_camel_case.style = underscore_camel_case
+dotnet_naming_symbols.private_fields.applicable_kinds = field
+dotnet_naming_symbols.private_fields.applicable_accessibilities = private
+
+# 参数：camelCase
+dotnet_naming_rule.parameters_camel_case.severity = warning
+dotnet_naming_rule.parameters_camel_case.symbols = parameters
+dotnet_naming_rule.parameters_camel_case.style = camel_case
+dotnet_naming_symbols.parameters.applicable_kinds = parameter
+
+# 局部变量：camelCase
+dotnet_naming_rule.locals_camel_case.severity = warning
+dotnet_naming_rule.locals_camel_case.symbols = locals
+dotnet_naming_rule.locals_camel_case.style = camel_case
+dotnet_naming_symbols.locals.applicable_kinds = local
+
+# 泛型参数：T 前缀 + PascalCase
+dotnet_naming_rule.type_parameters_t_prefix.severity = warning
+dotnet_naming_rule.type_parameters_t_prefix.symbols = type_parameters
+dotnet_naming_rule.type_parameters_t_prefix.style = t_pascal_case
+dotnet_naming_symbols.type_parameters.applicable_kinds = type_parameter
+
+# 异步方法：Async 后缀
+dotnet_naming_rule.async_methods_async_suffix.severity = warning
+dotnet_naming_rule.async_methods_async_suffix.symbols = async_methods
+dotnet_naming_rule.async_methods_async_suffix.style = pascal_case_async_suffix
+dotnet_naming_symbols.async_methods.applicable_kinds = method
+dotnet_naming_symbols.async_methods.required_modifiers = async
+dotnet_naming_style.pascal_case_async_suffix.required_suffix = Async
+dotnet_naming_style.pascal_case_async_suffix.capitalization = pascal_case
+
 [*.csproj]
 indent_size = 2

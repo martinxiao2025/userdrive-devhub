@@ -1,15 +1,26 @@
 <Project>
-  <!-- 统一编译口径：P0 锁定 net8.0，用本机 SDK 10.0.401 编译、运行时走 8.0.31（本机未装 8.x SDK） -->
+  <!-- 统一编译口径：P0 起锁定 net10.0，与 global.json 的 10.0.401 SDK 配套 -->
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
-    <LangVersion>12.0</LangVersion>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>14.0</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <InvariantGlobalization>true</InvariantGlobalization>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <Version>0.1.0</Version>
-    <DevhubVersion>0.1.0</DevhubVersion>
+    <DevHubdVersion>0.1.0</DevHubdVersion>
     <Company>userdrive-devhub</Company>
     <Product>devhubd</Product>
+    <!-- 源文件统一按 UTF-8 读取，避免中文注释在不同机器上出现乱码 -->
+    <CodePage>65001</CodePage>
+  </PropertyGroup>
+
+  <!-- 分析器门禁：内置 .NET 分析器 + 代码风格规则参与构建，命名规范见 .editorconfig -->
+  <PropertyGroup>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <!-- 门禁即红线：警告按错误处理，禁止靠 #pragma 批量压制换取"全绿" -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
 </Project>
