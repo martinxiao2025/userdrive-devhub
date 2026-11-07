@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://userdrive-devhub/schemas/task.schema.json",
+  "title": "devhub task",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "title", "status", "prompt"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+      "description": "工作区内唯一；跨工作区由 workspace_id 隔离"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "status": {
+      "enum": ["ready", "blocked", "done", "cancelled"]
+    },
+    "priority": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1000,
+      "default": 0
+    },
+    "delivery": {
+      "enum": ["review", "auto"],
+      "default": "review",
+      "description": "任务级档位只能收紧不能放松：全局为 dispatch_only 时 auto 不生效"
+    },
+    "writeScope": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": [],
+      "description": "相对工作区根的写入白名单；空数组表示只读"
+    },
+    "prompt": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

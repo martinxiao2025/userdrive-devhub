@@ -1,0 +1,16 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "userdrive-devhub",
+  "version": "0.1.0",
+  "description": "定时调度智能体：扫描工作区 .devhub/tasks/*.json，按队列派发执行并写回结果，向 Copilot Chat 提供调度状态与控制工具。",
+  "author": {
+    "name": "userdrive-devhub"
+  },
+  "license": "MIT",
+  "keywords": [
+    "scheduler",
+    "mcp",
+    "copilot",
+    "task-dispatch"
+  ]
+}

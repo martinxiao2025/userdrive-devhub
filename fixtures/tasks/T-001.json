@@ -1,0 +1,11 @@
+{
+  "id": "T-001",
+  "title": "生成周报草稿",
+  "status": "ready",
+  "priority": 100,
+  "delivery": "review",
+  "writeScope": [
+    "reports/"
+  ],
+  "prompt": "总结本周的提交记录，生成一份周报草稿保存到 reports/weekly.md。"
+}

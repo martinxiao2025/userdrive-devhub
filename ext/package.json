@@ -1,0 +1,32 @@
+{
+  "name": "devhub-bridge",
+  "displayName": "devhub bridge",
+  "description": "devhub 的薄适配层：vscode.lm 回合桥与调度通知。P0 仅清单骨架。",
+  "version": "0.1.0",
+  "publisher": "userdrive-devhub",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "devhub.showStatus",
+        "title": "devhub: 查看调度状态"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ."
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.5.0"
+  }
+}

@@ -1,0 +1,15 @@
+<Project>
+  <!-- 统一编译口径：P0 锁定 net8.0，用本机 SDK 10.0.401 编译、运行时走 8.0.31（本机未装 8.x SDK） -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <Version>0.1.0</Version>
+    <DevhubVersion>0.1.0</DevhubVersion>
+    <Company>userdrive-devhub</Company>
+    <Product>devhubd</Product>
+  </PropertyGroup>
+</Project>
