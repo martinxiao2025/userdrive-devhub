@@ -149,6 +149,7 @@ public sealed class MigratorTests : IDisposable
     /// <summary>
     /// V4 必须回填“已有真实 token、但 v3 默认写成 0”的旧行：让 <c>usage_available</c> 与
     /// 契约「false ⇔ token 为 NULL」一致；token 为 NULL 的行保持 0。
+    /// 这里直接构造 v3 形态的库（而不是先迁到最新再回退版本号），避免 V5 已加列后重复执行。
     /// </summary>
     [Fact]
     public async Task Migrate_V4_BackfillsUsageAvailableForLegacyTokenRowsAsync()
@@ -156,20 +157,24 @@ public sealed class MigratorTests : IDisposable
         var ct = TestContext.Current.CancellationToken;
         var factory = new SqliteConnectionFactory(Path.Combine(_directory, "devhub.db"));
 
-        // 先建到最新，再人为退回 v3 并写入两条“旧行”：一条有真实 token，一条没有。
-        await Migrator.MigrateAsync(factory, ct);
-
         using (var connection = await factory.OpenAsync(ct))
         {
             using var seed = connection.CreateCommand();
             seed.CommandText = """
-                PRAGMA foreign_keys = OFF;
-                INSERT INTO queue_item (id, workspace_id, task_id, task_hash, dedupe_key, status, priority, available_at, created_at, updated_at)
-                VALUES ('q1', 'ws', 'T1', 'h', 'k', 'succeeded', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
-                INSERT INTO attempt (id, queue_item_id, attempt_no, provider, started_at, input_tokens, output_tokens, usage_estimated, usage_available, rounds_exhausted)
-                VALUES ('a1', 'q1', 1, 'openai', '2026-01-01T00:00:00Z', 100, 20, 0, 0, 0);
-                INSERT INTO attempt (id, queue_item_id, attempt_no, provider, started_at, input_tokens, output_tokens, usage_estimated, usage_available, rounds_exhausted)
-                VALUES ('a2', 'q1', 2, 'vscode', '2026-01-01T00:00:00Z', NULL, NULL, 0, 0, 0);
+                CREATE TABLE queue_item (id TEXT PRIMARY KEY);
+                CREATE TABLE task_view (id TEXT);
+                CREATE TABLE attempt (
+                    id TEXT PRIMARY KEY,
+                    queue_item_id TEXT NOT NULL,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    usage_estimated INTEGER NOT NULL DEFAULT 0,
+                    usage_available INTEGER NOT NULL DEFAULT 0,
+                    rounds_exhausted INTEGER NOT NULL DEFAULT 0);
+                INSERT INTO attempt (id, queue_item_id, input_tokens, output_tokens)
+                VALUES ('a1', 'q1', 100, 20);
+                INSERT INTO attempt (id, queue_item_id, input_tokens, output_tokens)
+                VALUES ('a2', 'q1', NULL, NULL);
                 PRAGMA user_version = 3;
                 """;
             await seed.ExecuteNonQueryAsync(ct);
@@ -191,6 +196,46 @@ public sealed class MigratorTests : IDisposable
         Assert.Equal(0L, reader.GetInt64(1));
     }
 
+    /// <summary>
+    /// V5 只加列/加表：任务角色/依赖/审批、队列挂起、问题单与角色快照必须存在，且旧行默认值不改变行为。
+    /// </summary>
+    [Fact]
+    public async Task Migrate_V5_AddsRoleAndInputRequestStructuresAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var factory = new SqliteConnectionFactory(Path.Combine(_directory, "devhub.db"));
+        await Migrator.MigrateAsync(factory, ct);
+
+        Assert.True(await HasColumnAsync(factory, "task_view", "role_id", ct));
+        Assert.True(await HasColumnAsync(factory, "task_view", "depends_on", ct));
+        Assert.True(await HasColumnAsync(factory, "task_view", "approval_state", ct));
+        Assert.True(await HasColumnAsync(factory, "queue_item", "role_id", ct));
+        Assert.True(await HasColumnAsync(factory, "queue_item", "hold_kind", ct));
+        Assert.True(await HasColumnAsync(factory, "queue_item", "hold_ref", ct));
+
+        using var connection = await factory.OpenAsync(ct);
+        var tables = await Migrator.GetTableNamesAsync(connection, ct);
+        Assert.Contains("role_view", tables);
+        Assert.Contains("input_request", tables);
+
+        var indexes = await Migrator.GetIndexNamesAsync(connection, ct);
+        Assert.Contains("idx_queue_role", indexes);
+        Assert.Contains("idx_input_dedupe_open", indexes);
+        Assert.Contains("idx_input_open", indexes);
+        Assert.Contains("idx_input_task", indexes);
+
+        using var defaults = connection.CreateCommand();
+        defaults.CommandText = """
+            INSERT INTO task_view (workspace_id, id, source_path, content_hash, title, status, priority, write_scope, payload, seen_at, updated_at)
+            VALUES ('ws', 'T1', 'p', 'h', 't', 'ready', 0, '', '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+            SELECT role_id, approval_state FROM task_view WHERE id = 'T1';
+            """;
+        using var reader = await defaults.ExecuteReaderAsync(ct);
+        Assert.True(await reader.ReadAsync(ct));
+        Assert.Equal("implementer", reader.GetString(0));
+        Assert.Equal("none", reader.GetString(1));
+    }
+
     /// <summary>已有 V1 库升级时必须逐级补 V2/V3/V4，不重建表，并保持 user_version 递增。</summary>
     [Fact]
     public async Task Migrate_FromV1_UpgradesToLatestAsync()
@@ -203,6 +248,8 @@ public sealed class MigratorTests : IDisposable
             using var seed = connection.CreateCommand();
             seed.CommandText = """
                 CREATE TABLE attempt (id TEXT PRIMARY KEY, queue_item_id TEXT NOT NULL);
+                CREATE TABLE task_view (id TEXT);
+                CREATE TABLE queue_item (id TEXT);
                 PRAGMA user_version = 1;
                 """;
             await seed.ExecuteNonQueryAsync(ct);

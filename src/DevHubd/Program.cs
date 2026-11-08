@@ -9,6 +9,7 @@ using DevHubd.Core.Models;
 using DevHubd.Core.Providers;
 using DevHubd.Core.Queue;
 using DevHubd.Core.Results;
+using DevHubd.Core.Roles;
 using DevHubd.Core.Scheduling;
 using DevHubd.Core.Tasks;
 using DevHubd.Core.Workspaces;
@@ -113,7 +114,33 @@ internal static class Program
 
         // 先记下迁移前库文件是否存在：新库用配置档位做种子，老库以库内档位为准。
         var databaseExisted = File.Exists(paths.DatabasePath);
+
+        // 角色声明是纯文件校验，放在迁移之前：声明坏了不留下任何数据库副作用。
+        // 找不到插件包时只告警不阻断（行为与 v4 一致）；找到了就必须逐条通过校验。
+        var pluginDirectory = RoleCatalog.ResolvePluginDirectory();
+        RoleLoadResult? roleLoad = null;
+        if (pluginDirectory is null)
+        {
+            DevHubLog.RoleCatalogMissing(
+                logger,
+                "设置 DEVHUB_PLUGIN_DIR 指向含 plugin.json 的目录，或从仓库内启动。");
+        }
+        else
+        {
+            roleLoad = RoleCatalog.Load(pluginDirectory);
+            if (roleLoad.Errors.Count > 0)
+            {
+                foreach (var error in roleLoad.Errors)
+                {
+                    DevHubLog.RoleDeclarationInvalid(logger, error);
+                }
+
+                return Exit(logger, ExitCodes.InvalidPluginDeclaration);
+            }
+        }
+
         var factory = new SqliteConnectionFactory(paths.DatabasePath);
+
         int schemaVersion;
         try
         {
@@ -238,6 +265,8 @@ internal static class Program
             serviceProvider.GetRequiredService<IDbContextFactory<DevHubDbContext>>()));
         builder.Services.AddSingleton(serviceProvider => new NoticeStore(
             serviceProvider.GetRequiredService<IDbContextFactory<DevHubDbContext>>()));
+        builder.Services.AddSingleton(serviceProvider => new RoleSnapshotStore(
+            serviceProvider.GetRequiredService<IDbContextFactory<DevHubDbContext>>()));
         builder.Services.AddSingleton<TurnRunner>();
         builder.Services.AddSingleton<ExecutionCoordinator>();
 
@@ -278,6 +307,21 @@ internal static class Program
         {
             await stateStore.SetIntervalAsync(options.IntervalSeconds).ConfigureAwait(false);
             DevHubLog.IntervalPersisted(logger, options.IntervalSeconds);
+        }
+
+        // U7：把已校验的角色声明写入 role_view。快照是状态面与后续调度取角色的唯一来源，
+        // 因此必须在开始接受 MCP 调用之前完成；内容哈希未变的角色不会重复写库。
+        if (roleLoad is not null)
+        {
+            var roleStore = app.Services.GetRequiredService<RoleSnapshotStore>();
+            var sync = await roleStore.SyncAsync(roleLoad.Roles).ConfigureAwait(false);
+            DevHubLog.RoleSnapshotSynced(
+                logger,
+                roleLoad.Roles.Count,
+                sync.Added,
+                sync.Updated,
+                sync.Removed,
+                sync.Unchanged);
         }
 
         app.MapHealthEndpoints();

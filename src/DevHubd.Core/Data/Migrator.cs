@@ -13,8 +13,11 @@ namespace DevHubd.Core.Data;
 /// </summary>
 public static class Migrator
 {
-    /// <summary>当前 schema 版本。V1 = 9 张表；V2 = attempt.usage_estimated；V3 = attempt.usage_available / rounds_exhausted；V4 = 旧行 usage_available 回填。</summary>
-    public const int CurrentVersion = 4;
+    /// <summary>
+    /// 当前 schema 版本。V1 = 9 张表；V2 = attempt.usage_estimated；V3 = attempt.usage_available / rounds_exhausted；
+    /// V4 = 旧行 usage_available 回填；V5 = 角色快照、任务角色/依赖/审批列、队列挂起列与问题单表。
+    /// </summary>
+    public const int CurrentVersion = 5;
 
     /// <summary>V1 的全部 DDL 与初始数据。</summary>
     private const string SchemaV1 = """
@@ -185,6 +188,78 @@ public static class Migrator
            AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL);
         """;
 
+    /// <summary>
+    /// V5：角色调度与不确定项回流的持久化结构。<b>只加列/加表，不重建表、不重写数据</b>。
+    /// <para>
+    /// 选择一次性写全 V5（而不是按单元递增为 V5/V6…）的原因：<see cref="Migrator"/> 按
+    /// <c>user_version</c> 只执行一次，同一版本号无法分批追加；分版本会让每个单元都要改动版本常量。
+    /// </para>
+    /// <para>
+    /// 各列含义：<c>task_view.role_id</c> 缺省 <c>implementer</c>；<c>queue_item.role_id/hold_*</c> 可空；
+    /// <c>role_view</c> 是角色声明的数据库快照（状态必须在持久化层，见架构增量方案 §5）；
+    /// <c>input_request</c> 是后台回合提出的问题单，<c>dedupe_key</c> 用<b>部分唯一索引</b>
+    /// 只约束 <c>status='open'</c>：历史 <c>expired/cancelled</c> 记录不阻塞后续同题重问。
+    /// </para>
+    /// </summary>
+    private const string SchemaV5 = """
+        ALTER TABLE task_view ADD COLUMN role_id TEXT NOT NULL DEFAULT 'implementer';
+        ALTER TABLE task_view ADD COLUMN depends_on TEXT;
+        ALTER TABLE task_view ADD COLUMN approval_state TEXT NOT NULL DEFAULT 'none'
+          CHECK (approval_state IN ('none','pending','approved','rejected'));
+
+        ALTER TABLE queue_item ADD COLUMN role_id TEXT;
+        ALTER TABLE queue_item ADD COLUMN hold_kind TEXT CHECK (hold_kind IN ('input','approval'));
+        ALTER TABLE queue_item ADD COLUMN hold_ref TEXT;
+        CREATE INDEX idx_queue_role ON queue_item(role_id, status);
+
+        CREATE TABLE role_view (
+          id                   TEXT PRIMARY KEY,
+          name                 TEXT NOT NULL,
+          description          TEXT NOT NULL,
+          source_path          TEXT NOT NULL,
+          content_hash         TEXT NOT NULL,
+          skills               TEXT NOT NULL,
+          tools                TEXT NOT NULL,
+          delivery             TEXT NOT NULL CHECK (delivery IN ('auto','dispatch_only')),
+          requires_approval    INTEGER NOT NULL,
+          can_request_input    INTEGER NOT NULL,
+          max_parallel         INTEGER NOT NULL,
+          max_attempts         INTEGER NOT NULL,
+          max_rounds           INTEGER NOT NULL,
+          max_tool_calls       INTEGER NOT NULL,
+          max_duration_seconds INTEGER NOT NULL,
+          max_input_tokens     INTEGER,
+          payload              TEXT NOT NULL,
+          loaded_at            TEXT NOT NULL,
+          updated_at           TEXT NOT NULL
+        );
+
+        CREATE TABLE input_request (
+          id               TEXT PRIMARY KEY,
+          workspace_id     TEXT NOT NULL,
+          task_id          TEXT NOT NULL,
+          queue_item_id    TEXT NOT NULL,
+          role_id          TEXT NOT NULL,
+          status           TEXT NOT NULL CHECK (status IN ('open','answered','expired','cancelled')),
+          question         TEXT NOT NULL,
+          context          TEXT,
+          options          TEXT,
+          missing_inputs   TEXT,
+          allow_free_text  INTEGER NOT NULL DEFAULT 1,
+          dedupe_key       TEXT NOT NULL,
+          created_at       TEXT NOT NULL,
+          expires_at       TEXT NOT NULL,
+          answered_at      TEXT,
+          answer           TEXT,
+          answer_option_id TEXT,
+          answer_source    TEXT CHECK (answer_source IN ('user','agent','elicitation')),
+          answered_by      TEXT
+        );
+        CREATE UNIQUE INDEX idx_input_dedupe_open ON input_request(dedupe_key) WHERE status = 'open';
+        CREATE INDEX idx_input_open ON input_request(status, created_at);
+        CREATE INDEX idx_input_task ON input_request(workspace_id, task_id, status);
+        """;
+
     /// <summary>P0 期望存在的 9 张表（用于启动自检与测试断言）。</summary>
     public static readonly IReadOnlyList<string> ExpectedTables = new[]
     {
@@ -245,6 +320,12 @@ public static class Migrator
             }
 
             version = 4;
+        }
+
+        if (version < 5)
+        {
+            await ExecuteScriptAsync(connection, transaction, SchemaV5, cancellationToken).ConfigureAwait(false);
+            version = 5;
         }
 
         using (var stamp = connection.CreateCommand())

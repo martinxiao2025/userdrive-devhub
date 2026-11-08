@@ -109,6 +109,36 @@ public sealed class StartupExitCodeTests : IDisposable
         Assert.Contains("exitCode=5", result.Output, StringComparison.Ordinal);
     }
 
+    /// <summary>退出码 6：插件包中的角色声明缺字段时失败退出，并在日志里指出字段名。</summary>
+    [Fact]
+    public async Task Start_WhenRoleDeclarationInvalid_ExitsWith6Async()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        EnsureMutexFree();
+
+        var pluginDirectory = CreateDirectory();
+        await File.WriteAllTextAsync(Path.Combine(pluginDirectory, "plugin.json"), "{}", ct);
+        Directory.CreateDirectory(Path.Combine(pluginDirectory, "roles"));
+        var skillDirectory = Path.Combine(pluginDirectory, "skills", "devhub-scheduler");
+        Directory.CreateDirectory(skillDirectory);
+        await File.WriteAllTextAsync(Path.Combine(skillDirectory, "SKILL.md"), "# test\n", ct);
+        await File.WriteAllTextAsync(
+            Path.Combine(pluginDirectory, "roles", "broken.json"),
+            "{ \"id\": \"broken\" }",
+            ct);
+
+        var environment = new Dictionary<string, string>
+        {
+            ["DEVHUB_PLUGIN_DIR"] = pluginDirectory,
+        };
+        var result = await RunHostAsync(CreateDirectory(), Array.Empty<string>(), ct, environment);
+
+        Assert.Equal(ExitCodes.InvalidPluginDeclaration, result.ExitCode);
+        Assert.Contains("角色声明非法", result.Output, StringComparison.Ordinal);
+        Assert.Contains("缺少必填字段", result.Output, StringComparison.Ordinal);
+        Assert.Contains("exitCode=6", result.Output, StringComparison.Ordinal);
+    }
+
     /// <summary>宿主可执行文件路径（测试输出目录内的 apphost）。</summary>
     private static string HostExecutable =>
         Path.Combine(AppContext.BaseDirectory, OperatingSystem.IsWindows() ? "devhubd.exe" : "devhubd");
@@ -151,11 +181,13 @@ public sealed class StartupExitCodeTests : IDisposable
     /// <param name="dataDirectory">数据目录。</param>
     /// <param name="extraArguments">额外命令行参数。</param>
     /// <param name="cancellationToken">取消令牌。</param>
+    /// <param name="environment">额外环境变量（如 <c>DEVHUB_PLUGIN_DIR</c>）。</param>
     /// <returns>退出码与合并后的日志文本。</returns>
     private static async Task<HostRunResult> RunHostAsync(
         string dataDirectory,
         IReadOnlyList<string> extraArguments,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IReadOnlyDictionary<string, string>? environment = null)
     {
         var startInfo = new ProcessStartInfo(HostExecutable)
         {
@@ -176,6 +208,13 @@ public sealed class StartupExitCodeTests : IDisposable
         // 失败路径与凭据无关：移除 key 避免探测干扰；关闭调度避免后台扫描。
         startInfo.Environment.Remove("DEVHUB_OPENAI_API_KEY");
         startInfo.Environment["DEVHUB_SCHEDULER"] = "off";
+        if (environment is not null)
+        {
+            foreach (var (name, value) in environment)
+            {
+                startInfo.Environment[name] = value;
+            }
+        }
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(60));

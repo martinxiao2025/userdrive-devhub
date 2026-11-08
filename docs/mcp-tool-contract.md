@@ -87,6 +87,7 @@
 | `queue` | object | 按状态聚合的队列计数 |
 | `providers[]` | array | `provider` / `state` / `detail` / `checkedAt`（UTC + Z） |
 | `tokens` | object | 累计用量；`attemptsWithUsage` / `attemptsWithoutUsage` / `estimatedAttempts` 分列 |
+| `roles[]` | array | 角色快照：`id` / `name` / `delivery` / `maxParallel` / `running`（v5 起） |
 | `mcp` | object | `host` / `port` / `path`；端口固定 3091 |
 | `host` | object | `version` / `pid` / `schemaVersion` / `dataDirectory` / `startedAt`（UTC + Z） |
 | `unread` | object | 未读结果计数 |
@@ -214,9 +215,19 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 
 ## 6. 变更记录
 
+### v5 — 2026-11-08（U7：角色快照与回流结构，纯增量）
+
+- `task_view` 新增 `role_id`（`NOT NULL DEFAULT 'implementer'`）、`depends_on`、`approval_state`（`none/pending/approved/rejected`，默认 `none`）。
+- `queue_item` 新增 `role_id`、`hold_kind`（`input/approval`）、`hold_ref`，并新增索引 `idx_queue_role`。
+- 新增 `role_view`：角色声明（`plugin/roles/*.json`）的数据库快照，含 `content_hash` 与全部预算/并发字段。
+- 新增 `input_request`：问题单。`dedupe_key` 使用**部分唯一索引**只约束 `status='open'`，历史 `expired/cancelled` 记录不阻塞同题重问。
+- `scheduler_status` 新增只读字段 `roles[]`（`id/name/delivery/maxParallel/running`）；`running` 为 `claimed/running` 队列项的实时计数。
+- 启动时若找到 `plugin/plugin.json`（或 `DEVHUB_PLUGIN_DIR`），角色声明必须全部通过校验，否则以退出码 **6** 终止并逐条打印文件与字段名。
+
 ### 待实施 — 2026-11-08（契约先行，未上线）
 
-> 以下工具与 schema v5 仅登记契约，**当前实现不存在**：调用会返回 `UNKNOWN_TOOL`，数据库仍为 v4。
+> 以下**工具**当前实现不存在：调用会返回 `UNKNOWN_TOOL`。schema v5 与 `scheduler_status.roles`
+> 已在 U7 上线（见下一条变更记录），其余能力按 U8–U12 分单元实施。
 > 方案见 `.trae/documents/架构增量方案-角色调度与不确定项回流.md`。上线时必须同步 `ToolVocabulary`、工具快照测试与本文件。
 
 **`input_request_list`（只读）**
@@ -272,7 +283,7 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 
 `NEEDS_INPUT`、`INPUT_TIMEOUT`、`INPUT_NOT_ALLOWED`、`UNKNOWN_INPUT_REQUEST`、`INPUT_REQUEST_CLOSED`、`INVALID_ANSWER`、`ANSWER_CONFLICT`、`INVALID_ROLE`、`TASK_CONFLICT`、`TASK_CHANGED`、`DEPENDENCY_UNMET`、`UNKNOWN_RESULT`、`RESULT_NOT_PENDING`。
 
-**schema v5（未执行）**
+**schema v5（U7 已执行，见上一条变更记录）**
 
 只做 `ALTER TABLE ADD COLUMN` 与新增表（`input_request`、`role_view`），**不修改任何既有 `CHECK`、不重建表**。
 `queue_item` 新增 `role_id/hold_kind/hold_ref`；`task_view` 新增 `role_id/depends_on/approval_state`。

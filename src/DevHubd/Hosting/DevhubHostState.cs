@@ -63,6 +63,7 @@ public sealed class DevHubHostState : ISchedulerStatusSource
         var unread = await ReadUnreadAsync(db, cancellationToken).ConfigureAwait(false);
         var providers = await ReadProvidersAsync(db, cancellationToken).ConfigureAwait(false);
         var tokens = await ReadTokenCountersAsync(db, cancellationToken).ConfigureAwait(false);
+        var roles = await ReadRolesAsync(db, cancellationToken).ConfigureAwait(false);
 
         return new SchedulerStatusSnapshot
         {
@@ -78,6 +79,7 @@ public sealed class DevHubHostState : ISchedulerStatusSource
             Unread = unread,
             Tokens = tokens,
             Providers = providers,
+            Roles = roles,
             Mcp = new McpBindingStatus { Bound = true, Port = _host.Options.McpPort },
             Host = new HostStatus
             {
@@ -194,6 +196,50 @@ public sealed class DevHubHostState : ISchedulerStatusSource
             AttemptsWithoutUsage = aggregate.WithoutUsage,
             EstimatedAttempts = aggregate.Estimated,
         };
+    }
+
+    /// <summary>读取角色快照，并按 <c>claimed/running</c> 的队列项统计当前占用。</summary>
+    /// <param name="db">上下文。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private static async Task<IReadOnlyList<RoleStatus>> ReadRolesAsync(
+        DevHubDbContext db,
+        CancellationToken cancellationToken)
+    {
+        var roles = await db.RoleViews
+            .AsNoTracking()
+            .OrderBy(role => role.Id)
+            .Select(role => new { role.Id, role.Name, role.Delivery, role.MaxParallel })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        if (roles.Count == 0)
+        {
+            return Array.Empty<RoleStatus>();
+        }
+
+        var running = await db.QueueItems
+            .AsNoTracking()
+            .Where(item => item.RoleId != null && (item.Status == "claimed" || item.Status == "running"))
+            .GroupBy(item => item.RoleId)
+            .Select(group => new { RoleId = group.Key, Count = group.Count() })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        var counts = running.ToDictionary(
+            item => item.RoleId ?? string.Empty,
+            item => item.Count,
+            StringComparer.Ordinal);
+
+        return roles
+            .Select(role => new RoleStatus
+            {
+                Id = role.Id,
+                Name = role.Name,
+                Delivery = role.Delivery,
+                MaxParallel = role.MaxParallel,
+                Running = counts.GetValueOrDefault(role.Id),
+            })
+            .ToList();
     }
 
     /// <summary>读取 provider 状态；表为空时给出未配置的默认两项。</summary>

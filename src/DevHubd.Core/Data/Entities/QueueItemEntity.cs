@@ -36,6 +36,15 @@ public sealed class QueueItemEntity
     /// <summary>首选 provider。</summary>
     public string PreferredProvider { get; set; } = string.Empty;
 
+    /// <summary>入队时复制的角色 id；null 表示 v4 遗留行（按 implementer 处理）。</summary>
+    public string? RoleId { get; set; }
+
+    /// <summary>挂起类型：input / approval；null 表示未挂起。</summary>
+    public string? HoldKind { get; set; }
+
+    /// <summary>挂起引用：问题单 id 或审批目标 id。</summary>
+    public string? HoldRef { get; set; }
+
     /// <summary>最早可认领时间（ISO-8601 字符串）。</summary>
     public string AvailableAt { get; set; } = string.Empty;
 

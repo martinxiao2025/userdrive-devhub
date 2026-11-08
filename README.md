@@ -225,6 +225,7 @@ node scripts/smoke-mcp.mjs
 | 3 | MCP 端口 3091 被占用 |
 | 4 | 数据目录不可写 |
 | 5 | 数据库迁移失败 |
+| 6 | 插件包角色声明非法（缺字段、越界或引用不存在的技能） |
 
 端口固定 `127.0.0.1:3091`（与 `plugin/mcp.json` 一致），被占用即失败退出，不顺延到随机端口。
 
@@ -236,6 +237,7 @@ node scripts/smoke-mcp.mjs
 | 退出码 3 | `Get-NetTCPConnection -LocalPort 3091 -State Listen` 找到占用进程 |
 | 退出码 4 | 检查数据目录权限与路径是否被文件占用 |
 | 退出码 5 | 查看日志中的 `eventId=1103`，确认 `devhub.db` 未被其他进程锁死 |
+| 退出码 6 | 查看 `eventId=1006` 的逐条错误，按「文件 + 字段名」修正 `plugin/roles/*.json`；临时绕过可清除 `DEVHUB_PLUGIN_DIR` 让宿主跳过角色加载 |
 | 扩展无通知 | 确认扩展设置 `devhub.notifications.enabled=true`（默认关闭）且 `runtime.json` 的 `apiEnabled=true`；上次已提醒的序号存在扩展 `globalState` 的 `devhub.noticeSeq` |
 | 扩展桥未启动（`vscode:down`） | `vscode.lm` 没有可用模型：在 VS Code 中登录 GitHub Copilot 后重载窗口，`lm-bridge.json` 才会写出 |
 
@@ -261,8 +263,12 @@ node scripts/smoke-mcp.mjs
 
 ### 3.5 升级到本版本（含破坏性变更）
 
-升级步骤：停止旧实例 → 替换二进制/插件 → 启动。数据库会在启动时自动从 schema v2 迁移到 v3
-（`attempt` 增加 `usage_available`、`rounds_exhausted`），旧行默认 0，无需手工改库。
+升级步骤：停止旧实例 → 替换二进制/插件 → 启动。数据库会在启动时自动迁移到 schema v5：
+v2/v3 的 `attempt` 用量列保持原语义，v5 只做 `ALTER TABLE ADD COLUMN` 与新增表
+（`role_view`、`input_request`，以及 `task_view.role_id/depends_on/approval_state`、
+`queue_item.role_id/hold_kind/hold_ref`），**不修改既有 CHECK、不重建表**，旧行按默认值
+（`role_id=implementer`、`approval_state=none`）继续工作，无需手工改库。
+启动时会校验 `plugin/roles/*.json` 并把角色写入 `role_view`；声明非法则以退出码 6 终止。
 
 **B1 时间格式统一为 UTC + `Z`**
 
@@ -331,8 +337,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -A
 
 ### 6.1 已真实验证
 
-- `dotnet build DevHubd.sln`：0 警告 0 错误；`dotnet test`：126/126 通过、0 跳过（此前的 5 项启动失败路径用例在停止守护进程、互斥体释放后真机跑通，见下一条）。
-- `node scripts/validate-plugin.mjs`（4 项 PASS）、`node scripts/check-encoding.mjs`（156 个文件）、`node scripts/smoke-mcp.mjs`（真实握手 + `tools/list` + `tools/call` + `resources/read`）全部通过。
+- `dotnet build DevHubd.sln`：0 警告 0 错误；`dotnet test`：132/132 通过、0 跳过（此前的 5 项启动失败路径用例在停止守护进程、互斥体释放后真机跑通，见下一条）。
+- `node scripts/validate-plugin.mjs`（5 项 PASS，含 `roles/` 角色字段校验）、`node scripts/check-encoding.mjs`（169 个文件）、`node scripts/smoke-mcp.mjs`（真实握手 + `tools/list` + `tools/call` + `resources/read`）全部通过。
+- 角色声明与快照（2026-11-08，U7）：临时数据目录从零启动，日志为 `数据库就绪…（schema v5）`、`角色快照已同步：declared=3 added=3 updated=0 removed=0 unchanged=0`；经真实 MCP 握手调用 `scheduler_status` 返回 `roles[]` 三项（`implementer` maxParallel=2、`reviewer` 1、`triage` 1，`running` 均为 0）；`/health` 的 `tables` 含 `role_view`、`input_request`。声明非法路径由 `StartupExitCodeTests` 真机复跑：退出码 6 且日志含 `缺少必填字段`。
 - 真实 BYOK 回合（2026-11-08）：provider `openai`，端点 `https://api.deepseek.com`，模型 `deepseek-flash`；任务 REAL-001 / REAL-002 / REAL-003 均产出 `awaiting_review` 结果，工作区只改 `out/` 下目标文件。
 - schema 升级：已有 V1 库启动后 `user_version` 由 1 升到 2（新增 `attempt.usage_estimated`），`scheduler_status.host.schemaVersion=2`。2026-11-08 增补：v3 新增 `attempt.usage_available`、`attempt.rounds_exhausted`；v4 回填旧行 `usage_available`（token 非空即标 1，token 为 `NULL` 保持 0）。真实数据目录启动日志为 `数据库就绪…（schema v4）`，冒烟返回 `schema=v4`。
 - v2 → v4 迁移安全核对（2026-11-08，**真实 v2 库副本** `%TEMP%\devhub-migrate-check\devhub.db`，先 `VACUUM INTO` 出干净副本，全程只动副本）：迁移前 `user_version=2`、`integrity_check=ok`、`foreign_key_violations=0`；各表行数 task_view=5、queue_item=5、attempt=6、result=5、notice=5、provider_state=2、scheduler_state=1、scope_lock=0、audit=1。迁移后 `MigrateAsync` 返回 4，行数逐表完全一致，既有主键 **missing=0**（9 张表全部），`integrity_check=ok`、外键无违规；旧行 `rounds_exhausted` 全为 0，`usage_available` 与 token 是否为空严格对应（6 条旧 attempt 中 4 条有 token 被标 1、2 条 token 为 `NULL` 保持 0）；重复迁移幂等返回 4。结论 `PASS`，不以“启动成功 + schema v4”替代行数与主键证据。

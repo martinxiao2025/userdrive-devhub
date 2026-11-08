@@ -47,6 +47,19 @@ public sealed record SchedulerStatusSnapshot
 
     /// <summary>全部 attempt 的 token 用量汇总（provider 未返回 usage 的不计入）。</summary>
     public TokenCounters Tokens { get; init; } = new();
+
+    /// <summary>角色快照与并发占用（来自 <c>role_view</c>，见架构增量方案 §4.2）。</summary>
+    public IReadOnlyList<RoleStatus> Roles { get; init; } = Array.Empty<RoleStatus>();
+}
+
+/// <summary>单个角色的声明摘要与当前占用。</summary>
+public sealed record RoleStatus
+{
+    public string Id { get; init; } = string.Empty;
+    public string Name { get; init; } = string.Empty;
+    public string Delivery { get; init; } = "dispatch_only";
+    public int MaxParallel { get; init; }
+    public int Running { get; init; }
 }
 
 /// <summary>累计计数器（§11.1）。</summary>

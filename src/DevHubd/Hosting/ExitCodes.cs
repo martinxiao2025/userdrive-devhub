@@ -22,4 +22,7 @@ public static class ExitCodes
 
     /// <summary>数据库迁移失败。</summary>
     public const int MigrationFailed = 5;
+
+    /// <summary>插件包内的角色声明非法（缺字段、取值越界、引用不存在的技能）。</summary>
+    public const int InvalidPluginDeclaration = 6;
 }

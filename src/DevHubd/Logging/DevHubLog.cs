@@ -99,6 +99,27 @@ internal static partial class DevHubLog
         Message = "扫描间隔已写回：intervalSeconds={IntervalSeconds}")]
     public static partial void IntervalPersisted(ILogger logger, int intervalSeconds);
 
+    /// <summary>角色声明非法（退出码 6）：逐条记录文件与字段名。</summary>
+    [LoggerMessage(EventId = 1006, Level = LogLevel.Error,
+        Message = "启动失败：角色声明非法（退出码 6）。error={Error}")]
+    public static partial void RoleDeclarationInvalid(ILogger logger, string error);
+
+    /// <summary>未找到插件包：不加载角色，调度行为与 v4 一致。</summary>
+    [LoggerMessage(EventId = 1109, Level = LogLevel.Warning,
+        Message = "未找到 plugin/plugin.json，跳过角色加载。hint={Hint}")]
+    public static partial void RoleCatalogMissing(ILogger logger, string hint);
+
+    /// <summary>角色快照已同步到 <c>role_view</c>。</summary>
+    [LoggerMessage(EventId = 1110, Level = LogLevel.Information,
+        Message = "角色快照已同步：declared={Declared} added={Added} updated={Updated} removed={Removed} unchanged={Unchanged}")]
+    public static partial void RoleSnapshotSynced(
+        ILogger logger,
+        int declared,
+        int added,
+        int updated,
+        int removed,
+        int unchanged);
+
     /// <summary>健康检查探库失败，<c>/health</c> 返回 503。</summary>
     [LoggerMessage(EventId = 1200, Level = LogLevel.Warning,
         Message = "健康检查失败，/health 返回 503。database={Database}")]

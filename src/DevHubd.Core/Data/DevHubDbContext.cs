@@ -45,6 +45,9 @@ public sealed class DevHubDbContext : DbContext
     /// <summary>审计流水。</summary>
     public DbSet<AuditEntity> Audits => Set<AuditEntity>();
 
+    /// <summary>角色声明快照。</summary>
+    public DbSet<RoleViewEntity> RoleViews => Set<RoleViewEntity>();
+
     /// <summary>
     /// 显式映射既有 schema：表名、列名、主键、唯一约束、索引全部按 <see cref="Migrator"/> 的 DDL 书写。
     /// 布尔列以 INTEGER 0/1 存储（<c>HasConversion&lt;int&gt;</c>），字符串时间保持 ISO-8601 原样。
@@ -62,6 +65,41 @@ public sealed class DevHubDbContext : DbContext
         ConfigureSchedulerState(modelBuilder);
         ConfigureScopeLock(modelBuilder);
         ConfigureAudit(modelBuilder);
+        ConfigureRoleView(modelBuilder);
+    }
+
+    /// <summary>映射 <c>role_view</c>（schema v5）。</summary>
+    /// <param name="modelBuilder">模型构建器。</param>
+    private static void ConfigureRoleView(ModelBuilder modelBuilder)
+    {
+        var entity = modelBuilder.Entity<RoleViewEntity>();
+        entity.ToTable(
+            "role_view",
+            table => table.HasCheckConstraint(
+                "ck_role_view_delivery",
+                "delivery IN ('auto','dispatch_only')"));
+
+        entity.HasKey(item => item.Id);
+
+        entity.Property(item => item.Id).HasColumnName("id").ValueGeneratedNever();
+        entity.Property(item => item.Name).HasColumnName("name");
+        entity.Property(item => item.Description).HasColumnName("description");
+        entity.Property(item => item.SourcePath).HasColumnName("source_path");
+        entity.Property(item => item.ContentHash).HasColumnName("content_hash");
+        entity.Property(item => item.Skills).HasColumnName("skills");
+        entity.Property(item => item.Tools).HasColumnName("tools");
+        entity.Property(item => item.Delivery).HasColumnName("delivery");
+        entity.Property(item => item.RequiresApproval).HasColumnName("requires_approval").HasConversion<int>();
+        entity.Property(item => item.CanRequestInput).HasColumnName("can_request_input").HasConversion<int>();
+        entity.Property(item => item.MaxParallel).HasColumnName("max_parallel");
+        entity.Property(item => item.MaxAttempts).HasColumnName("max_attempts");
+        entity.Property(item => item.MaxRounds).HasColumnName("max_rounds");
+        entity.Property(item => item.MaxToolCalls).HasColumnName("max_tool_calls");
+        entity.Property(item => item.MaxDurationSeconds).HasColumnName("max_duration_seconds");
+        entity.Property(item => item.MaxInputTokens).HasColumnName("max_input_tokens");
+        entity.Property(item => item.Payload).HasColumnName("payload");
+        entity.Property(item => item.LoadedAt).HasColumnName("loaded_at");
+        entity.Property(item => item.UpdatedAt).HasColumnName("updated_at");
     }
 
     /// <summary>映射 <c>task_view</c>。</summary>
@@ -115,6 +153,9 @@ public sealed class DevHubDbContext : DbContext
         entity.Property(item => item.Attempt).HasColumnName("attempt");
         entity.Property(item => item.MaxAttempts).HasColumnName("max_attempts");
         entity.Property(item => item.PreferredProvider).HasColumnName("preferred_provider");
+        entity.Property(item => item.RoleId).HasColumnName("role_id");
+        entity.Property(item => item.HoldKind).HasColumnName("hold_kind");
+        entity.Property(item => item.HoldRef).HasColumnName("hold_ref");
         entity.Property(item => item.AvailableAt).HasColumnName("available_at");
         entity.Property(item => item.LeaseOwner).HasColumnName("lease_owner");
         entity.Property(item => item.LeaseExpiresAt).HasColumnName("lease_expires_at");
@@ -128,6 +169,7 @@ public sealed class DevHubDbContext : DbContext
             .HasDatabaseName("idx_queue_ready");
         entity.HasIndex(item => new { item.WorkspaceId, item.TaskId, item.Status })
             .HasDatabaseName("idx_queue_task");
+        entity.HasIndex(item => new { item.RoleId, item.Status }).HasDatabaseName("idx_queue_role");
     }
 
     /// <summary>映射 <c>attempt</c>。</summary>
