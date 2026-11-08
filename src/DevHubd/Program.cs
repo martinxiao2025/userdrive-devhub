@@ -334,6 +334,17 @@ internal static class Program
                 sync.Unchanged);
         }
 
+        // U12：单实例互斥保证启动瞬间没有并发执行体，上一个进程遗留的未结束 attempt
+        // 必须在这里兜底关闭，否则会永远显示为「运行中」。
+        var executionStore = app.Services.GetRequiredService<ExecutionStore>();
+        var abandonedAttempts = await executionStore
+            .AbandonOrphanAttemptsAsync(UtcTime.Now())
+            .ConfigureAwait(false);
+        if (abandonedAttempts > 0)
+        {
+            DevHubLog.OrphanAttemptsAbandoned(logger, abandonedAttempts);
+        }
+
         app.MapHealthEndpoints();
         app.MapInternalApiEndpoints();
         app.MapDevHubdMcp();

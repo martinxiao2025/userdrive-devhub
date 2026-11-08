@@ -45,6 +45,7 @@ public sealed class DispatchService : IDispatchService
     /// <param name="provider">auto / openai / vscode。</param>
     /// <param name="dryRun">只判定不写入。</param>
     /// <param name="force">忽略 manual 暂停强行入队。</param>
+    /// <param name="requestId">幂等键；同键重复派发返回首次的队列项。</param>
     /// <param name="cancellationToken">取消令牌。</param>
     public async Task<DispatchOutcome> DispatchNowAsync(
         string taskId,
@@ -52,6 +53,7 @@ public sealed class DispatchService : IDispatchService
         string provider,
         bool dryRun,
         bool force,
+        string? requestId,
         CancellationToken cancellationToken = default)
     {
         var normalizedProvider = (provider ?? "auto").Trim().ToLowerInvariant();
@@ -107,7 +109,7 @@ public sealed class DispatchService : IDispatchService
         }
 
         var result = await _queue
-            .EnqueueTaskAsync(workspace.Id, task, resolved, dryRun, cancellationToken)
+            .EnqueueTaskAsync(workspace.Id, task, resolved, dryRun, requestId, cancellationToken)
             .ConfigureAwait(false);
 
         var status = result.Status switch

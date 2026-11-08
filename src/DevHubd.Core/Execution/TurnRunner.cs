@@ -3,6 +3,7 @@ using DevHubd.Core.Input;
 using DevHubd.Core.Models;
 using DevHubd.Core.Queue;
 using DevHubd.Core.Roles;
+using DevHubd.Core.Scheduling;
 using DevHubd.Core.Tasks;
 using DevHubd.Core.Workspaces;
 using Microsoft.Extensions.Logging;
@@ -48,17 +49,17 @@ public sealed class TurnRunner
 
     private readonly ModelClientRegistry _registry;
     private readonly ExecutionOptions _options;
-    private readonly EffectiveDeliveryMode _deliveryMode;
+    private readonly SchedulerStateStore _stateStore;
     private readonly DevHubPaths _paths;
     private readonly InputRequestStore _inputRequests;
     private readonly RoleSnapshotStore _roleSnapshots;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<TurnRunner> _logger;
 
-    /// <summary>注入模型注册表、执行配置、运行时档位、路径、问题单存取、角色快照、日志工厂与日志器。</summary>
+    /// <summary>注入模型注册表、执行配置、调度状态存取、路径、问题单存取、角色快照、日志工厂与日志器。</summary>
     /// <param name="registry">模型客户端注册表。</param>
     /// <param name="options">执行配置。</param>
-    /// <param name="deliveryMode">运行时交付档位（唯一来源，已由 <c>scheduler_state.mode</c> 校正）。</param>
+    /// <param name="stateStore">调度状态存取；交付档位每回合从库读取，避免进程内存漂移。</param>
     /// <param name="paths">运行时路径。</param>
     /// <param name="inputRequests">问题单存取。</param>
     /// <param name="roleSnapshots">角色快照（判断 <c>canRequestInput</c>）。</param>
@@ -67,7 +68,7 @@ public sealed class TurnRunner
     public TurnRunner(
         ModelClientRegistry registry,
         ExecutionOptions options,
-        EffectiveDeliveryMode deliveryMode,
+        SchedulerStateStore stateStore,
         DevHubPaths paths,
         InputRequestStore inputRequests,
         RoleSnapshotStore roleSnapshots,
@@ -76,7 +77,7 @@ public sealed class TurnRunner
     {
         _registry = registry;
         _options = options;
-        _deliveryMode = deliveryMode;
+        _stateStore = stateStore;
         _paths = paths;
         _inputRequests = inputRequests;
         _roleSnapshots = roleSnapshots;
@@ -123,7 +124,9 @@ public sealed class TurnRunner
                 null);
         }
 
-        var deliveryOutcome = ResolveDeliveryOutcome(task);
+        // 交付档位以库为准：每回合读取 scheduler_state.mode，控制面改档后下一次判定立即生效。
+        var schedulerState = await _stateStore.ReadAsync(cancellationToken).ConfigureAwait(false);
+        var deliveryOutcome = ResolveDeliveryOutcome(task, schedulerState.Mode);
         var workDirectory = deliveryOutcome == "delivered" ? null : CreateWorkDirectory(item.Id);
         var writeRoot = workDirectory ?? workspace.Root;
 
@@ -305,9 +308,10 @@ public sealed class TurnRunner
     /// 任务级声明优先于全局档位，避免全局 auto 绕过任务自带的人工闸门。
     /// </summary>
     /// <param name="task">任务文档。</param>
-    private string ResolveDeliveryOutcome(TaskDocument task) =>
+    /// <param name="mode">库中的当前交付档位（<c>scheduler_state.mode</c>）。</param>
+    private static string ResolveDeliveryOutcome(TaskDocument task, string mode) =>
         !task.RequiresApproval &&
-        string.Equals(_deliveryMode.Value, "auto", StringComparison.Ordinal) &&
+        string.Equals(mode, "auto", StringComparison.Ordinal) &&
         string.Equals(task.Delivery, "auto", StringComparison.Ordinal)
             ? "delivered"
             : "awaiting_review";

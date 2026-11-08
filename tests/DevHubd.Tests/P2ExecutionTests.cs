@@ -169,11 +169,11 @@ public sealed class P2ExecutionTests : IDisposable
     }
 
     /// <summary>
-    /// M1b：交付档位只看运行时单例（<see cref="EffectiveDeliveryMode"/>），不看启动配置。
-    /// 即使 Execution:DeliveryMode 仍是 dispatch_only，运行时单例为 auto 且任务声明 auto，也必须 delivered。
+    /// M1b（U12 后）：交付档位只以 <c>scheduler_state.mode</c> 为准，不看启动配置。
+    /// 即使 Execution:DeliveryMode 仍是 dispatch_only，库中 mode 为 auto 且任务声明 auto，也必须 delivered。
     /// </summary>
     [Fact]
-    public async Task Pump_RuntimeModeAuto_DeliversRegardlessOfConfigAsync()
+    public async Task Pump_StateModeAuto_DeliversRegardlessOfConfigAsync()
     {
         var ct = TestContext.Current.CancellationToken;
         var root = CreateWorkspace("alpha");
@@ -185,11 +185,11 @@ public sealed class P2ExecutionTests : IDisposable
             "openai",
             (_, _, _) => Task.FromResult(TurnResult.Done("已完成。", 0, new TokenUsage(1, 1, false), Array.Empty<string>())));
 
-        // 配置保持默认 dispatch_only，只把运行时单例设为 auto。
+        // 配置保持默认 dispatch_only，只把库中的 mode 设为 auto。
         var coordinator = CreateCoordinator(
             fake,
             new ExecutionOptions(),
-            deliveryMode: new EffectiveDeliveryMode("auto"));
+            mode: "auto");
 
         await coordinator.PumpAsync(ct);
         await WaitUntilAsync(async () => await CountAsync("SELECT COUNT(*) FROM result;", ct) == 1, ct);
@@ -197,9 +197,9 @@ public sealed class P2ExecutionTests : IDisposable
         Assert.Equal("delivered", await ScalarStringAsync("SELECT outcome FROM result;", ct));
     }
 
-    /// <summary>M1b 反向：运行时单例为 dispatch_only 时，任务即便声明 auto 也只进 awaiting_review。</summary>
+    /// <summary>M1b 反向：库中 mode 为 dispatch_only 时，任务即便声明 auto 也只进 awaiting_review。</summary>
     [Fact]
-    public async Task Pump_RuntimeModeDispatchOnly_KeepsAwaitingReviewAsync()
+    public async Task Pump_StateModeDispatchOnly_KeepsAwaitingReviewAsync()
     {
         var ct = TestContext.Current.CancellationToken;
         var root = CreateWorkspace("alpha");
@@ -214,7 +214,7 @@ public sealed class P2ExecutionTests : IDisposable
         var coordinator = CreateCoordinator(
             fake,
             new ExecutionOptions { DeliveryMode = "auto" },
-            deliveryMode: new EffectiveDeliveryMode("dispatch_only"));
+            mode: "dispatch_only");
 
         await coordinator.PumpAsync(ct);
         await WaitUntilAsync(async () => await CountAsync("SELECT COUNT(*) FROM result;", ct) == 1, ct);
@@ -239,13 +239,70 @@ public sealed class P2ExecutionTests : IDisposable
         var coordinator = CreateCoordinator(
             fake,
             new ExecutionOptions { DeliveryMode = "auto" },
-            deliveryMode: new EffectiveDeliveryMode("auto"));
+            mode: "auto");
 
         await coordinator.PumpAsync(ct);
         await WaitUntilAsync(async () => await CountAsync("SELECT COUNT(*) FROM result;", ct) == 1, ct);
 
         Assert.Equal("awaiting_review", await ScalarStringAsync("SELECT outcome FROM result;", ct));
         Assert.Equal("pending", await ScalarStringAsync("SELECT approval_state FROM task_view WHERE id = 'T-001';", ct));
+    }
+
+    /// <summary>
+    /// U12 验收①：进程运行期间直接改库 <c>scheduler_state.mode</c>，下一回合的交付判定立即生效，
+    /// 不再依赖进程内的启动种子或缓存。
+    /// </summary>
+    [Fact]
+    public async Task Pump_ModeChangedInStoreBetweenRuns_TakesEffectAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "自动交付", "ready", 10, delivery: "auto");
+        await PrepareQueueAsync(ct);
+
+        var fake = new FakeModelClient(
+            "openai",
+            (_, _, _) => Task.FromResult(TurnResult.Done("已完成。", 0, new TokenUsage(1, 1, false), Array.Empty<string>())));
+
+        // 构建时库中仍是 dispatch_only；之后改库，模拟控制面在运行期切换档位。
+        var coordinator = CreateCoordinator(fake, new ExecutionOptions());
+        await new SchedulerStateStore(_factory).SetModeAsync("auto", ct);
+
+        await coordinator.PumpAsync(ct);
+        await WaitUntilAsync(async () => await CountAsync("SELECT COUNT(*) FROM result;", ct) == 1, ct);
+
+        Assert.Equal("delivered", await ScalarStringAsync("SELECT outcome FROM result;", ct));
+    }
+
+    /// <summary>
+    /// U12 验收④：重启兜底把上个进程遗留的未结束 attempt 置为 <c>abandoned/PROCESS_RESTART</c>，
+    /// 避免统计与排障把"进程被杀"误读成"仍在运行"。
+    /// </summary>
+    [Fact]
+    public async Task AbandonOrphanAttempts_MarksOpenAttemptsAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "重启前未完成", "ready", 10);
+        await PrepareQueueAsync(ct);
+
+        // 造一条"上个进程未收尾"的 attempt（ended_at 为空）。
+        await ExecuteAsync(
+            """
+            INSERT INTO attempt (id, queue_item_id, attempt_no, provider, started_at)
+            SELECT 'A-1', id, 1, 'openai', '2026-01-01T00:00:00Z' FROM queue_item LIMIT 1;
+            """,
+            ct);
+
+        var abandoned = await _store.AbandonOrphanAttemptsAsync(DateTimeOffset.UtcNow.ToString("O"), ct);
+
+        Assert.Equal(1, abandoned);
+        Assert.Equal(
+            "abandoned|PROCESS_RESTART",
+            await ScalarStringAsync("SELECT outcome || '|' || error_code FROM attempt WHERE id = 'A-1';", ct));
+        Assert.NotNull(await ScalarStringAsync("SELECT ended_at FROM attempt WHERE id = 'A-1';", ct));
     }
 
     /// <summary>
@@ -508,18 +565,26 @@ public sealed class P2ExecutionTests : IDisposable
     /// <param name="options">执行配置。</param>
     /// <param name="turnLogger">回合执行器日志器。</param>
     /// <param name="coordinatorLogger">协调器日志器。</param>
+    /// <param name="mode">写入 <c>scheduler_state.mode</c> 的交付档位；null 表示沿用库中现有值。</param>
     private ExecutionCoordinator CreateCoordinator(
         FakeModelClient fake,
         ExecutionOptions options,
         ILogger<TurnRunner>? turnLogger = null,
         ILogger<ExecutionCoordinator>? coordinatorLogger = null,
-        EffectiveDeliveryMode? deliveryMode = null)
+        string? mode = null)
     {
         var normalized = options.Normalize();
+        var stateStore = new SchedulerStateStore(_factory);
+        if (mode is not null)
+        {
+            // 交付档位以库为唯一事实来源：测试直接写库，而不是注入进程内缓存。
+            stateStore.SetModeAsync(mode, TestContext.Current.CancellationToken).GetAwaiter().GetResult();
+        }
+
         var runner = new TurnRunner(
             new ModelClientRegistry(new[] { fake }),
             normalized,
-            deliveryMode ?? new EffectiveDeliveryMode(normalized.DeliveryMode),
+            stateStore,
             new DevHubPaths(_directory),
             new InputRequestStore(_factory),
             new RoleSnapshotStore(new DevHubDbContextFactory(_factory.ConnectionString)),

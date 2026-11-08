@@ -145,7 +145,7 @@ public sealed class SchedulerPipelineTests : IDisposable
         await _engine.TickAsync(ct);
 
         var dispatcher = new DispatchService(_registry, _queue, _stateStore, new ProviderStateStore(_factory));
-        var outcome = await dispatcher.DispatchNowAsync("T-001", null, "auto", dryRun: false, force: false, ct);
+        var outcome = await dispatcher.DispatchNowAsync("T-001", null, "auto", dryRun: false, force: false, requestId: null, ct);
 
         Assert.Equal(DispatchStatus.AmbiguousTask, outcome.Status);
         Assert.NotNull(outcome.Candidates);
@@ -165,12 +165,37 @@ public sealed class SchedulerPipelineTests : IDisposable
         await new TaskScanner(_factory).ScanAsync(new WorkspaceDefinition("alpha", root, true), ct);
 
         var dispatcher = new DispatchService(_registry, _queue, _stateStore, new ProviderStateStore(_factory));
-        var outcome = await dispatcher.DispatchNowAsync("T-001", "alpha", "auto", dryRun: false, force: false, ct);
+        var outcome = await dispatcher.DispatchNowAsync("T-001", "alpha", "auto", dryRun: false, force: false, requestId: null, ct);
 
         Assert.Equal(DispatchStatus.Enqueued, outcome.Status);
         Assert.Equal("alpha", outcome.WorkspaceId);
         Assert.Equal("openai", outcome.Provider);
         Assert.False(string.IsNullOrEmpty(outcome.QueueItemId));
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+    }
+
+    /// <summary>
+    /// U12 验收②：同一 <c>requestId</c> 重复派发返回首次创建的队列项，不会重复插入。
+    /// </summary>
+    [Fact]
+    public async Task DispatchNow_SameRequestId_ReturnsSameQueueItemAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "唯一任务", "ready", 10);
+        await new TaskScanner(_factory).ScanAsync(new WorkspaceDefinition("alpha", root, true), ct);
+
+        var dispatcher = new DispatchService(_registry, _queue, _stateStore, new ProviderStateStore(_factory));
+
+        var first = await dispatcher.DispatchNowAsync(
+            "T-001", "alpha", "auto", dryRun: false, force: false, requestId: "req-1", ct);
+        var second = await dispatcher.DispatchNowAsync(
+            "T-001", "alpha", "auto", dryRun: false, force: false, requestId: "req-1", ct);
+
+        Assert.Equal(DispatchStatus.Enqueued, first.Status);
+        Assert.Equal(DispatchStatus.Deduped, second.Status);
+        Assert.Equal(first.QueueItemId, second.QueueItemId);
         Assert.Equal(1, await CountQueueItemsAsync(ct));
     }
 
@@ -185,7 +210,7 @@ public sealed class SchedulerPipelineTests : IDisposable
         await _engine.TickAsync(ct);
 
         var dispatcher = new DispatchService(_registry, _queue, _stateStore, new ProviderStateStore(_factory));
-        var outcome = await dispatcher.DispatchNowAsync("T-001", "alpha", "auto", dryRun: false, force: false, ct);
+        var outcome = await dispatcher.DispatchNowAsync("T-001", "alpha", "auto", dryRun: false, force: false, requestId: null, ct);
 
         Assert.Equal(DispatchStatus.Deduped, outcome.Status);
         Assert.Equal("openai", outcome.Provider);
@@ -206,11 +231,11 @@ public sealed class SchedulerPipelineTests : IDisposable
         await new TaskScanner(_factory).ScanAsync(new WorkspaceDefinition("alpha", root, true), ct);
 
         var task = await _queue.GetTaskAsync("alpha", "T-001", ct);
-        var enqueued = await _queue.EnqueueTaskAsync("alpha", task!, "vscode", dryRun: false, ct);
+        var enqueued = await _queue.EnqueueTaskAsync("alpha", task!, "vscode", dryRun: false, requestId: null, ct);
         Assert.Equal("vscode", enqueued.Provider);
 
         var dispatcher = new DispatchService(_registry, _queue, _stateStore, new ProviderStateStore(_factory));
-        var outcome = await dispatcher.DispatchNowAsync("T-001", "alpha", "auto", dryRun: false, force: false, ct);
+        var outcome = await dispatcher.DispatchNowAsync("T-001", "alpha", "auto", dryRun: false, force: false, requestId: null, ct);
 
         Assert.Equal(DispatchStatus.Deduped, outcome.Status);
         Assert.Equal("vscode", outcome.Provider);
@@ -229,7 +254,7 @@ public sealed class SchedulerPipelineTests : IDisposable
         await _engine.TickAsync(ct);
 
         var dispatcher = new DispatchService(_registry, _queue, _stateStore, new ProviderStateStore(_factory));
-        var outcome = await dispatcher.DispatchNowAsync("T-001", "alpha", "openai", dryRun: true, force: false, ct);
+        var outcome = await dispatcher.DispatchNowAsync("T-001", "alpha", "openai", dryRun: true, force: false, requestId: null, ct);
 
         Assert.Equal(DispatchStatus.TaskNotReady, outcome.Status);
     }
@@ -245,7 +270,7 @@ public sealed class SchedulerPipelineTests : IDisposable
         await _engine.TickAsync(ct);
 
         var dispatcher = new DispatchService(_registry, _queue, _stateStore, new ProviderStateStore(_factory));
-        var outcome = await dispatcher.DispatchNowAsync("T-001", "alpha", "claude", dryRun: false, force: false, ct);
+        var outcome = await dispatcher.DispatchNowAsync("T-001", "alpha", "claude", dryRun: false, force: false, requestId: null, ct);
 
         Assert.Equal(DispatchStatus.InvalidProvider, outcome.Status);
     }
@@ -261,7 +286,7 @@ public sealed class SchedulerPipelineTests : IDisposable
         await _stateStore.SetEnabledAsync(false, "manual", ct);
 
         var dispatcher = new DispatchService(_registry, _queue, _stateStore, new ProviderStateStore(_factory));
-        var outcome = await dispatcher.DispatchNowAsync("T-001", "alpha", "openai", dryRun: false, force: false, ct);
+        var outcome = await dispatcher.DispatchNowAsync("T-001", "alpha", "openai", dryRun: false, force: false, requestId: null, ct);
 
         Assert.Equal(DispatchStatus.SchedulerPaused, outcome.Status);
     }

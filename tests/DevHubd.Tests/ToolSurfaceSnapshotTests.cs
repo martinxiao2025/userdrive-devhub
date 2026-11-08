@@ -20,7 +20,7 @@ public sealed class ToolSurfaceSnapshotTests
         ["scheduler_status"] = Array.Empty<string>(),
         ["queue_list"] = new[] { "status", "limit", "cursor" },
         ["queue_get"] = new[] { "queueItemId" },
-        ["dispatch_now"] = new[] { "taskId", "workspaceId", "provider", "dryRun", "force" },
+        ["dispatch_now"] = new[] { "taskId", "workspaceId", "provider", "dryRun", "force", "requestId" },
         ["scheduler_control"] = new[] { "action", "reason", "mode", "provider" },
         ["result_list"] = new[] { "unreadOnly", "limit", "cursor" },
         ["result_ack"] = new[] { "ids", "all" },

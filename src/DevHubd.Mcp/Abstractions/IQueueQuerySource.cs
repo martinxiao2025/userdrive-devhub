@@ -101,6 +101,7 @@ public interface IDispatchService
     /// <param name="provider">auto / openai / vscode。</param>
     /// <param name="dryRun">只判定不写入。</param>
     /// <param name="force">忽略 manual 暂停强行入队。</param>
+    /// <param name="requestId">可选幂等键：同一键重复调用返回首次创建的队列项。</param>
     /// <param name="cancellationToken">取消令牌。</param>
     Task<DispatchOutcome> DispatchNowAsync(
         string taskId,
@@ -108,6 +109,7 @@ public interface IDispatchService
         string provider,
         bool dryRun,
         bool force,
+        string? requestId,
         CancellationToken cancellationToken = default);
 }
 

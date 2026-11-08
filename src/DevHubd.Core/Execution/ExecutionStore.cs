@@ -1,6 +1,7 @@
 using System.Text.Json;
 using DevHubd.Core.Data;
 using DevHubd.Core.Data.Entities;
+using DevHubd.Core.Models;
 using Microsoft.EntityFrameworkCore;
 
 namespace DevHubd.Core.Execution;
@@ -336,6 +337,27 @@ public sealed class ExecutionStore
             """,
             // null 值直接以 null 传递：EF 会为无类型参数生成 NULL，不需要（也不应）传 DBNull。
             new object[] { dedupeKey, kind, taskId!, title, body, now },
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 进程重启兜底：把仍在执行中（<c>ended_at IS NULL</c>）的 attempt 统一标记为
+    /// <c>abandoned / PROCESS_RESTART</c>。单实例互斥保证启动时不存在并发执行体，
+    /// 因此这些行都属于上一个已退出进程，不能让它永远悬空。
+    /// </summary>
+    /// <param name="now">结束时间（UTC + Z）。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    /// <returns>被兜底关闭的 attempt 行数。</returns>
+    public async Task<int> AbandonOrphanAttemptsAsync(string now, CancellationToken cancellationToken = default)
+    {
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        return await db.Database.ExecuteSqlRawAsync(
+            """
+            UPDATE attempt
+            SET ended_at = {0}, outcome = 'abandoned', error_code = {1}
+            WHERE ended_at IS NULL;
+            """,
+            new object[] { now, DevHubErrorCodes.ProcessRestart },
             cancellationToken).ConfigureAwait(false);
     }
 

@@ -135,9 +135,11 @@
 | `workspaceId` | string? | null | 任务 id 跨工作区重名时必须提供 |
 | `provider` | string | `auto` | `auto` / `openai` / `vscode` |
 | `dryRun` | bool | false | 只校验不派发 |
-| `force` | bool | false | 跳过“已在队列中”的去重 |
+| `force` | bool | false | 调度处于 manual 暂停时强行入队（quota/auth 等硬暂停不可覆盖） |
+| `requestId` | string? | null | 幂等键（1–100 字符）；同键重复调用返回首次创建的队列项 |
 
 返回 `{ taskId, workspaceId, status, queueItemId, provider, dryRun }`。
+`force` 只覆盖 manual 暂停，不改变“已在队列中”的去重语义；需要去重请使用 `requestId`。
 
 错误码：`UNKNOWN_TASK`、`AMBIGUOUS_TASK`、`TASK_NOT_READY`、`SCHEDULER_PAUSED`、
 `PROVIDER_UNAVAILABLE`、`NO_MODEL_PROVIDER`、`INVALID_PROVIDER`。
@@ -152,7 +154,9 @@
 | `provider` | string? | `reset_breaker` 必填：`openai` / `vscode` |
 
 返回 `SchedulerControlSnapshot`：`enabled` / `mode` / `pauseReason` / `intervalSeconds` /
-`scanRequested` / `changed` / `providers[]`。
+`scanRequested` / `changed` / `probeStarted` / `providers[]`。
+`probeStarted=true` 表示本次调用启动了后台探测（`action=probe_models`），探测进行中再次调用返回 `false`，
+结果通过 `scheduler_status.providers[]` 轮询。
 
 错误码：`INVALID_ACTION`、`INVALID_ARGUMENT` 及 `SchedulerControlException` 携带的任务级码（retryable 由异常决定）。
 
@@ -281,6 +285,18 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 ---
 
 ## 6. 变更记录
+
+### U12 — 2026-11-08（无状态整改：档位以库为准、派发幂等、探测异步、重启兜底）
+
+- 交付档位统一以 `scheduler_state.mode` 为唯一事实来源：`TurnRunner` 每回合读库，
+  `devhub://limits` 与控制面快照同源读取；`EffectiveDeliveryMode` 仅保留为启动种子/展示缓存，
+  不再参与交付判定，消除“库已切换、执行仍按启动配置跑”的漂移。
+- `dispatch_now` 新增可选 `requestId`（1–100 字符）：提供时以 `request:{workspaceId}:{requestId}`
+  作为 `dedupe_key`，同键重复派发返回首次创建的队列项（`status=deduped`、`queueItemId` 相同）。
+- `scheduler_control` 的 `probe_models` 改为异步：调用只启动后台探测并立即返回 `probeStarted=true`，
+  provider 结果由 `scheduler_status` 轮询；探测进行中重复调用返回 `false`，不再阻塞调用方。
+- 启动时（单实例互斥下）把 `ended_at IS NULL` 的遗留 attempt 统一置 `abandoned/PROCESS_RESTART`，
+  避免重启后统计与排障仍显示“运行中”。新增错误码 `PROCESS_RESTART`。
 
 ### U10 — 2026-11-08（不确定项回流：会话侧取回与回答）
 

@@ -57,16 +57,18 @@ public sealed class P3ControlTests : IAsyncLifetime
         return ValueTask.CompletedTask;
     }
 
-    /// <summary>上报的 deliveryMode 必须来自运行时单例，而不是命令行解锁标记或配置初值。</summary>
+    /// <summary>上报的 deliveryMode 必须来自库中实际档位，而不是命令行解锁标记或配置初值。</summary>
     [Fact]
-    public async Task Limits_DeliveryMode_MatchesRuntimeModeAsync()
+    public async Task Limits_DeliveryMode_MatchesPersistedModeAsync()
     {
+        var ct = TestContext.Current.CancellationToken;
         var options = DevHubdOptions.FromArgsAndEnvironment(Array.Empty<string>());
         Assert.False(options.AllowAutoDelivery);
 
         var execution = new ExecutionOptions().Normalize();
-        var limits = await new DevHubd.Endpoints.LimitsSource(execution, new EffectiveDeliveryMode("auto"), options)
-            .GetAsync(TestContext.Current.CancellationToken);
+        await _stateStore.SetModeAsync("auto", ct);
+
+        var limits = await new DevHubd.Endpoints.LimitsSource(execution, _stateStore, options).GetAsync(ct);
 
         Assert.Equal("auto", limits.Mode);
     }
@@ -176,9 +178,9 @@ public sealed class P3ControlTests : IAsyncLifetime
         Assert.Equal(1, await CountAuditAsync("provider.reset_breaker", ct));
     }
 
-    /// <summary>probe_models 会把两个 provider 的探测结果落库。</summary>
+    /// <summary>probe_models 立即返回 <c>probeStarted=true</c>，并在后台把两个 provider 的探测结果落库。</summary>
     [Fact]
-    public async Task ProbeModels_PersistsProviderStatesAsync()
+    public async Task ProbeModels_StartsBackgroundProbeAndPersistsAsync()
     {
         var ct = TestContext.Current.CancellationToken;
         var control = CreateControl(
@@ -187,11 +189,22 @@ public sealed class P3ControlTests : IAsyncLifetime
 
         var snapshot = await control.ProbeModelsAsync(ct);
 
-        var openai = await _providerStates.GetAsync("openai", ct);
-        var vscode = await _providerStates.GetAsync("vscode", ct);
-        Assert.Equal(ProviderStates.Ready, openai!.State);
-        Assert.Equal(ProviderStates.Down, vscode!.State);
-        Assert.Equal(2, snapshot.Providers.Count);
+        // 探测转为后台执行：调用只负责启动，结果靠 scheduler_status 轮询。
+        Assert.True(snapshot.ProbeStarted);
+
+        await WaitUntilAsync(
+            async () =>
+            {
+                var openai = await _providerStates.GetAsync("openai", ct);
+                var vscode = await _providerStates.GetAsync("vscode", ct);
+                return openai?.State == ProviderStates.Ready && vscode?.State == ProviderStates.Down;
+            },
+            ct);
+
+        var persistedOpenAi = await _providerStates.GetAsync("openai", ct);
+        var persistedVsCode = await _providerStates.GetAsync("vscode", ct);
+        Assert.Equal(ProviderStates.Ready, persistedOpenAi!.State);
+        Assert.Equal(ProviderStates.Down, persistedVsCode!.State);
     }
 
     /// <summary>显式指定 vscode 且桥不在线时，dispatch_now 语义返回 PROVIDER_UNAVAILABLE。</summary>
@@ -231,7 +244,8 @@ public sealed class P3ControlTests : IAsyncLifetime
         await new Core.Tasks.TaskScanner(_factory)
             .ScanAsync(new WorkspaceDefinition("alpha", workspaceRoot, true), ct);
 
-        var outcome = await dispatcher.DispatchNowAsync("T-001", "alpha", "vscode", dryRun: false, force: false, ct);
+        var outcome = await dispatcher.DispatchNowAsync(
+            "T-001", "alpha", "vscode", dryRun: false, force: false, requestId: null, ct);
 
         Assert.Equal(DispatchStatus.ProviderUnavailable, outcome.Status);
         Assert.Equal("vscode", outcome.Provider);
@@ -255,9 +269,26 @@ public sealed class P3ControlTests : IAsyncLifetime
             _deliveryMode,
             NullLogger<SchedulerControlService>.Instance);
 
-    /// <summary>统计指定动作的审计条数。</summary>
-    /// <param name="action">动作名。</param>
+    /// <summary>轮询等待条件成立；超时即失败。</summary>
+    /// <param name="condition">条件。</param>
     /// <param name="cancellationToken">取消令牌。</param>
+    private static async Task WaitUntilAsync(Func<Task<bool>> condition, CancellationToken cancellationToken)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (await condition())
+            {
+                return;
+            }
+
+            await Task.Delay(25, cancellationToken);
+        }
+
+        Assert.Fail("等待条件超时。");
+    }
+
+    /// <summary>统计指定动作的审计条数。</summary>
     private async Task<int> CountAuditAsync(string action, CancellationToken cancellationToken)
     {
         using var connection = await _factory.OpenAsync(cancellationToken);

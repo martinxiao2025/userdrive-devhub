@@ -30,19 +30,33 @@ public sealed class DispatchNowTool
     /// <param name="provider">auto / openai / vscode。</param>
     /// <param name="dryRun">是否只判定不写入。</param>
     /// <param name="force">manual 暂停时是否强制入队（仅人工暂停可覆盖）。</param>
+    /// <param name="requestId">可选幂等键（1–100 字符）；同键重复调用返回首次创建的队列项。</param>
     /// <param name="cancellationToken">取消令牌。</param>
     [McpServerTool(Name = "dispatch_now", ReadOnly = false, Idempotent = true, OpenWorld = false)]
-    [Description("立即把指定任务加入调度队列。默认 dryRun=false 会写入队列；dryRun=true 只返回判定结果。显式指定 provider 时会先校验其可用性。")]
+    [Description("立即把指定任务加入调度队列。默认 dryRun=false 会写入队列；dryRun=true 只返回判定结果。显式指定 provider 时会先校验其可用性。提供 requestId 时同一键重复调用幂等返回首次的队列项。")]
     public async Task<CallToolResult> DispatchAsync(
         [Description("任务 id（.devhub/tasks 中的 id）。")] string taskId,
         [Description("可选：工作区 id；同名任务存在于多个工作区时必须指定。")] string? workspaceId = null,
         [Description("首选 provider：" + ToolVocabulary.Providers + "（auto 为默认，按可用性选择）。")] string provider = "auto",
         [Description("true 时只判定不写入。")] bool dryRun = false,
         [Description("true 时忽略 manual 暂停强行入队；quota/auth 等硬暂停不可覆盖。")] bool force = false,
+        [Description("可选幂等键（1–100 字符）：同一键重复调用返回首次创建的队列项。")] string? requestId = null,
         CancellationToken cancellationToken = default)
     {
+        var normalizedRequestId = string.IsNullOrWhiteSpace(requestId) ? null : requestId.Trim();
+        if (normalizedRequestId is { Length: > 100 })
+        {
+            return await FailureAsync(
+                "INVALID_ARGUMENT",
+                "requestId 长度为 1–100 字符。",
+                retryable: true,
+                next: "缩短 requestId 后重试。",
+                details: new { length = normalizedRequestId.Length },
+                cancellationToken).ConfigureAwait(false);
+        }
+
         var outcome = await _dispatcher
-            .DispatchNowAsync(taskId, workspaceId, provider, dryRun, force, cancellationToken)
+            .DispatchNowAsync(taskId, workspaceId, provider, dryRun, force, normalizedRequestId, cancellationToken)
             .ConfigureAwait(false);
 
         switch (outcome.Status)

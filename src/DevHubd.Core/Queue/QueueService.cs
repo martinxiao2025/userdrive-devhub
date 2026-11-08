@@ -153,16 +153,21 @@ public sealed class QueueService
     /// <param name="task">任务投影。</param>
     /// <param name="provider">首选 provider。</param>
     /// <param name="dryRun">只判断是否可入队，不写库。</param>
+    /// <param name="requestId">可选幂等键；提供时以其作为去重键，同一键重复派发返回首次队列项。</param>
     /// <param name="cancellationToken">取消令牌。</param>
     public async Task<ManualEnqueueResult> EnqueueTaskAsync(
         string workspaceId,
         TaskRow task,
         string provider,
         bool dryRun,
+        string? requestId,
         CancellationToken cancellationToken = default)
     {
         var now = Now();
-        var dedupeKey = BuildDedupeKey(workspaceId, task.Id, task.ContentHash);
+        // 幂等键直接作为 dedupe_key：复用它既有的唯一约束与去重分支，避免为请求号新增列。
+        var dedupeKey = string.IsNullOrWhiteSpace(requestId)
+            ? BuildDedupeKey(workspaceId, task.Id, task.ContentHash)
+            : $"request:{workspaceId}:{requestId.Trim()}";
 
         await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);

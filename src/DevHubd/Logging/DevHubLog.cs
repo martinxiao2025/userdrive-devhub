@@ -120,6 +120,11 @@ internal static partial class DevHubLog
         int removed,
         int unchanged);
 
+    /// <summary>启动时把上一个进程遗留的未结束 attempt 兜底为 abandoned。</summary>
+    [LoggerMessage(EventId = 1111, Level = LogLevel.Warning,
+        Message = "重启兜底：已把遗留 attempt 标记为 abandoned。count={Count}")]
+    public static partial void OrphanAttemptsAbandoned(ILogger logger, int count);
+
     /// <summary>健康检查探库失败，<c>/health</c> 返回 503。</summary>
     [LoggerMessage(EventId = 1200, Level = LogLevel.Warning,
         Message = "健康检查失败，/health 返回 503。database={Database}")]

@@ -26,6 +26,7 @@ public sealed class SchedulerControlService : ISchedulerControl
     private readonly DevHubdOptions _options;
     private readonly EffectiveDeliveryMode _deliveryMode;
     private readonly ILogger<SchedulerControlService> _logger;
+    private int _probeRunning;
 
     /// <summary>注入状态存取、唤醒信号、provider 状态、客户端注册表、启动选项、运行时档位与日志器。</summary>
     /// <param name="stateStore">调度状态存取。</param>
@@ -221,40 +222,71 @@ public sealed class SchedulerControlService : ISchedulerControl
     /// <param name="cancellationToken">取消令牌。</param>
     public async Task<SchedulerControlSnapshot> ProbeModelsAsync(CancellationToken cancellationToken = default)
     {
-        foreach (var provider in _clients.Providers)
+        // 探测可能持续数十秒：只负责启动后台任务并立即回显，调用方用 scheduler_status 轮询结果。
+        var started = Interlocked.CompareExchange(ref _probeRunning, 1, 0) == 0;
+        if (started)
         {
-            var client = _clients.Get(provider);
-            if (client is null)
-            {
-                continue;
-            }
+            await _stateStore.AuditAsync(Actor, "provider.probe_models", null, null, cancellationToken)
+                .ConfigureAwait(false);
 
-            var health = await client.ProbeAsync(cancellationToken).ConfigureAwait(false);
-            var current = await _providerStates.GetAsync(provider, cancellationToken).ConfigureAwait(false);
-            await _providerStates.SaveAsync(
-                new ProviderStateRecord(
-                    provider,
-                    health.State,
-                    health.Detail,
-                    current?.Breaker ?? BreakerStates.Closed,
-                    current?.BreakerReason,
-                    current?.BreakerOpenedAt,
-                    current?.ConsecutiveFailures ?? 0,
-                    DateTimeOffset.UtcNow.ToString("O")),
-                cancellationToken).ConfigureAwait(false);
-
-            _logger.LogInformation(
-                "provider 探测完成：provider={Provider} state={State} available={Available}",
-                provider,
-                health.State,
-                health.Available);
+            _ = Task.Run(ProbeModelsInBackgroundAsync, CancellationToken.None);
+            _logger.LogInformation("已启动 provider 后台探测。");
         }
 
-        await _stateStore.AuditAsync(Actor, "provider.probe_models", null, null, cancellationToken)
-            .ConfigureAwait(false);
-
         var state = await _stateStore.ReadAsync(cancellationToken).ConfigureAwait(false);
-        return await ToSnapshotAsync(state, scanRequested: false, changed: false, cancellationToken).ConfigureAwait(false);
+        return await ToSnapshotAsync(
+            state,
+            scanRequested: false,
+            changed: false,
+            cancellationToken,
+            probeStarted: started).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 后台探测所有 provider 并落库；不向外抛异常，避免未观察任务导致进程异常。
+    /// </summary>
+    private async Task ProbeModelsInBackgroundAsync()
+    {
+        try
+        {
+            foreach (var provider in _clients.Providers)
+            {
+                var client = _clients.Get(provider);
+                if (client is null)
+                {
+                    continue;
+                }
+
+                var health = await client.ProbeAsync(CancellationToken.None).ConfigureAwait(false);
+                var current = await _providerStates.GetAsync(provider, CancellationToken.None).ConfigureAwait(false);
+                await _providerStates.SaveAsync(
+                    new ProviderStateRecord(
+                        provider,
+                        health.State,
+                        health.Detail,
+                        current?.Breaker ?? BreakerStates.Closed,
+                        current?.BreakerReason,
+                        current?.BreakerOpenedAt,
+                        current?.ConsecutiveFailures ?? 0,
+                        DateTimeOffset.UtcNow.ToString("O")),
+                    CancellationToken.None).ConfigureAwait(false);
+
+                _logger.LogInformation(
+                    "provider 探测完成：provider={Provider} state={State} available={Available}",
+                    provider,
+                    health.State,
+                    health.Available);
+            }
+        }
+        catch (Exception exception)
+        {
+            // 探测是尽力而为：失败只记日志，状态仍保留上一次结果，由调度器按熔断语义处理。
+            _logger.LogWarning(exception, "provider 后台探测失败。");
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _probeRunning, 0);
+        }
     }
 
     /// <summary>环境变量硬关（<c>DEVHUB_SCHEDULER=off</c>）时拒绝启动类动作。</summary>
@@ -278,7 +310,8 @@ public sealed class SchedulerControlService : ISchedulerControl
         SchedulerState state,
         bool scanRequested,
         bool changed,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool probeStarted = false)
     {
         var providers = await _providerStates.ListAsync(cancellationToken).ConfigureAwait(false);
         return new SchedulerControlSnapshot
@@ -289,6 +322,7 @@ public sealed class SchedulerControlService : ISchedulerControl
             IntervalSeconds = state.IntervalSeconds,
             ScanRequested = scanRequested,
             Changed = changed,
+            ProbeStarted = probeStarted,
             Providers = providers
                 .Select(record => new ProviderStatus
                 {

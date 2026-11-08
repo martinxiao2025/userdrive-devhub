@@ -77,6 +77,9 @@ public sealed record SchedulerControlSnapshot
     /// <summary>本次动作是否实际改变了状态（幂等动作可为 false）。</summary>
     public bool Changed { get; init; }
 
+    /// <summary>本次调用是否启动了后台 provider 探测（<c>probe_models</c>）；结果用 scheduler_status 轮询。</summary>
+    public bool ProbeStarted { get; init; }
+
     /// <summary>provider 状态（控制面动作后回显，便于确认熔断是否已重置）。</summary>
     public IReadOnlyList<ProviderStatus> Providers { get; init; } = Array.Empty<ProviderStatus>();
 }

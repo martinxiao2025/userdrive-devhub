@@ -100,4 +100,7 @@ public static class DevHubErrorCodes
 
     /// <summary>结果不处于待审批状态，不能通过或驳回。</summary>
     public const string ResultNotPending = "RESULT_NOT_PENDING";
+
+    /// <summary>进程重启导致上一个进程的回合中断（attempt 兜底为 abandoned）。</summary>
+    public const string ProcessRestart = "PROCESS_RESTART";
 }
