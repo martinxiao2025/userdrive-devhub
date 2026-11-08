@@ -280,6 +280,40 @@ public sealed class P2ExecutionTests : IDisposable
         Assert.Equal(1, await CountAsync("SELECT COUNT(*) FROM queue_item WHERE status = 'cancelled';", ct));
     }
 
+    /// <summary>
+    /// 认领成功后 provider 状态检查抛异常时，必须归还并发槽位；
+    /// 否则 MaxParallel=1 的协调器会永久失去派发能力。
+    /// </summary>
+    [Fact]
+    public async Task Pump_WhenProviderCheckThrows_ReleasesSlotAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "第一个", "ready", 20);
+        WriteTask(root, "T-002", "第二个", "ready", 10);
+        await PrepareQueueAsync(ct);
+
+        var fake = new FakeModelClient(
+            "openai",
+            (request, _, _) => Task.FromResult(TurnResult.Done($"完成 {request.TaskId}", 0, null, Array.Empty<string>())));
+        var coordinator = CreateCoordinator(fake, new ExecutionOptions { MaxParallel = 1 });
+
+        // 删掉 provider_state：第一次 Pump 在认领成功后、置 running 之前抛 SqliteException。
+        var ddl = await ScalarStringAsync(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'provider_state';",
+            ct);
+        Assert.NotNull(ddl);
+        await ExecuteAsync("DROP TABLE provider_state;", ct);
+
+        await Assert.ThrowsAsync<SqliteException>(() => coordinator.PumpAsync(ct));
+
+        // 恢复表后再次 Pump：若槽位泄漏，这里会因 MaxParallel=1 而返回 0。
+        await ExecuteAsync(ddl!, ct);
+        Assert.Equal(1, await coordinator.PumpAsync(ct));
+        await WaitUntilAsync(async () => await CountAsync("SELECT COUNT(*) FROM result;", ct) == 1, ct);
+    }
+
     /// <summary>构建执行协调器。</summary>
     /// <param name="fake">假模型客户端。</param>
     /// <param name="options">执行配置。</param>
@@ -410,6 +444,17 @@ public sealed class P2ExecutionTests : IDisposable
         command.CommandText = sql;
         var value = await command.ExecuteScalarAsync(cancellationToken);
         return Convert.ToInt64(value, System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>执行一条非查询 SQL（测试内构造异常/恢复 schema 用）。</summary>
+    /// <param name="sql">SQL 语句。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private async Task ExecuteAsync(string sql, CancellationToken cancellationToken)
+    {
+        using var connection = await _factory.OpenAsync(cancellationToken);
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
     /// <summary>读取字符串值。</summary>

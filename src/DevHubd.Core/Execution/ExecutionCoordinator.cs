@@ -76,43 +76,46 @@ public sealed class ExecutionCoordinator
                 break;
             }
 
-            ClaimedQueueItem? claimed;
+            var slotHandedOff = false;
             try
             {
-                claimed = await _queue
+                var claimed = await _queue
                     .ClaimDetailedAsync(_ownerId, TimeSpan.FromSeconds(_options.LeaseSeconds), cancellationToken)
                     .ConfigureAwait(false);
+
+                if (claimed is null)
+                {
+                    break;
+                }
+
+                if (!await _providerStates.IsDispatchAllowedAsync(claimed.Item.PreferredProvider, cancellationToken)
+                        .ConfigureAwait(false))
+                {
+                    // 熔断打开：不消耗重试预算，退回队列并停止本轮认领，避免空转。
+                    await ReleaseBlockedAsync(claimed).ConfigureAwait(false);
+                    _logger.LogWarning(
+                        "provider 熔断打开，暂停派发：queueItemId={QueueItemId} provider={Provider}",
+                        claimed.Item.Id,
+                        claimed.Item.PreferredProvider);
+                    break;
+                }
+
+                await _store.MarkRunningAsync(claimed.Item.Id, Now(), cancellationToken).ConfigureAwait(false);
+
+                var task = RunTrackedAsync(claimed, cancellationToken);
+                _active[claimed.Item.Id] = task;
+                slotHandedOff = true;
+                started++;
             }
-            catch
+            finally
             {
-                _slots.Release();
-                throw;
+                // 认领后的任一步失败都必须归还槽位，否则并发容量会永久减少；
+                // 成功交给 RunTrackedAsync 后由它负责释放，避免重复 Release。
+                if (!slotHandedOff)
+                {
+                    _slots.Release();
+                }
             }
-
-            if (claimed is null)
-            {
-                _slots.Release();
-                break;
-            }
-
-            if (!await _providerStates.IsDispatchAllowedAsync(claimed.Item.PreferredProvider, cancellationToken)
-                    .ConfigureAwait(false))
-            {
-                // 熔断打开：不消耗重试预算，退回队列并停止本轮认领，避免空转。
-                await ReleaseBlockedAsync(claimed).ConfigureAwait(false);
-                _slots.Release();
-                _logger.LogWarning(
-                    "provider 熔断打开，暂停派发：queueItemId={QueueItemId} provider={Provider}",
-                    claimed.Item.Id,
-                    claimed.Item.PreferredProvider);
-                break;
-            }
-
-            await _store.MarkRunningAsync(claimed.Item.Id, Now(), cancellationToken).ConfigureAwait(false);
-
-            var task = RunTrackedAsync(claimed, cancellationToken);
-            _active[claimed.Item.Id] = task;
-            started++;
         }
 
         return started;

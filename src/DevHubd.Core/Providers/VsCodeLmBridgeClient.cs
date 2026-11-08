@@ -21,6 +21,9 @@ public sealed class VsCodeLmBridgeClient : IModelClient
 
     private const int PollWaitSeconds = 30;
 
+    /// <summary>取消远端回合的最长等待时间；桥无响应时不能让取消请求永久挂起。</summary>
+    private static readonly TimeSpan _cancelTimeout = TimeSpan.FromSeconds(3);
+
     /// <summary>与扩展交换 JSON 时的序列化约定：camelCase，与 <c>lm-bridge.json</c> 保持一致。</summary>
     private static readonly JsonSerializerOptions _bridgeJson = new(JsonSerializerDefaults.Web);
 
@@ -251,16 +254,19 @@ public sealed class VsCodeLmBridgeClient : IModelClient
         }
     }
 
-    /// <summary>尽力取消远端回合；失败只记 Debug，不影响本回合的结果语义。</summary>
+    /// <summary>尽力取消远端回合；失败或超时只记 Debug，不影响本回合的结果语义。</summary>
     /// <param name="discovery">发现信息。</param>
     /// <param name="turnId">回合 id。</param>
     private async Task CancelTurnAsync(LmBridgeDiscovery discovery, string turnId)
     {
         try
         {
+            // 共享 HttpClient 不设超时（回合超时由上层预算控制），取消请求必须自带上限：
+            // 桥进程卡死时不能让它阻塞 RunTurnAsync 的 finally 与宿主停机。
+            using var timeout = new CancellationTokenSource(_cancelTimeout);
             using var delete = new HttpRequestMessage(HttpMethod.Delete, $"{BaseUrl(discovery)}/turns/{turnId}");
             delete.Headers.Authorization = new AuthenticationHeaderValue("Bearer", discovery.Token);
-            using var response = await _http.SendAsync(delete, CancellationToken.None).ConfigureAwait(false);
+            using var response = await _http.SendAsync(delete, timeout.Token).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
             {
                 _logger.LogDebug("取消 vscode 回合返回 {StatusCode}：turnId={TurnId}", (int)response.StatusCode, turnId);

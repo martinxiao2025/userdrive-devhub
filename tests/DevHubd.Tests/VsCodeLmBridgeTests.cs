@@ -140,6 +140,35 @@ public sealed class VsCodeLmBridgeTests : IAsyncLifetime
         Assert.Null(result.Usage);
     }
 
+    /// <summary>
+    /// 取消回合时桥对 DELETE 无响应：取消请求必须有独立超时，
+    /// 否则共享 HttpClient（无超时）会让 RunTurnAsync 永久挂起。
+    /// </summary>
+    [Fact]
+    public async Task RunTurn_CancelWithStalledBridge_ReturnsCancelledWithinTimeoutAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        WriteDiscovery(pid: 1, port: 1);
+
+        using var http = new HttpClient(new StallingBridgeHandler()) { Timeout = Timeout.InfiniteTimeSpan };
+        var client = new VsCodeLmBridgeClient(
+            http,
+            _paths,
+            new InternalApiOptions("http://127.0.0.1:3091", "internal-token"),
+            new TurnDispatcherRegistry(),
+            NullLogger<VsCodeLmBridgeClient>.Instance);
+
+        using var cancel = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var turn = client.RunTurnAsync(CreateRequest(), new NoopDispatcher(), cancel.Token);
+        await Task.Delay(100, ct);
+        await cancel.CancelAsync();
+
+        var result = await turn.WaitAsync(TimeSpan.FromSeconds(10), ct);
+
+        Assert.Equal(TurnState.Cancelled, result.State);
+        Assert.Equal(ModelErrorKinds.UserCancelled, result.Error!.Kind);
+    }
+
     /// <summary>写出发现文件（camelCase，与扩展约定一致）。</summary>
     /// <param name="pid">pid。</param>
     /// <param name="port">端口。</param>
@@ -200,6 +229,27 @@ public sealed class VsCodeLmBridgeTests : IAsyncLifetime
             JsonElement input,
             CancellationToken cancellationToken = default) =>
             Task.FromResult(ToolExecutionResult.Fail("NOT_SUPPORTED", "测试桩不执行工具"));
+    }
+
+    /// <summary>卡死的桥：POST 立即接受，轮询与 DELETE 一直挂起，只能靠取消超时收敛。</summary>
+    private sealed class StallingBridgeHandler : HttpMessageHandler
+    {
+        /// <inheritdoc />
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            if (request.Method == HttpMethod.Post)
+            {
+                return new HttpResponseMessage(HttpStatusCode.Accepted)
+                {
+                    Content = new StringContent("{}", Encoding.UTF8, "application/json"),
+                };
+            }
+
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
+            throw new InvalidOperationException("不可达");
+        }
     }
 
     /// <summary>

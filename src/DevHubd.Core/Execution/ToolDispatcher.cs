@@ -238,7 +238,17 @@ public sealed class ToolDispatcher : IToolDispatcher
         var results = new List<string>();
         var scanned = 0;
 
-        foreach (var file in Directory.EnumerateFiles(check.FullPath!, "*", SearchOption.AllDirectories))
+        // 用 EnumerationOptions 而不是 SearchOption.AllDirectories：
+        // 后者遇到无权限子目录会抛 UnauthorizedAccessException，一个不可读目录就能让整个回合失败。
+        // AttributesToSkip=0 保持原行为（不跳过隐藏/系统文件）。
+        var enumeration = new EnumerationOptions
+        {
+            RecurseSubdirectories = true,
+            IgnoreInaccessible = true,
+            AttributesToSkip = 0,
+        };
+
+        foreach (var file in Directory.EnumerateFiles(check.FullPath!, "*", enumeration))
         {
             cancellationToken.ThrowIfCancellationRequested();
 

@@ -56,6 +56,40 @@ public sealed class OpenAiUsageTests
         Assert.Null(result.Usage);
     }
 
+    /// <summary>usage 是空对象（端点没给计数字段）时记 null，不能把 0 当真实用量。</summary>
+    [Fact]
+    public async Task RunTurnAsync_EmptyUsageObject_ReturnsNullAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var handler = new ScriptedHandler(
+            """
+            {"choices":[{"message":{"role":"assistant","content":"done"}}],"usage":{}}
+            """);
+
+        var result = await RunAsync(handler, ct);
+
+        Assert.Equal(TurnState.Done, result.State);
+        Assert.Null(result.Usage);
+    }
+
+    /// <summary>只返回单边计数时，缺失的一边按 0 计，整体仍是真实用量。</summary>
+    [Fact]
+    public async Task RunTurnAsync_PartialUsageCountsMissingSideAsZeroAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var handler = new ScriptedHandler(
+            """
+            {"choices":[{"message":{"role":"assistant","content":"done"}}],"usage":{"prompt_tokens":100}}
+            """);
+
+        var result = await RunAsync(handler, ct);
+
+        Assert.NotNull(result.Usage);
+        Assert.Equal(100, result.Usage!.InputTokens);
+        Assert.Equal(0, result.Usage.OutputTokens);
+        Assert.False(result.Usage.Estimated);
+    }
+
     /// <summary>构造客户端并执行一次回合。</summary>
     /// <param name="handler">脚本化 HTTP 处理器。</param>
     /// <param name="cancellationToken">取消令牌。</param>

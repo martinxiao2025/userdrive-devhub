@@ -458,14 +458,20 @@ public sealed class OpenAiCompatibleModelClient : IModelClient
             return null;
         }
 
-        var input = usage.TryGetProperty("prompt_tokens", out var prompt) && prompt.TryGetInt32(out var promptValue)
-            ? promptValue
-            : 0;
-        var output = usage.TryGetProperty("completion_tokens", out var completion) && completion.TryGetInt32(out var completionValue)
-            ? completionValue
-            : 0;
+        var input = 0;
+        var output = 0;
+        var hasInput = usage.TryGetProperty("prompt_tokens", out var prompt) && prompt.TryGetInt32(out input);
+        var hasOutput = usage.TryGetProperty("completion_tokens", out var completion) && completion.TryGetInt32(out output);
 
-        return new TokenUsage(input, output, Estimated: false);
+        // usage 存在但两个计数字段都读不到（例如空对象），说明端点没有给出真实用量：
+        // 必须返回 null，让它按「缺失 usage」处理，而不是把 0 当成真实 token 落库。
+        if (!hasInput && !hasOutput)
+        {
+            return null;
+        }
+
+        // 单边缺失时按 0 计另一边，保持既有 OpenAI 语义。
+        return new TokenUsage(hasInput ? input : 0, hasOutput ? output : 0, Estimated: false);
     }
 
     /// <summary>把 assistant 消息（含 tool_calls）原样回填，保持与请求的 tool_call_id 对应。</summary>
