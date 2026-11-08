@@ -149,7 +149,11 @@ public static class ChatTurnExecutor
                 ResolveToolCalls(response, dispatcher),
                 MapUsage(response.Usage, pipeline.AllRoundsReportedUsage),
                 ResolveChangedFiles(response, dispatcher),
-                pipeline.RoundsExhausted);
+                pipeline.RoundsExhausted) with
+            {
+                // provider 返回的模型名最可靠；缺失时回落到请求中解析出的有效模型名。
+                Model = response.ModelId ?? request.Model,
+            };
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -161,21 +165,33 @@ public static class ChatTurnExecutor
             // 连续工具错误达到框架上限后，框架会把最后一次异常原样抛出。
             return TurnResult.Failed(
                 new ModelError(exception.Kind, exception.Code, exception.Message),
-                dispatcher.ExecutedCalls);
+                dispatcher.ExecutedCalls) with
+            {
+                Model = request.Model,
+            };
         }
         catch (ChatTurnException exception) when (exception.Error.Kind == ModelErrorKinds.UserCancelled)
         {
-            return TurnResult.Cancelled(exception.Error, dispatcher.ExecutedCalls);
+            return TurnResult.Cancelled(exception.Error, dispatcher.ExecutedCalls) with
+            {
+                Model = request.Model,
+            };
         }
         catch (OperationCanceledException)
         {
             return TurnResult.Failed(
                 new ModelError(ModelErrorKinds.Transient, DevHubErrorCodes.RequestTimeout, "模型请求被取消。"),
-                dispatcher.ExecutedCalls);
+                dispatcher.ExecutedCalls) with
+            {
+                Model = request.Model,
+            };
         }
         catch (Exception exception)
         {
-            return TurnResult.Failed(mapException(exception), dispatcher.ExecutedCalls);
+            return TurnResult.Failed(mapException(exception), dispatcher.ExecutedCalls) with
+            {
+                Model = request.Model,
+            };
         }
     }
 

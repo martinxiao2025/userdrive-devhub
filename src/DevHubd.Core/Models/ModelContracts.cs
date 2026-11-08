@@ -148,6 +148,9 @@ public sealed record TurnResult(
     ModelError? Error,
     bool RoundsExhausted = false)
 {
+    /// <summary>provider 实际使用的模型名；未知时为 null。</summary>
+    public string? Model { get; init; }
+
     /// <summary>构造成功结果。</summary>
     /// <param name="text">模型文本。</param>
     /// <param name="toolCalls">工具调用次数。</param>

@@ -36,10 +36,11 @@ const ROLE_ID_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
 const TOOL_NAME_PATTERN = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/;
 
 /**
- * 已知 MCP 工具表：新增工具必须先更新本表与 docs/mcp-tool-contract.md，否则角色引用会失败。
- * 前 7 个为已实现工具；后 5 个为方案已给契约但尚未上线的工具。
+ * 已知工具表：新增工具必须先更新本表与 docs/mcp-tool-contract.md，否则角色引用会失败。
+ * 文件与交互工具由回合内 ToolDispatcher 提供；其余为 MCP 服务层工具。
  */
 const KNOWN_TOOLS = new Set([
+  'read_file', 'list_dir', 'search', 'write_file', 'apply_patch', 'ask_input',
   'scheduler_status', 'queue_list', 'queue_get', 'dispatch_now', 'scheduler_control',
   'result_list', 'result_ack',
   'input_request_list', 'input_request_get', 'input_request_answer', 'input_request_cancel',

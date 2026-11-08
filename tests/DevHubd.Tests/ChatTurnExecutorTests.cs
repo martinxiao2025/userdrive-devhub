@@ -169,6 +169,32 @@ public sealed class ChatTurnExecutorTests
         Assert.DoesNotContain(records, record => record.Message.Contains("SECRET_TOKEN_VALUE", StringComparison.Ordinal));
     }
 
+    /// <summary>响应里的实际模型名必须回传到 <see cref="TurnResult.Model"/>，供 attempt.model 落库。</summary>
+    [Fact]
+    public async Task RunAsync_CapturesResponseModelIdAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var dispatcher = new ScriptedDispatcher(_ => ToolExecutionResult.Ok("ok"));
+        var inner = new ScriptedChatClient(_ => new ChatResponse(new ChatMessage(ChatRole.Assistant, "完成"))
+        {
+            ModelId = "gpt-5-test",
+        });
+
+        var request = CreateRequest(maxRounds: 2);
+        using var pipeline = ChatTurnExecutor.CreatePipeline(inner, request, dispatcher, NullLogger.Instance);
+
+        var result = await ChatTurnExecutor.RunAsync(
+            pipeline,
+            request,
+            dispatcher,
+            MapTestException,
+            NullLogger.Instance,
+            ct);
+
+        Assert.Equal(TurnState.Done, result.State);
+        Assert.Equal("gpt-5-test", result.Model);
+    }
+
     /// <summary>构造一个最小回合请求。</summary>
     /// <param name="maxRounds">工具轮数上限。</param>
     private static TurnRequest CreateRequest(int maxRounds) => new(

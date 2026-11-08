@@ -240,20 +240,28 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 | `comment` | string? | 审批意见，写入审计 |
 
 返回：`{ resultId, outcome:"delivered", taskId, decidedAt }`。
-语义：仅 `awaiting_review` 可审批；通过后结果终态置 `delivered`，`task_view.approval_state` 置 `approved`，
-并写 `audit(action='result.approved', actor='mcp')`。
+语义：仅 `awaiting_review` 可审批；通过后结果终态置 `delivered`，`task_view.approval_state` 置 `approved`、
+`task_view.status` 置 `done`，并把任务文件的 `status` 同步写成 `done`，
+同时写 `audit(action='result.approved', actor='mcp')`。
 错误码：`UNKNOWN_RESULT`、`RESULT_NOT_PENDING`（均 retryable=false）。
 
 ### 3.13 `result_reject`
 
 参数：`resultId`、`comment?`。
 返回：`{ resultId, outcome:"failed", taskId, decidedAt }`。
-语义：驳回后结果终态置 `failed`，`task_view.approval_state` 置 `rejected`，写 `audit(action='result.rejected')`
+语义：驳回后结果终态置 `failed`，`task_view.approval_state` 置 `rejected`、`task_view.status` 回到 `ready`
+（等待重新派发），任务文件 `status` 同步写成 `ready`；写 `audit(action='result.rejected')`
 与 `notice.kind='failure'`（去重键 `result-rejected:<resultId>`）。
 错误码：`UNKNOWN_RESULT`、`RESULT_NOT_PENDING`。
 
 两个工具同向重复提交是幂等的（`decidedAt=null`，不重复写审计/通知）；反向提交返回
-`RESULT_NOT_PENDING`，不覆盖既有终态。审批不修改任务文件。
+`RESULT_NOT_PENDING`，不覆盖既有终态。**任务状态与任务文件、`task_view` 同时回写**：
+
+| 审批态 | 结果 outcome | task_view.status | 任务文件 status |
+|---|---|---|---|
+| 待审 `pending` | `awaiting_review` | `ready` | `ready` |
+| 通过 `approved` | `delivered` | `done` | `done` |
+| 驳回 `rejected` | `failed` | `ready` | `ready` |
 
 ---
 
@@ -458,11 +466,24 @@ COUNT(attempt WHERE queue_item_id = ?
   `comment` 截断到 200 字符写入 `audit.detail`。
 - 驳回额外写 `notice.kind='failure'`，去重键 `result-rejected:<resultId>`，正文优先取驳回原因，否则取结果摘要；
   通过不写通知（结果本身已由 `result_list` 可见）。
-- `devhub://tasks` 条目新增 `approvalState`；审批**不修改任务文件**，任务清单仍由工作区维护。
+- `devhub://tasks` 条目新增 `approvalState`；审批通过/驳回会同时回写任务文件与 `task_view.status`（见 §3.12–§3.13）。
 - 新增错误码（只增不改）：`UNKNOWN_RESULT`、`RESULT_NOT_PENDING`；连同前序单元累计新增
   `NEEDS_INPUT`、`INPUT_TIMEOUT`、`INPUT_NOT_ALLOWED`、`UNKNOWN_INPUT_REQUEST`、`INPUT_REQUEST_CLOSED`、
   `INVALID_ANSWER`、`ANSWER_CONFLICT`、`INVALID_ROLE`、`TASK_CONFLICT`、`TASK_CHANGED`、
   `DEPENDENCY_UNMET`、`AMBIGUOUS_WORKSPACE`。
+
+### U12 — 2026-11-08（角色工具面接入回合 + 状态回写 + 模型名落库）
+
+- 后台回合的工具面由角色声明的 `tools` 决定：`TurnRunner` 读取角色快照后构建白名单，
+  `ToolDispatcher` 只暴露白名单内的文件工具与服务层工具；越权调用返回 `TOOL_NOT_ALLOWED`。
+- `task_upsert`、`queue_*`、`scheduler_status`、`result_*`、`input_request_*` 在后台回合内
+  走与聊天侧相同的服务层实现（由 Mcp 层 `McpTurnToolService` 适配），不再只能由会话代录。
+- 角色快照缺失时使用显式缺省工具集（`TurnRunner.DefaultToolNames`），不做隐式兜底；
+  `ask_input` 仍需同时满足角色 `canRequestInput=true`。
+- 审批状态回写：通过 → 任务 `done`，驳回 → 任务 `ready`，待审保持 `ready`；
+  `task_view` 与任务文件同一结论，扫描器下一轮不会把状态改回去。
+- `attempt.model` 落 provider 实际使用的模型名（优先响应 `model`，缺失时回落到请求解析出的默认模型）。
+- 新增错误码（只增不改）：`TOOL_NOT_ALLOWED`。
 
 ### v4 — 2026-11-08（数据修正，无字段变化）
 

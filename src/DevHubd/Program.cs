@@ -267,7 +267,8 @@ internal static class Program
         builder.Services.AddSingleton(serviceProvider => new ResultStore(
             serviceProvider.GetRequiredService<IDbContextFactory<DevHubDbContext>>()));
         builder.Services.AddSingleton(serviceProvider => new ResultDecisionStore(
-            serviceProvider.GetRequiredService<IDbContextFactory<DevHubDbContext>>()));
+            serviceProvider.GetRequiredService<IDbContextFactory<DevHubDbContext>>(),
+            serviceProvider.GetRequiredService<ILogger<ResultDecisionStore>>()));
         builder.Services.AddSingleton(serviceProvider => new NoticeStore(
             serviceProvider.GetRequiredService<IDbContextFactory<DevHubDbContext>>()));
         builder.Services.AddSingleton(serviceProvider => new RoleSnapshotStore(

@@ -120,10 +120,13 @@ public sealed class OpenAiCompatibleModelClient : IModelClient
         }
 
         var model = request.Model ?? _options.Model;
-        using var pipeline = CreatePipeline(model, apiKey, request, dispatcher);
+
+        // 把解析后的有效模型名回填到请求，确保 attempt.model 不会因为"用默认值"而落 NULL。
+        var effectiveRequest = request with { Model = model };
+        using var pipeline = CreatePipeline(model, apiKey, effectiveRequest, dispatcher);
 
         return await ChatTurnExecutor
-            .RunAsync(pipeline, request, dispatcher, MapException, _logger, cancellationToken)
+            .RunAsync(pipeline, effectiveRequest, dispatcher, MapException, _logger, cancellationToken)
             .ConfigureAwait(false);
     }
 

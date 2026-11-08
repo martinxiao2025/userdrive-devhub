@@ -1,7 +1,10 @@
 using DevHubd.Core.Data;
 using DevHubd.Core.Data.Entities;
 using DevHubd.Core.Models;
+using DevHubd.Core.Tasks;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace DevHubd.Core.Results;
 
@@ -38,18 +41,24 @@ public sealed record ResultDecisionOutcome(
 
 /// <summary>
 /// 结果审批闸门（U11）：把 <c>awaiting_review</c> 的结果推进到 <c>delivered</c>（通过）或
-/// <c>failed</c>（驳回），并同步 <c>task_view.approval_state</c>、写审计与驳回通知。
-/// 审批不改任务文件：任务清单仍由工作区维护，避免调度器改写用户文件。
+/// <c>failed</c>（驳回），并同步 <c>task_view</c> 与任务文件：
+/// 通过 → 任务 <c>done</c>；驳回 → 任务回到 <c>ready</c>（可重新派发）。
+/// 两处同时回写，避免"审批态变了、任务状态不动"的半边同步。
 /// </summary>
 public sealed class ResultDecisionStore
 {
     private readonly IDbContextFactory<DevHubDbContext> _contextFactory;
+    private readonly ILogger<ResultDecisionStore> _logger;
 
-    /// <summary>注入 EF Core 上下文工厂。</summary>
+    /// <summary>注入 EF Core 上下文工厂与日志器。</summary>
     /// <param name="contextFactory">上下文工厂。</param>
-    public ResultDecisionStore(IDbContextFactory<DevHubDbContext> contextFactory)
+    /// <param name="logger">日志器；null 时使用 NullLogger（测试场景）。</param>
+    public ResultDecisionStore(
+        IDbContextFactory<DevHubDbContext> contextFactory,
+        ILogger<ResultDecisionStore>? logger = null)
     {
         _contextFactory = contextFactory;
+        _logger = logger ?? NullLogger<ResultDecisionStore>.Instance;
     }
 
     /// <summary>用裸连接工厂构造（测试与不依赖 DI 的场景）。</summary>
@@ -121,17 +130,24 @@ public sealed class ResultDecisionStore
             .FirstOrDefaultAsync(cancellationToken)
             .ConfigureAwait(false);
 
+        // 任务状态与审批态同事务回写：通过 → done，驳回 → ready（保留可重做），待审不变。
+        // 任务文件在提交后按同一状态回写，扫描器下一轮读到的就是一致状态。
+        var taskStatus = approve ? "done" : "ready";
+        TaskViewEntity? taskView = null;
         if (!string.IsNullOrEmpty(workspaceId))
         {
-            var approvalState = approve ? "approved" : "rejected";
-            await db.TaskViews
-                .Where(task => task.WorkspaceId == workspaceId && task.Id == entity.TaskId)
-                .ExecuteUpdateAsync(
-                    setters => setters
-                        .SetProperty(task => task.ApprovalState, approvalState)
-                        .SetProperty(task => task.UpdatedAt, now),
+            taskView = await db.TaskViews
+                .FirstOrDefaultAsync(
+                    task => task.WorkspaceId == workspaceId && task.Id == entity.TaskId,
                     cancellationToken)
                 .ConfigureAwait(false);
+
+            if (taskView is not null)
+            {
+                taskView.ApprovalState = approve ? "approved" : "rejected";
+                taskView.Status = taskStatus;
+                taskView.UpdatedAt = now;
+            }
         }
 
         db.Audits.Add(new AuditEntity
@@ -169,6 +185,12 @@ public sealed class ResultDecisionStore
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
 
+        // 任务文件与 task_view 必须同步：文件写失败时记录完整上下文，下一轮扫描会以文件为准重新物化。
+        if (taskView is not null)
+        {
+            await WriteTaskFileStatusAsync(taskView, taskStatus, cancellationToken).ConfigureAwait(false);
+        }
+
         return new ResultDecisionOutcome(
             ResultDecisionStatus.Decided,
             entity.Id,
@@ -176,6 +198,57 @@ public sealed class ResultDecisionStore
             target,
             now,
             null);
+    }
+
+    /// <summary>按审批结论回写任务文件状态；失败只记录日志，不推翻已经提交的审批事务。</summary>
+    /// <param name="taskView">任务视图行（提供文件路径）。</param>
+    /// <param name="status">目标状态。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private async Task WriteTaskFileStatusAsync(
+        TaskViewEntity taskView,
+        string status,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(taskView.SourcePath))
+        {
+            _logger.LogWarning(
+                "任务视图缺少 source_path，无法回写任务文件：workspaceId={WorkspaceId} taskId={TaskId}",
+                taskView.WorkspaceId,
+                taskView.Id);
+            return;
+        }
+
+        try
+        {
+            var written = await TaskFileStatusUpdater
+                .TrySetStatusAsync(taskView.SourcePath, status, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (written)
+            {
+                _logger.LogInformation(
+                    "任务文件状态已回写：taskId={TaskId} status={Status} path={Path}",
+                    taskView.Id,
+                    status,
+                    taskView.SourcePath);
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "任务文件不存在或不是 JSON 对象，跳过回写：taskId={TaskId} path={Path}",
+                    taskView.Id,
+                    taskView.SourcePath);
+            }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or System.Text.Json.JsonException)
+        {
+            _logger.LogError(
+                exception,
+                "任务文件状态回写失败：taskId={TaskId} status={Status} path={Path}",
+                taskView.Id,
+                status,
+                taskView.SourcePath);
+        }
     }
 
     /// <summary>按字符截断，避免审计与通知正文无限增长。</summary>

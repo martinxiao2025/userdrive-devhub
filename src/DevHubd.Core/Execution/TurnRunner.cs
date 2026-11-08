@@ -42,8 +42,9 @@ public sealed class TurnRunner
         1. 只能使用提供的工具；工具入参路径必须是相对路径。
         2. {0}
         3. 当前交付档位为 {1}
-        4. 不要尝试提交、推送、合并或运行命令。
-        5. 完成后用简洁中文总结你做了什么；如果没有写入任何文件，请明确说明。
+        4. 本回合可用工具为 {2}；名单之外的工具一律拒绝并返回 TOOL_NOT_ALLOWED。
+        5. 不要尝试提交、推送、合并或运行命令。
+        6. 完成后用简洁中文总结你做了什么；如果没有写入任何文件，请明确说明。
         """;
 
     /// <summary>回答段总长度上限（字符）。超出时优先丢弃更早的回答。</summary>
@@ -57,12 +58,35 @@ public sealed class TurnRunner
 
     private static readonly string[] _sensitivePromptSegments = { ".env", "secrets" };
 
+    /// <summary>队列项未声明角色时使用的显式缺省角色。</summary>
+    public const string DefaultRoleId = "implementer";
+
+    /// <summary>
+    /// 缺省角色的显式工具集：角色快照缺失（如未部署插件包）时使用，不做隐式兜底。
+    /// 仍受 <c>canRequestInput</c> 影响，<c>ask_input</c> 会在不允许提问时被过滤。
+    /// </summary>
+    public static readonly IReadOnlyList<string> DefaultToolNames = new[]
+    {
+        "read_file",
+        "list_dir",
+        "search",
+        "write_file",
+        "apply_patch",
+        "ask_input",
+        "scheduler_status",
+        "queue_list",
+        "queue_get",
+        "result_list",
+        "result_ack",
+    };
+
     private readonly ModelClientRegistry _registry;
     private readonly ExecutionOptions _options;
     private readonly SchedulerStateStore _stateStore;
     private readonly DevHubPaths _paths;
     private readonly InputRequestStore _inputRequests;
     private readonly RoleSnapshotStore _roleSnapshots;
+    private readonly ITurnToolService? _turnTools;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<TurnRunner> _logger;
 
@@ -72,9 +96,10 @@ public sealed class TurnRunner
     /// <param name="stateStore">调度状态存取；交付档位每回合从库读取，避免进程内存漂移。</param>
     /// <param name="paths">运行时路径。</param>
     /// <param name="inputRequests">问题单存取。</param>
-    /// <param name="roleSnapshots">角色快照（判断 <c>canRequestInput</c>）。</param>
+    /// <param name="roleSnapshots">角色快照（判断 <c>canRequestInput</c> 与工具声明）。</param>
     /// <param name="loggerFactory">用于创建工具执行器日志器。</param>
     /// <param name="logger">日志器。</param>
+    /// <param name="turnTools">服务层工具执行端口（<c>task_upsert</c>、<c>queue_*</c> 等）；null 表示无服务层工具。</param>
     public TurnRunner(
         ModelClientRegistry registry,
         ExecutionOptions options,
@@ -83,7 +108,8 @@ public sealed class TurnRunner
         InputRequestStore inputRequests,
         RoleSnapshotStore roleSnapshots,
         ILoggerFactory loggerFactory,
-        ILogger<TurnRunner> logger)
+        ILogger<TurnRunner> logger,
+        ITurnToolService? turnTools = null)
     {
         _registry = registry;
         _options = options;
@@ -93,6 +119,7 @@ public sealed class TurnRunner
         _roleSnapshots = roleSnapshots;
         _loggerFactory = loggerFactory;
         _logger = logger;
+        _turnTools = turnTools;
     }
 
     /// <summary>
@@ -149,16 +176,19 @@ public sealed class TurnRunner
             EnforceScope: deliveryOutcome == "delivered");
 
         var budget = _options.ToBudget();
-        var roleId = string.IsNullOrWhiteSpace(item.RoleId) ? "implementer" : item.RoleId;
-        var canRequestInput = await _roleSnapshots.CanRequestInputAsync(roleId, cancellationToken)
-            .ConfigureAwait(false);
+        var roleId = string.IsNullOrWhiteSpace(item.RoleId) ? DefaultRoleId : item.RoleId;
+        var role = await _roleSnapshots.GetAsync(roleId, cancellationToken).ConfigureAwait(false);
+        var canRequestInput = role?.CanRequestInput ?? false;
+        var allowedTools = ResolveAllowedTools(roleId, role);
 
         var dispatcher = new ToolDispatcher(
             workspaceContext,
             budget,
+            allowedTools,
             _loggerFactory.CreateLogger<ToolDispatcher>(),
             canRequestInput,
-            canRequestInput ? (prompt, token) => AskInputAsync(item, roleId, prompt, token) : null);
+            canRequestInput ? (prompt, token) => AskInputAsync(item, roleId, prompt, token) : null,
+            _turnTools);
 
         // 恢复回合：把同一队列项已回答的问题单结构化追加到原任务指令之后，
         // 让模型看得到人工答案，不再就已回答的问题重复 ask_input。
@@ -183,7 +213,7 @@ public sealed class TurnRunner
             item.Id,
             item.WorkspaceId,
             item.TaskId,
-            BuildSystemPrompt(deliveryOutcome, task, workspace, writeRoot),
+            BuildSystemPrompt(deliveryOutcome, task, workspace, writeRoot, allowedTools),
             prompt,
             dispatcher.Describe(),
             budget,
@@ -258,7 +288,11 @@ public sealed class TurnRunner
                     DevHubErrorCodes.NeedsInput,
                     dispatcher.InputQuestion ?? "任务缺少必要输入，等待回答。"),
                 result.ToolCalls,
-                result.Usage);
+                result.Usage) with
+            {
+                // 提问不是模型失败：保留已解析的模型名与用量，attempt 记录仍可追溯。
+                Model = result.Model ?? request.Model,
+            };
         }
 
         if (result.State == TurnState.Done)
@@ -292,7 +326,61 @@ public sealed class TurnRunner
                 result.Error?.Code);
         }
 
-        return new TurnRunOutcome(turnId, provider, request.Model, deliveryOutcome, result, artifacts, workDirectory, inputRequestId);
+        return new TurnRunOutcome(
+            turnId,
+            provider,
+            result.Model ?? request.Model,
+            deliveryOutcome,
+            result,
+            artifacts,
+            workDirectory,
+            inputRequestId);
+    }
+
+    /// <summary>
+    /// 解析角色的工具声明；角色快照缺失时使用显式的缺省工具集。
+    /// 角色声明为空（历史数据）同样回落到缺省集合并记录警告，不让回合变成"零工具"。
+    /// </summary>
+    /// <param name="roleId">角色 id。</param>
+    /// <param name="role">角色快照；null 表示未加载。</param>
+    private IReadOnlyList<string> ResolveAllowedTools(string roleId, Data.Entities.RoleViewEntity? role)
+    {
+        if (role is null)
+        {
+            _logger.LogWarning(
+                "角色快照缺失，使用显式缺省工具集：role={RoleId} tools={ToolCount}",
+                roleId,
+                DefaultToolNames.Count);
+            return DefaultToolNames;
+        }
+
+        var tools = new List<string>();
+        try
+        {
+            var declared = JsonSerializer.Deserialize<string[]>(role.Tools, JsonSerializerOptions.Web);
+            if (declared is not null && declared.Length > 0)
+            {
+                tools.AddRange(declared.Where(tool => !string.IsNullOrWhiteSpace(tool)));
+            }
+        }
+        catch (JsonException exception)
+        {
+            _logger.LogWarning(
+                exception,
+                "角色工具声明解析失败，使用显式缺省工具集：role={RoleId}",
+                roleId);
+        }
+
+        if (tools.Count == 0)
+        {
+            _logger.LogWarning(
+                "角色未声明任何工具，使用显式缺省工具集：role={RoleId} tools={ToolCount}",
+                roleId,
+                DefaultToolNames.Count);
+            return DefaultToolNames;
+        }
+
+        return tools;
     }
 
     /// <summary>把模型侧提问落为问题单；同任务已有 open 请求时复用既有 id。</summary>
@@ -377,11 +465,13 @@ public sealed class TurnRunner
     /// <param name="task">任务文档。</param>
     /// <param name="workspace">工作区（读根）。</param>
     /// <param name="writeRoot">本回合写根：auto 为工作区根，dispatch_only 为隔离工作目录。</param>
+    /// <param name="allowedTools">角色声明的工具名集合。</param>
     private static string BuildSystemPrompt(
         string deliveryOutcome,
         TaskDocument task,
         WorkspaceDefinition workspace,
-        string writeRoot)
+        string writeRoot,
+        IReadOnlyList<string> allowedTools)
     {
         var delivered = deliveryOutcome == "delivered";
         var delivery = delivered
@@ -398,7 +488,8 @@ public sealed class TurnRunner
         return string.Format(
             SystemPromptTemplate,
             $"{roots}；敏感路径（{sensitive}、.git、*.pem、*.key）一律拒绝，越界由进程强制拦截。",
-            delivery);
+            delivery,
+            string.Join(", ", allowedTools));
     }
 
     /// <summary>

@@ -60,6 +60,9 @@ public static class DevHubErrorCodes
     /// <summary>未知工具。</summary>
     public const string UnknownTool = "UNKNOWN_TOOL";
 
+    /// <summary>角色未声明该工具：越权调用被拒绝。</summary>
+    public const string ToolNotAllowed = "TOOL_NOT_ALLOWED";
+
     /// <summary>预算（轮次 / 写入 / 时长）超限。</summary>
     public const string BudgetExceeded = "BUDGET_EXCEEDED";
 

@@ -168,6 +168,7 @@ public sealed class PathGuardTests : IDisposable
         var dispatcher = new ToolDispatcher(
             new TurnWorkspace(_root, _workRoot, WriteScope: null, EnforceScope: false),
             _budget,
+            ToolDispatcher.FileToolNames,
             NullLogger<ToolDispatcher>.Instance);
 
         // 读工作区既有文件：dispatch_only 下同样必须能读源码。
@@ -231,6 +232,7 @@ public sealed class PathGuardTests : IDisposable
         var dispatcher = new ToolDispatcher(
             new TurnWorkspace(_root, _workRoot, WriteScope: null, EnforceScope: false),
             _budget,
+            ToolDispatcher.FileToolNames,
             NullLogger<ToolDispatcher>.Instance);
 
         using var list = JsonDocument.Parse("""{"path":"."}""");
@@ -254,6 +256,7 @@ public sealed class PathGuardTests : IDisposable
         var dispatcher = new ToolDispatcher(
             new TurnWorkspace(_root, _root, new[] { "src" }, EnforceScope: true),
             _budget,
+            ToolDispatcher.FileToolNames,
             NullLogger<ToolDispatcher>.Instance);
 
         using var document = JsonDocument.Parse("""{"path":"docs/a.md","content":"bad"}""");

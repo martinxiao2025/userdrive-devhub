@@ -548,6 +548,12 @@ public sealed class P2ExecutionTests : IDisposable
             ct);
 
         // 挂起：pending + hold_kind=input；attempt 保持 1（单调递增，不再回退）。
+        // 结算在后台任务里完成：通知在挂起之后写入，先等落库再断言，避免与结算竞态。
+        await WaitUntilAsync(
+            async () => await CountAsync(
+                "SELECT COUNT(*) FROM notice WHERE kind = 'failure' AND title LIKE '需要输入%';",
+                ct) == 1,
+            ct);
         Assert.Equal(
             "pending|input|1",
             await ScalarStringAsync(

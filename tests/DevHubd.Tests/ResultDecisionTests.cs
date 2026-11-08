@@ -12,6 +12,7 @@ namespace DevHubd.Tests;
 public sealed class ResultDecisionTests : IDisposable
 {
     private readonly string _directory;
+    private readonly string _taskFile;
     private readonly SqliteConnectionFactory _factory;
     private readonly ResultDecisionStore _store;
 
@@ -20,6 +21,7 @@ public sealed class ResultDecisionTests : IDisposable
     {
         _directory = Path.Combine(Path.GetTempPath(), "devhubd-tests", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_directory);
+        _taskFile = Path.Combine(_directory, "T-1.json");
         _factory = new SqliteConnectionFactory(Path.Combine(_directory, "devhub.db"));
         Migrator.MigrateAsync(_factory, TestContext.Current.CancellationToken).GetAwaiter().GetResult();
         _store = new ResultDecisionStore(_factory);
@@ -53,6 +55,11 @@ public sealed class ResultDecisionTests : IDisposable
         Assert.NotNull(decision.DecidedAt);
         Assert.Equal("delivered", await ScalarStringAsync("SELECT outcome FROM result WHERE id = 'r1';", ct));
         Assert.Equal("approved", await ScalarStringAsync("SELECT approval_state FROM task_view WHERE id = 'T-1';", ct));
+        Assert.Equal("done", await ScalarStringAsync("SELECT status FROM task_view WHERE id = 'T-1';", ct));
+        var taskText = await File.ReadAllTextAsync(_taskFile, ct);
+        Assert.Contains("\"status\": \"done\"", taskText, StringComparison.Ordinal);
+        // 回写只改 status：中文标题保持原文，不被转义成 \uXXXX。
+        Assert.Contains("任务", taskText, StringComparison.Ordinal);
         Assert.Equal(1, await CountAsync("SELECT COUNT(*) FROM audit WHERE action = 'result.approved';", ct));
         Assert.Equal(0, await CountAsync("SELECT COUNT(*) FROM notice;", ct));
     }
@@ -69,6 +76,8 @@ public sealed class ResultDecisionTests : IDisposable
         Assert.Equal("failed", decision.Outcome);
         Assert.Equal("failed", await ScalarStringAsync("SELECT outcome FROM result WHERE id = 'r1';", ct));
         Assert.Equal("rejected", await ScalarStringAsync("SELECT approval_state FROM task_view WHERE id = 'T-1';", ct));
+        Assert.Equal("ready", await ScalarStringAsync("SELECT status FROM task_view WHERE id = 'T-1';", ct));
+        Assert.Contains("\"status\": \"ready\"", await File.ReadAllTextAsync(_taskFile, ct), StringComparison.Ordinal);
         Assert.Equal(1, await CountAsync("SELECT COUNT(*) FROM audit WHERE action = 'result.rejected' AND actor = 'reviewer';", ct));
         Assert.Equal(1, await CountAsync("SELECT COUNT(*) FROM notice WHERE kind = 'failure' AND task_id = 'T-1';", ct));
         Assert.Equal(
@@ -117,17 +126,23 @@ public sealed class ResultDecisionTests : IDisposable
         Assert.Null(decision.TaskId);
     }
 
-    /// <summary>插入一条已完成的队列项、任务视图与待审结果。</summary>
+    /// <summary>插入一条已完成的队列项、任务视图与待审结果，并准备真实任务文件。</summary>
     /// <param name="ct">取消令牌。</param>
     private async Task SeedAsync(CancellationToken ct)
     {
+        await File.WriteAllTextAsync(
+            _taskFile,
+            """{"id":"T-1","title":"任务","status":"ready","prompt":"执行"}""",
+            new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+            ct);
+
         await ExecuteAsync(
             """
             INSERT INTO task_view (
                 workspace_id, id, source_path, content_hash, title, status, priority,
                 write_scope, payload, seen_at, updated_at, role_id, depends_on, approval_state)
             VALUES (
-                'alpha', 'T-1', '.devhub/tasks/T-1.json', 'hash', '任务', 'done', 0,
+                'alpha', 'T-1', '.devhub/tasks/T-1.json', 'hash', '任务', 'ready', 0,
                 '[]', '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'implementer', '[]', 'pending');
 
             INSERT INTO queue_item (
@@ -141,6 +156,8 @@ public sealed class ResultDecisionTests : IDisposable
             VALUES ('r1', 'T-1', 'q1', 'openai', 'awaiting_review', '完成', '[]', '2026-01-01T00:00:00Z');
             """,
             ct);
+
+        await ExecuteAsync($"UPDATE task_view SET source_path = '{_taskFile}' WHERE id = 'T-1';", ct);
     }
 
     /// <summary>统计行数。</summary>

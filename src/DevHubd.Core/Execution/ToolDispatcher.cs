@@ -69,29 +69,41 @@ public sealed class ToolDispatcher : IToolDispatcher
     private readonly ILogger<ToolDispatcher> _logger;
     private readonly bool _canRequestInput;
     private readonly Func<InputPrompt, CancellationToken, Task<InputAcceptance>>? _askInput;
+    private readonly HashSet<string> _allowedTools;
+    private readonly ITurnToolService? _serviceTools;
+    private readonly HashSet<string> _serviceToolNames;
     private readonly List<string> _changedFiles = new();
     private int _writes;
     private string? _inputRequestId;
     private string? _inputQuestion;
 
-    /// <summary>注入回合上下文、预算与日志器；提问能力由角色声明决定。</summary>
+    /// <summary>注入回合上下文、角色工具白名单、预算与日志器；提问能力由角色声明决定。</summary>
     /// <param name="workspace">回合写入上下文。</param>
     /// <param name="budget">预算上限。</param>
+    /// <param name="allowedTools">角色声明的工具名集合；不在集合内的调用一律返回 TOOL_NOT_ALLOWED。</param>
     /// <param name="logger">日志器。</param>
     /// <param name="canRequestInput">该角色是否允许提问（<c>canRequestInput</c>）。</param>
     /// <param name="askInput">提问落库回调；为 null 表示不可提问。</param>
+    /// <param name="serviceTools">服务层工具执行端口；为 null 表示该回合没有服务层工具。</param>
     public ToolDispatcher(
         TurnWorkspace workspace,
         BudgetLimits budget,
+        IReadOnlyCollection<string> allowedTools,
         ILogger<ToolDispatcher> logger,
         bool canRequestInput = false,
-        Func<InputPrompt, CancellationToken, Task<InputAcceptance>>? askInput = null)
+        Func<InputPrompt, CancellationToken, Task<InputAcceptance>>? askInput = null,
+        ITurnToolService? serviceTools = null)
     {
         _workspace = workspace;
         _budget = budget;
         _logger = logger;
         _canRequestInput = canRequestInput && askInput is not null;
         _askInput = askInput;
+        _allowedTools = new HashSet<string>(allowedTools, StringComparer.Ordinal);
+        _serviceTools = serviceTools;
+        _serviceToolNames = serviceTools is null
+            ? new HashSet<string>(StringComparer.Ordinal)
+            : serviceTools.Describe().Select(descriptor => descriptor.Name).ToHashSet(StringComparer.Ordinal);
     }
 
     /// <inheritdoc />
@@ -106,15 +118,43 @@ public sealed class ToolDispatcher : IToolDispatcher
     /// <summary>本回合提出的问题文本；未提问为 null。</summary>
     public string? InputQuestion => _inputQuestion;
 
-    /// <inheritdoc />
-    public IReadOnlyList<ToolDescriptor> Describe() => _canRequestInput
-        ? _descriptors
-        : _descriptors.Where(descriptor => !string.Equals(descriptor.Name, AskInputToolName, StringComparison.Ordinal)).ToArray();
+    /// <summary>
+    /// 本回合暴露给模型的工具：文件工具与服务层工具合并后按角色声明过滤。
+    /// 未声明的工具不会出现在工具列表里，模型即使猜测名称调用也会被拒绝。
+    /// </summary>
+    public IReadOnlyList<ToolDescriptor> Describe()
+    {
+        var result = new List<ToolDescriptor>();
+        foreach (var descriptor in _descriptors)
+        {
+            if (_allowedTools.Contains(descriptor.Name))
+            {
+                result.Add(descriptor);
+            }
+        }
+
+        if (_serviceTools is not null)
+        {
+            foreach (var descriptor in _serviceTools.Describe())
+            {
+                if (_allowedTools.Contains(descriptor.Name))
+                {
+                    result.Add(descriptor);
+                }
+            }
+        }
+
+        return result;
+    }
 
     /// <summary>工具白名单名称（只读资源 <c>devhub://limits</c> 展示用）。</summary>
     public static IReadOnlyList<string> AllowedToolNames => _allowedToolNames;
 
+    /// <summary>文件与交互工具名（含 <c>ask_input</c>）：供角色声明与测试显式引用，避免散落字符串。</summary>
+    public static IReadOnlyList<string> FileToolNames => _fileToolNames;
+
     private static readonly string[] _allowedToolNames = _descriptors.Select(descriptor => descriptor.Name).ToArray();
+    private static readonly string[] _fileToolNames = _descriptors.Select(descriptor => descriptor.Name).ToArray();
 
     /// <inheritdoc />
     public async Task<ToolExecutionResult> ExecuteAsync(
@@ -123,10 +163,29 @@ public sealed class ToolDispatcher : IToolDispatcher
         JsonElement input,
         CancellationToken cancellationToken)
     {
-        ExecutedCalls++;
-
         // 诊断日志只记录工具名与结果码，不记录文件内容，避免泄漏工作区数据。
         _logger.LogDebug("工具调用：turnId={TurnId} tool={ToolName}", turnId, toolName);
+
+        // 角色声明的工具集是硬边界：未声明即越权，返回稳定错误码，不做任何隐式放行。
+        if (!_allowedTools.Contains(toolName))
+        {
+            _logger.LogWarning(
+                "工具越权调用被拒绝：turnId={TurnId} tool={ToolName}",
+                turnId,
+                toolName);
+            return ToolExecutionResult.Fail(
+                DevHubErrorCodes.ToolNotAllowed,
+                $"角色未声明工具 {toolName}，调用被拒绝（TOOL_NOT_ALLOWED）。");
+        }
+
+        ExecutedCalls++;
+
+        if (_serviceToolNames.Contains(toolName))
+        {
+            return _serviceTools is null
+                ? ToolExecutionResult.Fail(DevHubErrorCodes.UnknownTool, $"服务层工具不可用：{toolName}")
+                : await _serviceTools.InvokeAsync(toolName, input, cancellationToken).ConfigureAwait(false);
+        }
 
         return toolName switch
         {
@@ -136,7 +195,7 @@ public sealed class ToolDispatcher : IToolDispatcher
             "write_file" => await WriteFileAsync(input, cancellationToken).ConfigureAwait(false),
             "apply_patch" => await ApplyPatchAsync(input, cancellationToken).ConfigureAwait(false),
             AskInputToolName => await AskInputAsync(input, cancellationToken).ConfigureAwait(false),
-            _ => ToolExecutionResult.Fail(DevHubErrorCodes.UnknownTool, $"工具不在白名单内：{toolName}"),
+            _ => ToolExecutionResult.Fail(DevHubErrorCodes.UnknownTool, $"未知工具：{toolName}"),
         };
     }
 

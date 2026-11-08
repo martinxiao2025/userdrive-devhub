@@ -1,3 +1,5 @@
+using DevHubd.Core.Execution;
+using DevHubd.Mcp.Turns;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -24,6 +26,9 @@ public static class McpModule
             .WithHttpTransport(options => options.Stateless = true)
             .WithToolsFromAssembly(typeof(McpModule).Assembly)
             .WithResourcesFromAssembly(typeof(McpModule).Assembly);
+
+        // 后台回合复用同一套服务层工具；角色声明决定可见范围，TurnRunner 只做白名单校验。
+        services.AddSingleton<ITurnToolService, McpTurnToolService>();
 
         return services;
     }

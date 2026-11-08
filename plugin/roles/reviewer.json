@@ -7,6 +7,9 @@
     "devhub-task-handoff"
   ],
   "tools": [
+    "read_file",
+    "list_dir",
+    "search",
     "queue_get",
     "result_list",
     "input_request_list",
