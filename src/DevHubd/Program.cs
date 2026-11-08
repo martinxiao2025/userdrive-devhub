@@ -5,6 +5,7 @@ using System.Text;
 using DevHubd.Core;
 using DevHubd.Core.Data;
 using DevHubd.Core.Execution;
+using DevHubd.Core.Input;
 using DevHubd.Core.Models;
 using DevHubd.Core.Providers;
 using DevHubd.Core.Queue;
@@ -267,6 +268,8 @@ internal static class Program
         builder.Services.AddSingleton(serviceProvider => new NoticeStore(
             serviceProvider.GetRequiredService<IDbContextFactory<DevHubDbContext>>()));
         builder.Services.AddSingleton(serviceProvider => new RoleSnapshotStore(
+            serviceProvider.GetRequiredService<IDbContextFactory<DevHubDbContext>>()));
+        builder.Services.AddSingleton(serviceProvider => new InputRequestStore(
             serviceProvider.GetRequiredService<IDbContextFactory<DevHubDbContext>>()));
         builder.Services.AddSingleton<TurnRunner>();
         builder.Services.AddSingleton<ExecutionCoordinator>();

@@ -93,6 +93,27 @@ public sealed class RoleSnapshotStore
             .ConfigureAwait(false);
     }
 
+    /// <summary>读取单个角色快照；不存在返回 null。</summary>
+    /// <param name="roleId">角色 id。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    public async Task<RoleViewEntity?> GetAsync(string roleId, CancellationToken cancellationToken = default)
+    {
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        return await db.RoleViews
+            .AsNoTracking()
+            .FirstOrDefaultAsync(item => item.Id == roleId, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>该角色是否允许在回合中向用户提问；角色不存在时按不允许处理。</summary>
+    /// <param name="roleId">角色 id。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    public async Task<bool> CanRequestInputAsync(string roleId, CancellationToken cancellationToken = default)
+    {
+        var role = await GetAsync(roleId, cancellationToken).ConfigureAwait(false);
+        return role?.CanRequestInput ?? false;
+    }
+
     /// <summary>构造新的快照行。</summary>
     /// <param name="role">角色声明。</param>
     /// <param name="now">写入时间。</param>

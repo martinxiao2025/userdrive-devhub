@@ -320,11 +320,12 @@ public sealed class QueueService
                     WHERE status = 'pending'
                       AND available_at <= $now
                       AND attempt < max_attempts
+                      AND hold_kind IS NULL
                     ORDER BY priority DESC, created_at ASC, id ASC
                     LIMIT 1
                 )
                 RETURNING id, workspace_id, task_id, task_hash, status, priority, attempt, max_attempts,
-                          preferred_provider, available_at, lease_owner, lease_expires_at,
+                          preferred_provider, role_id, hold_kind, hold_ref, available_at, lease_owner, lease_expires_at,
                           last_error_code, last_error, created_at, updated_at;
                 """;
             AddParameter(command, "$owner", ownerId);
@@ -684,6 +685,9 @@ public sealed class QueueService
         entity.Attempt,
         entity.MaxAttempts,
         entity.PreferredProvider,
+        entity.RoleId,
+        entity.HoldKind,
+        entity.HoldRef,
         entity.AvailableAt,
         entity.LeaseOwner,
         entity.LeaseExpiresAt,
@@ -725,13 +729,16 @@ public sealed class QueueService
         reader.GetInt32(6),
         reader.GetInt32(7),
         reader.GetString(8),
-        reader.GetString(9),
+        reader.IsDBNull(9) ? null : reader.GetString(9),
         reader.IsDBNull(10) ? null : reader.GetString(10),
         reader.IsDBNull(11) ? null : reader.GetString(11),
-        reader.IsDBNull(12) ? null : reader.GetString(12),
+        reader.GetString(12),
         reader.IsDBNull(13) ? null : reader.GetString(13),
-        reader.GetString(14),
-        reader.GetString(15));
+        reader.IsDBNull(14) ? null : reader.GetString(14),
+        reader.IsDBNull(15) ? null : reader.GetString(15),
+        reader.IsDBNull(16) ? null : reader.GetString(16),
+        reader.GetString(17),
+        reader.GetString(18));
 
     /// <summary>生成下一页游标（base64url 编码的 priority/createdAt/id）。</summary>
     private static string EncodeCursor(QueueItem item)

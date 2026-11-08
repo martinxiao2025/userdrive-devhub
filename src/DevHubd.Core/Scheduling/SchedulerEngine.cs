@@ -1,4 +1,5 @@
 using DevHubd.Core.Execution;
+using DevHubd.Core.Input;
 using DevHubd.Core.Queue;
 using DevHubd.Core.Tasks;
 using DevHubd.Core.Workspaces;
@@ -36,6 +37,7 @@ public sealed class SchedulerEngine
     private readonly QueueService _queue;
     private readonly SchedulerStateStore _stateStore;
     private readonly ExecutionOptions _executionOptions;
+    private readonly InputRequestStore _inputRequests;
     private readonly ILogger<SchedulerEngine> _logger;
 
     /// <summary>注入依赖。</summary>
@@ -44,6 +46,7 @@ public sealed class SchedulerEngine
     /// <param name="queue">队列服务。</param>
     /// <param name="stateStore">调度状态存取。</param>
     /// <param name="executionOptions">执行配置（提供定时派发的 provider）。</param>
+    /// <param name="inputRequests">问题单存取（任务变更时取消旧挂起项）。</param>
     /// <param name="logger">日志器。</param>
     public SchedulerEngine(
         WorkspaceRegistry registry,
@@ -51,6 +54,7 @@ public sealed class SchedulerEngine
         QueueService queue,
         SchedulerStateStore stateStore,
         ExecutionOptions executionOptions,
+        InputRequestStore inputRequests,
         ILogger<SchedulerEngine> logger)
     {
         _registry = registry;
@@ -58,6 +62,7 @@ public sealed class SchedulerEngine
         _queue = queue;
         _stateStore = stateStore;
         _executionOptions = executionOptions;
+        _inputRequests = inputRequests;
         _logger = logger;
     }
 
@@ -122,6 +127,18 @@ public sealed class SchedulerEngine
             foreach (var problem in scan.Problems)
             {
                 _logger.LogWarning("任务文件被跳过：workspace={WorkspaceId} {Problem}", workspace.Id, problem);
+            }
+
+            // 任务内容变化后旧问题单不能再回答（旧答案会答到新任务上），
+            // 必须在入队前取消，否则旧挂起项会一直占着"活动队列项"使新内容无法入队。
+            var cancelled = await _inputRequests.CancelStaleAsync(workspace.Id, cancellationToken)
+                .ConfigureAwait(false);
+            if (cancelled > 0)
+            {
+                _logger.LogWarning(
+                    "任务内容已变更，取消旧问题单 {Count} 条：workspace={WorkspaceId}",
+                    cancelled,
+                    workspace.Id);
             }
 
             var enqueue = await _queue

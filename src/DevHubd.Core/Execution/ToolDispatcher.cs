@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using DevHubd.Core.Input;
 using DevHubd.Core.Models;
 using Microsoft.Extensions.Logging;
 
@@ -27,6 +28,9 @@ public sealed class ToolDispatcher : IToolDispatcher
     private const int MaxListEntries = 200;
     private const int MaxSearchFiles = 500;
     private const int MaxSearchResults = 100;
+    private const int MaxQuestionLength = 500;
+    private const int MaxContextLength = 4000;
+    private const int MaxOptions = 8;
 
     private static readonly UTF8Encoding _utf8NoBom = new(encoderShouldEmitUTF8Identifier: false);
     private static readonly ToolDescriptor[] _descriptors =
@@ -51,23 +55,42 @@ public sealed class ToolDispatcher : IToolDispatcher
             "apply_patch",
             "对文件做一次精确替换：find 必须唯一命中，否则拒绝。",
             """{"type":"object","properties":{"path":{"type":"string"},"find":{"type":"string"},"replace":{"type":"string"}},"required":["path","find","replace"],"additionalProperties":false}"""),
+        new(
+            "ask_input",
+            "缺少必要信息时向用户提问：问题单会落库并挂起任务，等人回答后继续。每回合最多提问一次。",
+            """{"type":"object","properties":{"question":{"type":"string","description":"一句话问题"},"context":{"type":"string","description":"摘要、相对路径与已脱敏片段；禁止写入凭据"},"options":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"label":{"type":"string"},"value":{"type":"string"},"recommended":{"type":"boolean"}},"required":["id","label"],"additionalProperties":false}},"missingInputs":{"type":"array","items":{"type":"string"}}},"required":["question"],"additionalProperties":false}"""),
     };
+
+    private const string AskInputToolName = "ask_input";
 
     private readonly TurnWorkspace _workspace;
     private readonly BudgetLimits _budget;
     private readonly ILogger<ToolDispatcher> _logger;
+    private readonly bool _canRequestInput;
+    private readonly Func<InputPrompt, CancellationToken, Task<InputAcceptance>>? _askInput;
     private readonly List<string> _changedFiles = new();
     private int _writes;
+    private string? _inputRequestId;
+    private string? _inputQuestion;
 
-    /// <summary>注入回合上下文、预算与日志器。</summary>
+    /// <summary>注入回合上下文、预算与日志器；提问能力由角色声明决定。</summary>
     /// <param name="workspace">回合写入上下文。</param>
     /// <param name="budget">预算上限。</param>
     /// <param name="logger">日志器。</param>
-    public ToolDispatcher(TurnWorkspace workspace, BudgetLimits budget, ILogger<ToolDispatcher> logger)
+    /// <param name="canRequestInput">该角色是否允许提问（<c>canRequestInput</c>）。</param>
+    /// <param name="askInput">提问落库回调；为 null 表示不可提问。</param>
+    public ToolDispatcher(
+        TurnWorkspace workspace,
+        BudgetLimits budget,
+        ILogger<ToolDispatcher> logger,
+        bool canRequestInput = false,
+        Func<InputPrompt, CancellationToken, Task<InputAcceptance>>? askInput = null)
     {
         _workspace = workspace;
         _budget = budget;
         _logger = logger;
+        _canRequestInput = canRequestInput && askInput is not null;
+        _askInput = askInput;
     }
 
     /// <inheritdoc />
@@ -76,8 +99,16 @@ public sealed class ToolDispatcher : IToolDispatcher
     /// <inheritdoc />
     public int ExecutedCalls { get; private set; }
 
+    /// <summary>本回合写入的问题单 id；null 表示未提问。</summary>
+    public string? InputRequestId => _inputRequestId;
+
+    /// <summary>本回合提出的问题文本；未提问为 null。</summary>
+    public string? InputQuestion => _inputQuestion;
+
     /// <inheritdoc />
-    public IReadOnlyList<ToolDescriptor> Describe() => _descriptors;
+    public IReadOnlyList<ToolDescriptor> Describe() => _canRequestInput
+        ? _descriptors
+        : _descriptors.Where(descriptor => !string.Equals(descriptor.Name, AskInputToolName, StringComparison.Ordinal)).ToArray();
 
     /// <summary>工具白名单名称（只读资源 <c>devhub://limits</c> 展示用）。</summary>
     public static IReadOnlyList<string> AllowedToolNames => _allowedToolNames;
@@ -103,8 +134,159 @@ public sealed class ToolDispatcher : IToolDispatcher
             "search" => await SearchAsync(input, cancellationToken).ConfigureAwait(false),
             "write_file" => await WriteFileAsync(input, cancellationToken).ConfigureAwait(false),
             "apply_patch" => await ApplyPatchAsync(input, cancellationToken).ConfigureAwait(false),
+            AskInputToolName => await AskInputAsync(input, cancellationToken).ConfigureAwait(false),
             _ => ToolExecutionResult.Fail(DevHubErrorCodes.UnknownTool, $"工具不在白名单内：{toolName}"),
         };
+    }
+
+    /// <summary>
+    /// 提问：校验参数、限制每回合一次，并把问题单落到持久化层。
+    /// 落库成功后返回 requestId；回合结束由 <c>TurnRunner</c> 转成 <c>needs_input</c> 收尾。
+    /// </summary>
+    /// <param name="input">入参。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private async Task<ToolExecutionResult> AskInputAsync(JsonElement input, CancellationToken cancellationToken)
+    {
+        if (!_canRequestInput || _askInput is null)
+        {
+            return ToolExecutionResult.Fail(
+                DevHubErrorCodes.InputNotAllowed,
+                "当前角色不允许向用户提问。");
+        }
+
+        if (_inputRequestId is not null)
+        {
+            return ToolExecutionResult.Ok(
+                $"已有待回答请求（{_inputRequestId}），请不要重复提问，直接结束本回合。");
+        }
+
+        if (!TryGetString(input, "question", out var question) || string.IsNullOrWhiteSpace(question))
+        {
+            return ToolExecutionResult.Fail(DevHubErrorCodes.InvalidArgument, "缺少 question 参数。");
+        }
+
+        question = question.Trim();
+        if (question.Length > MaxQuestionLength)
+        {
+            return ToolExecutionResult.Fail(
+                DevHubErrorCodes.InvalidArgument,
+                $"question 超过 {MaxQuestionLength} 字符上限。");
+        }
+
+        var context = TryGetString(input, "context", out var rawContext) ? rawContext.Trim() : null;
+        if (context is { Length: 0 })
+        {
+            context = null;
+        }
+
+        if (context is not null && context.Length > MaxContextLength)
+        {
+            return ToolExecutionResult.Fail(
+                DevHubErrorCodes.InvalidArgument,
+                $"context 超过 {MaxContextLength} 字符上限。");
+        }
+
+        var options = ParseOptions(input, out var optionsError);
+        if (optionsError is not null)
+        {
+            return ToolExecutionResult.Fail(DevHubErrorCodes.InvalidArgument, optionsError);
+        }
+
+        var missingInputs = ParseStringArray(input, "missingInputs");
+        if (missingInputs.Count > MaxOptions)
+        {
+            return ToolExecutionResult.Fail(
+                DevHubErrorCodes.InvalidArgument,
+                $"missingInputs 最多 {MaxOptions} 项。");
+        }
+
+        var acceptance = await _askInput(
+            new InputPrompt(question, context, options, missingInputs),
+            cancellationToken).ConfigureAwait(false);
+
+        if (!acceptance.Accepted || acceptance.RequestId is null)
+        {
+            return ToolExecutionResult.Fail(
+                acceptance.ErrorCode ?? DevHubErrorCodes.Internal,
+                acceptance.ErrorMessage ?? "问题单写入失败。");
+        }
+
+        _inputRequestId = acceptance.RequestId;
+        _inputQuestion = question;
+        return ToolExecutionResult.Ok(
+            $"问题已记录（{acceptance.RequestId}）。本回合到此结束，请用一句话说明因缺少输入而暂停。");
+    }
+
+    /// <summary>解析 <c>options</c> 数组；缺失视为空数组，格式非法返回错误说明。</summary>
+    /// <param name="input">入参。</param>
+    /// <param name="error">错误说明；null 表示解析成功。</param>
+    private static IReadOnlyList<InputOption> ParseOptions(JsonElement input, out string? error)
+    {
+        error = null;
+        if (input.ValueKind != JsonValueKind.Object ||
+            !input.TryGetProperty("options", out var element) ||
+            element.ValueKind == JsonValueKind.Null ||
+            element.ValueKind == JsonValueKind.Undefined)
+        {
+            return Array.Empty<InputOption>();
+        }
+
+        if (element.ValueKind != JsonValueKind.Array)
+        {
+            error = "options 必须是数组。";
+            return Array.Empty<InputOption>();
+        }
+
+        var options = new List<InputOption>();
+        foreach (var option in element.EnumerateArray())
+        {
+            if (options.Count >= MaxOptions)
+            {
+                error = $"options 最多 {MaxOptions} 项。";
+                return Array.Empty<InputOption>();
+            }
+
+            if (!TryGetString(option, "id", out var id) || string.IsNullOrWhiteSpace(id) ||
+                !TryGetString(option, "label", out var label) || string.IsNullOrWhiteSpace(label))
+            {
+                error = "options 每项必须包含非空 id 与 label。";
+                return Array.Empty<InputOption>();
+            }
+
+            var value = TryGetString(option, "value", out var rawValue) ? rawValue : null;
+            var recommended = option.TryGetProperty("recommended", out var flag) &&
+                              flag.ValueKind == JsonValueKind.True;
+
+            if (options.Any(item => string.Equals(item.Id, id, StringComparison.Ordinal)))
+            {
+                error = $"options 存在重复 id：{id}。";
+                return Array.Empty<InputOption>();
+            }
+
+            options.Add(new InputOption(id, label, value, recommended));
+        }
+
+        return options;
+    }
+
+    /// <summary>解析字符串数组参数；缺失或非数组时返回空数组。</summary>
+    /// <param name="input">入参。</param>
+    /// <param name="name">字段名。</param>
+    private static IReadOnlyList<string> ParseStringArray(JsonElement input, string name)
+    {
+        if (input.ValueKind != JsonValueKind.Object ||
+            !input.TryGetProperty(name, out var element) ||
+            element.ValueKind != JsonValueKind.Array)
+        {
+            return Array.Empty<string>();
+        }
+
+        return element
+            .EnumerateArray()
+            .Where(item => item.ValueKind == JsonValueKind.String)
+            .Select(item => item.GetString() ?? string.Empty)
+            .Where(item => item.Length > 0)
+            .ToArray();
     }
 
     /// <summary>读文件：工作区内、不超过预算的读取上限。</summary>

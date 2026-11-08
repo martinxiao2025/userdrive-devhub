@@ -62,6 +62,9 @@ public sealed record ExecutionOptions
     /// <summary>心跳间隔（秒）。</summary>
     public int HeartbeatSeconds { get; init; } = 30;
 
+    /// <summary>问题单有效期（小时）：超时后置 <c>expired</c> 并让任务失败（<c>INPUT_TIMEOUT</c>）。</summary>
+    public int InputTimeoutHours { get; init; } = 24;
+
     /// <summary>把执行配置收敛到合法区间，避免配置写错导致空转或越界。</summary>
     public ExecutionOptions Normalize() => this with
     {
@@ -78,6 +81,7 @@ public sealed record ExecutionOptions
         ScheduledProvider = NormalizeScheduledProvider(ScheduledProvider),
         LeaseSeconds = Math.Clamp(LeaseSeconds, 30, 600),
         HeartbeatSeconds = Math.Clamp(HeartbeatSeconds, 5, 300),
+        InputTimeoutHours = Math.Clamp(InputTimeoutHours, 1, 168),
     };
 
     /// <summary>转换为回合预算。</summary>

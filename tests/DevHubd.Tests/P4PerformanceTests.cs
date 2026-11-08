@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using DevHubd.Core.Data;
 using DevHubd.Core.Execution;
+using DevHubd.Core.Input;
 using DevHubd.Core.Queue;
 using DevHubd.Core.Scheduling;
 using DevHubd.Core.Tasks;
@@ -60,6 +61,7 @@ public sealed class P4PerformanceTests : IDisposable
             _queue,
             new SchedulerStateStore(_factory),
             new ExecutionOptions(),
+            new InputRequestStore(_factory),
             NullLogger<SchedulerEngine>.Instance);
 
         PrepareWorkspace();

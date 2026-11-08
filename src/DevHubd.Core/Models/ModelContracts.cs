@@ -48,6 +48,9 @@ public static class ModelErrorKinds
 
     /// <summary>人工取消或停机：不重试。</summary>
     public const string UserCancelled = "user_cancelled";
+
+    /// <summary>回合因缺少输入而暂停：记 abandoned，不消耗重试预算，等人回答后恢复。</summary>
+    public const string NeedsInput = "needs_input";
 }
 
 /// <summary>一次模型回合的错误描述。</summary>

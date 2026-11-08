@@ -215,6 +215,15 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 
 ## 6. 变更记录
 
+### U9 — 2026-11-08（不确定项回流：提问即挂起）
+
+- 模型侧工具面新增 `ask_input`：仅当角色 `canRequestInput=true` 时暴露；每回合最多提问一次，第二次调用返回既有 `requestId` 提示而不重复落库。
+- 提问写入 `input_request`：`dedupe_key = workspace/task/task_hash/question_hash`，同一任务只保留一条 `open`；重复提问复用既有 id。
+- 提问回合记 `attempt.outcome='abandoned'`、`error_kind='needs_input'`，token 与工具调用次数照实保留；`queue_item` 回到 `pending` 并写 `hold_kind='input'`/`hold_ref`，attempt 回退（不消耗重试预算）。
+- 认领谓词追加 `hold_kind IS NULL`：挂起项不占并发槽、不参与自动重试，重启后保持挂起。
+- 每次 tick 在入队前取消"任务内容已变更"的旧 `open` 问题单，并终止其挂起队列项（`last_error_code=TASK_CHANGED`），避免旧答案答到新任务。
+- 挂起时写 `notice.kind='failure'`（标题以「需要输入」开头）提示会话侧取回；`devhub://limits` 的工具白名单包含 `ask_input`。
+
 ### U8 — 2026-11-08（任务模型扩展与 `task_upsert`）
 
 - 任务文件新增可选 `role`（默认 `implementer`）、`dependsOn`、`requiresApproval`、`source`；封闭字段同步到 `schemas/task.schema.json`。

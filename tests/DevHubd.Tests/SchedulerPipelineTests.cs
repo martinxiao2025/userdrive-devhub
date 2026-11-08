@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using DevHubd.Core.Data;
 using DevHubd.Core.Execution;
+using DevHubd.Core.Input;
 using DevHubd.Core.Providers;
 using DevHubd.Core.Queue;
 using DevHubd.Core.Scheduling;
@@ -46,6 +47,7 @@ public sealed class SchedulerPipelineTests : IDisposable
             _queue,
             _stateStore,
             new ExecutionOptions(),
+            new InputRequestStore(_factory),
             NullLogger<SchedulerEngine>.Instance);
     }
 
@@ -391,6 +393,7 @@ public sealed class SchedulerPipelineTests : IDisposable
         _queue,
         _stateStore,
         options,
+        new InputRequestStore(_factory),
         NullLogger<SchedulerEngine>.Instance);
 
     /// <summary>创建工作区根目录（含 .devhub/tasks）。</summary>

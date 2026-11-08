@@ -3,10 +3,12 @@ using System.Text.Json;
 using DevHubd.Core;
 using DevHubd.Core.Data;
 using DevHubd.Core.Execution;
+using DevHubd.Core.Input;
 using DevHubd.Core.Models;
 using DevHubd.Core.Providers;
 using DevHubd.Core.Queue;
 using DevHubd.Core.Results;
+using DevHubd.Core.Roles;
 using DevHubd.Core.Scheduling;
 using DevHubd.Core.Tasks;
 using DevHubd.Core.Workspaces;
@@ -408,6 +410,73 @@ public sealed class P2ExecutionTests : IDisposable
         await WaitUntilAsync(async () => await CountAsync("SELECT COUNT(*) FROM result;", ct) == 1, ct);
     }
 
+    [Fact]
+    public async Task Pump_WhenModelAsksInput_HoldsItemWithoutConsumingAttemptAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "需要输入", "ready", 10);
+        await InsertAskableRoleAsync(ct);
+        await PrepareQueueAsync(ct);
+
+        var fake = new FakeModelClient(
+            "openai",
+            async (request, dispatcher, token) =>
+            {
+                using var payload = JsonDocument.Parse(
+                    """{"question":"写入哪个目录？","context":"任务未声明 writeScope","options":[{"id":"src","label":"src","recommended":true},{"id":"docs","label":"docs"}],"missingInputs":["writeScope"]}""");
+                var result = await dispatcher.ExecuteAsync(request.TurnId, "ask_input", payload.RootElement, token);
+                Assert.True(result.Success, result.ErrorMessage);
+                return TurnResult.Done("缺少写入目录，已提问。", 1, null, Array.Empty<string>());
+            });
+
+        var coordinator = CreateCoordinator(fake, new ExecutionOptions { MaxParallel = 1 });
+        Assert.Equal(1, await coordinator.PumpAsync(ct));
+        await WaitUntilAsync(
+            async () => await ScalarStringAsync(
+                "SELECT status FROM queue_item WHERE task_id = 'T-001';",
+                ct) == "pending",
+            ct);
+
+        // 挂起：pending + hold_kind=input，attempt 回退（提问不消耗重试预算）。
+        Assert.Equal(
+            "pending|input|0",
+            await ScalarStringAsync(
+                "SELECT status || '|' || hold_kind || '|' || attempt FROM queue_item WHERE task_id = 'T-001';",
+                ct));
+        Assert.Equal(
+            "open",
+            await ScalarStringAsync("SELECT status FROM input_request WHERE task_id = 'T-001';", ct));
+        Assert.Equal(
+            "写入哪个目录？",
+            await ScalarStringAsync("SELECT question FROM input_request WHERE task_id = 'T-001';", ct));
+        Assert.Equal(
+            "abandoned|needs_input",
+            await ScalarStringAsync("SELECT outcome || '|' || error_kind FROM attempt;", ct));
+        Assert.Equal(
+            1,
+            await CountAsync("SELECT COUNT(*) FROM notice WHERE kind = 'failure' AND title LIKE '需要输入%';", ct));
+
+        // 挂起项不参与认领：再 Pump 也不会重复执行（重启后同样成立，因为 hold 在持久化层）。
+        Assert.Equal(0, await coordinator.PumpAsync(ct));
+        Assert.Equal(1, fake.Calls);
+    }
+
+    /// <summary>插入一个允许提问的 implementer 角色快照。</summary>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private Task InsertAskableRoleAsync(CancellationToken cancellationToken) => ExecuteAsync(
+        """
+        INSERT INTO role_view (
+            id, name, description, source_path, content_hash, skills, tools, delivery,
+            requires_approval, can_request_input, max_parallel, max_attempts, max_rounds,
+            max_tool_calls, max_duration_seconds, max_input_tokens, payload, loaded_at, updated_at)
+        VALUES (
+            'implementer', '实现', 'desc', 'p', 'h', '[]', '[]', 'dispatch_only',
+            0, 1, 1, 3, 10, 20, 300, NULL, '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+        """,
+        cancellationToken);
+
     /// <summary>构建执行协调器。</summary>
     /// <param name="fake">假模型客户端。</param>
     /// <param name="options">执行配置。</param>
@@ -426,6 +495,8 @@ public sealed class P2ExecutionTests : IDisposable
             normalized,
             deliveryMode ?? new EffectiveDeliveryMode(normalized.DeliveryMode),
             new DevHubPaths(_directory),
+            new InputRequestStore(_factory),
+            new RoleSnapshotStore(new DevHubDbContextFactory(_factory.ConnectionString)),
             NullLoggerFactory.Instance,
             turnLogger ?? NullLogger<TurnRunner>.Instance);
 

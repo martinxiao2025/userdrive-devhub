@@ -48,6 +48,9 @@ public sealed class DevHubDbContext : DbContext
     /// <summary>角色声明快照。</summary>
     public DbSet<RoleViewEntity> RoleViews => Set<RoleViewEntity>();
 
+    /// <summary>不确定项问题单。</summary>
+    public DbSet<InputRequestEntity> InputRequests => Set<InputRequestEntity>();
+
     /// <summary>
     /// 显式映射既有 schema：表名、列名、主键、唯一约束、索引全部按 <see cref="Migrator"/> 的 DDL 书写。
     /// 布尔列以 INTEGER 0/1 存储（<c>HasConversion&lt;int&gt;</c>），字符串时间保持 ISO-8601 原样。
@@ -66,6 +69,48 @@ public sealed class DevHubDbContext : DbContext
         ConfigureScopeLock(modelBuilder);
         ConfigureAudit(modelBuilder);
         ConfigureRoleView(modelBuilder);
+        ConfigureInputRequest(modelBuilder);
+    }
+
+    /// <summary>映射 <c>input_request</c>（schema v5）。</summary>
+    /// <param name="modelBuilder">模型构建器。</param>
+    private static void ConfigureInputRequest(ModelBuilder modelBuilder)
+    {
+        var entity = modelBuilder.Entity<InputRequestEntity>();
+        entity.ToTable(
+            "input_request",
+            table => table.HasCheckConstraint(
+                "ck_input_request_status",
+                "status IN ('open','answered','expired','cancelled')"));
+
+        entity.HasKey(item => item.Id);
+
+        entity.Property(item => item.Id).HasColumnName("id").ValueGeneratedNever();
+        entity.Property(item => item.WorkspaceId).HasColumnName("workspace_id");
+        entity.Property(item => item.TaskId).HasColumnName("task_id");
+        entity.Property(item => item.QueueItemId).HasColumnName("queue_item_id");
+        entity.Property(item => item.RoleId).HasColumnName("role_id");
+        entity.Property(item => item.Status).HasColumnName("status");
+        entity.Property(item => item.Question).HasColumnName("question");
+        entity.Property(item => item.Context).HasColumnName("context");
+        entity.Property(item => item.Options).HasColumnName("options");
+        entity.Property(item => item.MissingInputs).HasColumnName("missing_inputs");
+        entity.Property(item => item.AllowFreeText).HasColumnName("allow_free_text").HasConversion<int>();
+        entity.Property(item => item.DedupeKey).HasColumnName("dedupe_key");
+        entity.Property(item => item.CreatedAt).HasColumnName("created_at");
+        entity.Property(item => item.ExpiresAt).HasColumnName("expires_at");
+        entity.Property(item => item.AnsweredAt).HasColumnName("answered_at");
+        entity.Property(item => item.Answer).HasColumnName("answer");
+        entity.Property(item => item.AnswerOptionId).HasColumnName("answer_option_id");
+        entity.Property(item => item.AnswerSource).HasColumnName("answer_source");
+        entity.Property(item => item.AnsweredBy).HasColumnName("answered_by");
+
+        entity.HasIndex(item => item.DedupeKey)
+            .IsUnique()
+            .HasFilter("status = 'open'")
+            .HasDatabaseName("idx_input_dedupe_open");
+        entity.HasIndex(item => new { item.Status, item.CreatedAt }).HasDatabaseName("idx_input_open");
+        entity.HasIndex(item => new { item.WorkspaceId, item.TaskId, item.Status }).HasDatabaseName("idx_input_task");
     }
 
     /// <summary>映射 <c>role_view</c>（schema v5）。</summary>

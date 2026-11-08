@@ -218,6 +218,40 @@ public sealed class ExecutionStore
             .ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// 任务因缺少输入而挂起：队列项回到 <c>pending</c> 并写入 <c>hold_kind='input'</c>，
+    /// 同时回退 attempt（提问不消耗重试预算）。挂起项不占用并发槽、不参与自动重试，
+    /// 认领谓词的 <c>hold_kind IS NULL</c> 排除它，直到回答清除 hold。
+    /// </summary>
+    /// <param name="queueItemId">队列项 id。</param>
+    /// <param name="inputRequestId">问题单 id。</param>
+    /// <param name="now">时间戳。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    public async Task HoldForInputAsync(
+        string queueItemId,
+        string inputRequestId,
+        string now,
+        CancellationToken cancellationToken = default)
+    {
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        await db.QueueItems
+            .Where(item => item.Id == queueItemId)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(item => item.Status, "pending")
+                    .SetProperty(item => item.HoldKind, "input")
+                    .SetProperty(item => item.HoldRef, inputRequestId)
+                    .SetProperty(item => item.LeaseOwner, (string?)null)
+                    .SetProperty(item => item.LeaseExpiresAt, (string?)null)
+                    .SetProperty(item => item.AvailableAt, now)
+                    .SetProperty(item => item.Attempt, item => item.Attempt > 0 ? item.Attempt - 1 : item.Attempt)
+                    .SetProperty(item => item.LastErrorCode, (string?)null)
+                    .SetProperty(item => item.LastError, (string?)null)
+                    .SetProperty(item => item.UpdatedAt, now),
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
     /// <summary>写入一条结果，返回结果 id。</summary>
     /// <param name="draft">结果内容。</param>
     /// <param name="now">时间戳。</param>

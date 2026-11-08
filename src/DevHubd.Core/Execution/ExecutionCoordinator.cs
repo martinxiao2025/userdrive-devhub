@@ -367,10 +367,15 @@ public sealed class ExecutionCoordinator
         var item = claimed.Item;
         var result = outcome.Result;
 
+        // 提问不是失败：记 abandoned（与取消同档），token 与调用次数照实保留。
+        var attemptOutcome = error.Kind == ModelErrorKinds.NeedsInput || result.State == TurnState.Cancelled
+            ? "abandoned"
+            : "failed";
+
         await _store.CompleteAttemptAsync(
             claimed.AttemptId,
             new AttemptCompletion(
-                result.State == TurnState.Cancelled ? "abandoned" : "failed",
+                attemptOutcome,
                 outcome.Model,
                 error.Kind,
                 error.Code,
@@ -384,6 +389,12 @@ public sealed class ExecutionCoordinator
                 Truncate(error.Message)),
             now,
             cancellationToken).ConfigureAwait(false);
+
+        if (error.Kind == ModelErrorKinds.NeedsInput)
+        {
+            await HoldForInputAsync(claimed, outcome, error, now, cancellationToken).ConfigureAwait(false);
+            return;
+        }
 
         switch (error.Kind)
         {
@@ -482,6 +493,51 @@ public sealed class ExecutionCoordinator
             outcome.Provider,
             error.Kind,
             error.Code);
+    }
+
+    /// <summary>
+    /// 缺少输入：把队列项挂起在问题单上（不占并发槽、不消耗重试预算、不自动重试），
+    /// 并写一条 <c>failure</c> 通知提示会话侧取回问题单。
+    /// 问题单 id 缺失说明回合状态自相矛盾，退回普通失败路径以免队列项永久悬挂。
+    /// </summary>
+    /// <param name="claimed">已认领项。</param>
+    /// <param name="outcome">回合产出。</param>
+    /// <param name="error">错误。</param>
+    /// <param name="now">时间戳。</param>
+    /// <param name="cancellationToken">取消令牌（收尾固定为 None）。</param>
+    private async Task HoldForInputAsync(
+        ClaimedQueueItem claimed,
+        TurnRunOutcome outcome,
+        ModelError error,
+        string now,
+        CancellationToken cancellationToken)
+    {
+        var item = claimed.Item;
+
+        if (outcome.InputRequestId is not { } requestId)
+        {
+            await RetryOrDieAsync(claimed, outcome, error, maxAttempts: 2, backoff: TimeSpan.FromSeconds(30), now, cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        await _store.HoldForInputAsync(item.Id, requestId, now, cancellationToken).ConfigureAwait(false);
+
+        await _store.InsertNoticeAsync(
+            $"input:{requestId}",
+            "failure",
+            item.TaskId,
+            $"需要输入：任务 {item.TaskId}",
+            error.Message,
+            now,
+            cancellationToken).ConfigureAwait(false);
+
+        _logger.LogInformation(
+            "任务挂起等待输入：queueItemId={QueueItemId} taskId={TaskId} attempt={Attempt} requestId={RequestId}",
+            item.Id,
+            item.TaskId,
+            item.Attempt,
+            requestId);
     }
 
     /// <summary>任务级失败：未达上限则退避重试，达上限则置 dead 并产出失败结果。</summary>

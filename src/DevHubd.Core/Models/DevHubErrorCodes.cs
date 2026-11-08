@@ -68,4 +68,15 @@ public static class DevHubErrorCodes
 
     /// <summary>未归类的内部错误。</summary>
     public const string Internal = "INTERNAL";
+
+    // ---------- 不确定项回流 ----------
+
+    /// <summary>任务因缺少输入而挂起，等待会话侧回答。</summary>
+    public const string NeedsInput = "NEEDS_INPUT";
+
+    /// <summary>当前角色不允许向用户提问。</summary>
+    public const string InputNotAllowed = "INPUT_NOT_ALLOWED";
+
+    /// <summary>任务内容在等待回答期间已变更，旧问题单被取消。</summary>
+    public const string TaskChanged = "TASK_CHANGED";
 }

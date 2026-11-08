@@ -1,5 +1,8 @@
+using System.Text.Json;
+using DevHubd.Core.Input;
 using DevHubd.Core.Models;
 using DevHubd.Core.Queue;
+using DevHubd.Core.Roles;
 using DevHubd.Core.Tasks;
 using DevHubd.Core.Workspaces;
 using Microsoft.Extensions.Logging;
@@ -14,6 +17,7 @@ namespace DevHubd.Core.Execution;
 /// <param name="Result">回合结果。</param>
 /// <param name="Artifacts">产物（相对路径）。</param>
 /// <param name="WorkDirectory">隔离工作目录；auto 档位为 null。</param>
+/// <param name="InputRequestId">本回合写入的问题单 id；null 表示未提问。</param>
 public sealed record TurnRunOutcome(
     string TurnId,
     string Provider,
@@ -21,7 +25,8 @@ public sealed record TurnRunOutcome(
     string DeliveryOutcome,
     TurnResult Result,
     IReadOnlyList<string> Artifacts,
-    string? WorkDirectory);
+    string? WorkDirectory,
+    string? InputRequestId = null);
 
 /// <summary>
 /// 回合执行器：解析交付档位、准备隔离目录、构造工具白名单与提示词、调用模型客户端。
@@ -45,14 +50,18 @@ public sealed class TurnRunner
     private readonly ExecutionOptions _options;
     private readonly EffectiveDeliveryMode _deliveryMode;
     private readonly DevHubPaths _paths;
+    private readonly InputRequestStore _inputRequests;
+    private readonly RoleSnapshotStore _roleSnapshots;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<TurnRunner> _logger;
 
-    /// <summary>注入模型注册表、执行配置、运行时档位、路径、日志工厂与日志器。</summary>
+    /// <summary>注入模型注册表、执行配置、运行时档位、路径、问题单存取、角色快照、日志工厂与日志器。</summary>
     /// <param name="registry">模型客户端注册表。</param>
     /// <param name="options">执行配置。</param>
     /// <param name="deliveryMode">运行时交付档位（唯一来源，已由 <c>scheduler_state.mode</c> 校正）。</param>
     /// <param name="paths">运行时路径。</param>
+    /// <param name="inputRequests">问题单存取。</param>
+    /// <param name="roleSnapshots">角色快照（判断 <c>canRequestInput</c>）。</param>
     /// <param name="loggerFactory">用于创建工具执行器日志器。</param>
     /// <param name="logger">日志器。</param>
     public TurnRunner(
@@ -60,6 +69,8 @@ public sealed class TurnRunner
         ExecutionOptions options,
         EffectiveDeliveryMode deliveryMode,
         DevHubPaths paths,
+        InputRequestStore inputRequests,
+        RoleSnapshotStore roleSnapshots,
         ILoggerFactory loggerFactory,
         ILogger<TurnRunner> logger)
     {
@@ -67,6 +78,8 @@ public sealed class TurnRunner
         _options = options;
         _deliveryMode = deliveryMode;
         _paths = paths;
+        _inputRequests = inputRequests;
+        _roleSnapshots = roleSnapshots;
         _loggerFactory = loggerFactory;
         _logger = logger;
     }
@@ -121,10 +134,16 @@ public sealed class TurnRunner
             EnforceScope: deliveryOutcome == "delivered");
 
         var budget = _options.ToBudget();
-        IToolDispatcher dispatcher = new ToolDispatcher(
+        var roleId = string.IsNullOrWhiteSpace(item.RoleId) ? "implementer" : item.RoleId;
+        var canRequestInput = await _roleSnapshots.CanRequestInputAsync(roleId, cancellationToken)
+            .ConfigureAwait(false);
+
+        var dispatcher = new ToolDispatcher(
             workspaceContext,
             budget,
-            _loggerFactory.CreateLogger<ToolDispatcher>());
+            _loggerFactory.CreateLogger<ToolDispatcher>(),
+            canRequestInput,
+            canRequestInput ? (prompt, token) => AskInputAsync(item, roleId, prompt, token) : null);
 
         var request = new TurnRequest(
             turnId,
@@ -189,6 +208,28 @@ public sealed class TurnRunner
 
         var artifacts = BuildArtifacts(item.Id, workDirectory, dispatcher.ChangedFiles);
 
+        // 提问即暂停：回合正常结束后若模型已写入问题单，则本回合按 needs_input 收尾，
+        // token 与工具调用次数照实保留（不估算、不吞成本），由协调器挂起队列项。
+        string? inputRequestId = null;
+        if (result.State == TurnState.Done && dispatcher.InputRequestId is { } requested)
+        {
+            inputRequestId = requested;
+            _logger.LogInformation(
+                "模型回合请求输入，转入挂起：queueItemId={QueueItemId} attempt={Attempt} turnId={TurnId} requestId={RequestId}",
+                item.Id,
+                item.Attempt,
+                turnId,
+                requested);
+
+            result = TurnResult.Failed(
+                new ModelError(
+                    ModelErrorKinds.NeedsInput,
+                    DevHubErrorCodes.NeedsInput,
+                    dispatcher.InputQuestion ?? "任务缺少必要输入，等待回答。"),
+                result.ToolCalls,
+                result.Usage);
+        }
+
         if (result.State == TurnState.Done)
         {
             _logger.LogInformation(
@@ -220,7 +261,43 @@ public sealed class TurnRunner
                 result.Error?.Code);
         }
 
-        return new TurnRunOutcome(turnId, provider, request.Model, deliveryOutcome, result, artifacts, workDirectory);
+        return new TurnRunOutcome(turnId, provider, request.Model, deliveryOutcome, result, artifacts, workDirectory, inputRequestId);
+    }
+
+    /// <summary>把模型侧提问落为问题单；同任务已有 open 请求时复用既有 id。</summary>
+    /// <param name="item">当前队列项。</param>
+    /// <param name="roleId">提问时生效的角色 id。</param>
+    /// <param name="prompt">已校验的提问内容。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private async Task<InputAcceptance> AskInputAsync(
+        QueueItem item,
+        string roleId,
+        InputPrompt prompt,
+        CancellationToken cancellationToken)
+    {
+        var result = await _inputRequests.CreateAsync(
+            new InputRequestDraft(
+                item.WorkspaceId,
+                item.TaskId,
+                item.Id,
+                roleId,
+                item.TaskHash,
+                prompt.Question,
+                prompt.Context is null ? null : JsonSerializer.Serialize(new { summary = prompt.Context }),
+                prompt.Options.Count == 0 ? null : JsonSerializer.Serialize(prompt.Options),
+                prompt.MissingInputs.Count == 0 ? null : JsonSerializer.Serialize(prompt.MissingInputs),
+                AllowFreeText: true,
+                DateTimeOffset.UtcNow.AddHours(_options.InputTimeoutHours)),
+            cancellationToken).ConfigureAwait(false);
+
+        _logger.LogInformation(
+            "问题单已写入：queueItemId={QueueItemId} requestId={RequestId} created={Created} role={RoleId}",
+            item.Id,
+            result.RequestId,
+            result.Created,
+            roleId);
+
+        return InputAcceptance.Ok(result.RequestId, result.Created);
     }
 
     /// <summary>
