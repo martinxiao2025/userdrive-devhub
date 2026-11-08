@@ -98,12 +98,16 @@ public sealed class P2ExecutionTests : IDisposable
         Assert.Equal(10L, await ScalarLongAsync("SELECT input_tokens FROM attempt;", ct));
         Assert.Equal(5L, await ScalarLongAsync("SELECT output_tokens FROM attempt;", ct));
         Assert.Equal(0L, await ScalarLongAsync("SELECT usage_estimated FROM attempt;", ct));
+        Assert.Equal(1L, await ScalarLongAsync("SELECT usage_available FROM attempt;", ct));
+        Assert.Equal(0L, await ScalarLongAsync("SELECT rounds_exhausted FROM attempt;", ct));
 
         var detail = await _queue.GetAsync(queueItemId!, ct);
         var attempt = Assert.Single(detail!.Attempts);
         Assert.Equal(10, attempt.InputTokens);
         Assert.Equal(5, attempt.OutputTokens);
         Assert.False(attempt.UsageEstimated);
+        Assert.True(attempt.UsageAvailable);
+        Assert.False(attempt.RoundsExhausted);
         Assert.Equal(0, attempt.ToolCalls);
 
         // result_list 读侧同样要带上同一份用量与工具调用次数。
@@ -112,6 +116,8 @@ public sealed class P2ExecutionTests : IDisposable
         Assert.Equal(10, listed.InputTokens);
         Assert.Equal(5, listed.OutputTokens);
         Assert.False(listed.UsageEstimated);
+        Assert.True(listed.UsageAvailable);
+        Assert.False(listed.RoundsExhausted);
         Assert.Equal(0, listed.ToolCalls);
 
         var turnStart = turnLogger.Collector.GetSnapshot()
@@ -124,6 +130,40 @@ public sealed class P2ExecutionTests : IDisposable
             .Single(record => record.Message.Contains("队列项执行成功", StringComparison.Ordinal));
         Assert.Contains(queueItemId!, settled.Message, StringComparison.Ordinal);
         Assert.Contains("turnId=", settled.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// 轮次耗尽与用量不可得必须原样落库并在 result_list 可见：
+    /// 状态仍是 succeeded，但 <c>roundsExhausted=true</c> 明确区别于自然完成，
+    /// <c>usageAvailable=false</c> 表示 token 缺失而不是 0。
+    /// </summary>
+    [Fact]
+    public async Task Pump_RoundsExhaustedAndUnavailableUsage_ArePersistedAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "轮次耗尽", "ready", 10);
+        await PrepareQueueAsync(ct);
+
+        var fake = new FakeModelClient(
+            "openai",
+            (_, _, _) => Task.FromResult(
+                TurnResult.Done("兜底答复", 3, null, Array.Empty<string>(), roundsExhausted: true)));
+
+        var coordinator = CreateCoordinator(fake, new ExecutionOptions());
+        await coordinator.PumpAsync(ct);
+        await WaitUntilAsync(async () => await CountAsync("SELECT COUNT(*) FROM result;", ct) == 1, ct);
+
+        Assert.Equal("succeeded", await ScalarStringAsync("SELECT status FROM queue_item;", ct));
+        Assert.Equal(1L, await ScalarLongAsync("SELECT rounds_exhausted FROM attempt;", ct));
+        Assert.Equal(0L, await ScalarLongAsync("SELECT usage_available FROM attempt;", ct));
+
+        var listed = Assert.Single((await new ResultStore(_factory).ListAsync(false, 10, null, ct)).Items);
+        Assert.True(listed.RoundsExhausted);
+        Assert.False(listed.UsageAvailable);
+        Assert.Null(listed.InputTokens);
+        Assert.Null(listed.OutputTokens);
     }
 
     /// <summary>

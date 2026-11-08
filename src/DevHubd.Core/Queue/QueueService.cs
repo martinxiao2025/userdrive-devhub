@@ -689,6 +689,8 @@ public sealed class QueueService
         entity.InputTokens,
         entity.OutputTokens,
         entity.UsageEstimated,
+        entity.UsageAvailable,
+        entity.RoundsExhausted,
         entity.FilesChanged,
         entity.Summary);
 

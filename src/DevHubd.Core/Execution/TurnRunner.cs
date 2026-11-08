@@ -193,7 +193,7 @@ public sealed class TurnRunner
         {
             _logger.LogInformation(
                 "模型回合结束：queueItemId={QueueItemId} attempt={Attempt} turnId={TurnId} provider={Provider} toolCalls={ToolCalls} filesChanged={FilesChanged} " +
-                "promptTokens={PromptTokens} completionTokens={CompletionTokens} totalTokens={TotalTokens} usageEstimated={UsageEstimated} usageMissing={UsageMissing}",
+                "promptTokens={PromptTokens} completionTokens={CompletionTokens} totalTokens={TotalTokens} usageEstimated={UsageEstimated} usageMissing={UsageMissing} roundsExhausted={RoundsExhausted}",
                 item.Id,
                 item.Attempt,
                 turnId,
@@ -204,7 +204,8 @@ public sealed class TurnRunner
                 result.Usage?.OutputTokens ?? 0,
                 result.Usage is null ? 0 : result.Usage.InputTokens + result.Usage.OutputTokens,
                 result.Usage?.Estimated ?? false,
-                result.Usage is null);
+                result.Usage is null,
+                result.RoundsExhausted);
         }
         else
         {

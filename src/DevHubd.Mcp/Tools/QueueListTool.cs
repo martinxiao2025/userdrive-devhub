@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Text.Json;
 using DevHubd.Mcp.Abstractions;
+using DevHubd.Mcp.Contracts;
 using DevHubd.Mcp.Errors;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
@@ -29,7 +30,7 @@ public sealed class QueueListTool
     /// <param name="cursor">上一页返回的 nextCursor。</param>
     /// <param name="cancellationToken">取消令牌。</param>
     [McpServerTool(Name = "queue_list", ReadOnly = true, Idempotent = true, OpenWorld = false)]
-    [Description("分页列出调度队列项；支持按状态过滤（pending/claimed/running/succeeded/failed/dead/cancelled/all）。")]
+    [Description("分页列出调度队列项；支持按状态过滤（" + ToolVocabulary.QueueStatuses + "）。")]
     public async Task<CallToolResult> ListAsync(
         [Description("状态过滤，默认 all。")] string status = "all",
         [Description("每页数量，1–100，默认 20。")] int limit = 20,
@@ -62,7 +63,7 @@ public sealed class QueueListTool
                     code: "INVALID_STATUS",
                     message: "status 取值非法。",
                     retryable: true,
-                    next: "使用 pending/claimed/running/succeeded/failed/dead/cancelled/all 之一。",
+                    next: "使用 " + ToolVocabulary.QueueStatuses + " 之一。",
                     details: new { status }),
                 _digest,
                 cancellationToken).ConfigureAwait(false);

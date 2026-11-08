@@ -50,6 +50,9 @@ public sealed class ChatTurnExecutorTests
         Assert.Equal(2, result.ToolCalls);
         Assert.Equal(3, inner.Calls);
         Assert.True(inner.Requests[^1]?.Tools is null or { Count: 0 });
+
+        // 状态仍是 Done（不改写框架返回路径），但必须留痕，供落库与 result_list 区分“自然完成”。
+        Assert.True(result.RoundsExhausted);
     }
 
     /// <summary>工具业务失败以稳定错误码回灌给模型，模型可以据此纠正并完成回合。</summary>
@@ -76,6 +79,7 @@ public sealed class ChatTurnExecutorTests
         Assert.Equal(TurnState.Done, result.State);
         Assert.Equal("已根据错误提示调整。", result.Text);
         Assert.Equal(1, result.ToolCalls);
+        Assert.False(result.RoundsExhausted);
     }
 
     /// <summary>连续工具错误达到框架上限后，框架原样抛出最后一次受控异常，执行器映射为 tool_error。</summary>

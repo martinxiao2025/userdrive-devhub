@@ -45,6 +45,9 @@ public sealed class ChatPipeline : IDisposable
     /// <summary>是否每一轮都返回了可用 usage。</summary>
     public bool AllRoundsReportedUsage => _usageTracker.AllRoundsReportedUsage;
 
+    /// <summary>是否耗尽了工具轮次预算（框架已移除工具并产出兜底答复）。</summary>
+    public bool RoundsExhausted => _usageTracker.RoundsExhausted;
+
     /// <inheritdoc />
     public void Dispose() => Client.Dispose();
 }
@@ -145,7 +148,8 @@ public static class ChatTurnExecutor
                 ExtractText(response),
                 ResolveToolCalls(response, dispatcher),
                 MapUsage(response.Usage, pipeline.AllRoundsReportedUsage),
-                ResolveChangedFiles(response, dispatcher));
+                ResolveChangedFiles(response, dispatcher),
+                pipeline.RoundsExhausted);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {

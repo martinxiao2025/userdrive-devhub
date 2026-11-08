@@ -157,6 +157,8 @@ public sealed class DevHubDbContext : DbContext
         entity.Property(item => item.InputTokens).HasColumnName("input_tokens");
         entity.Property(item => item.OutputTokens).HasColumnName("output_tokens");
         entity.Property(item => item.UsageEstimated).HasColumnName("usage_estimated").HasConversion<int>();
+        entity.Property(item => item.UsageAvailable).HasColumnName("usage_available").HasConversion<int>();
+        entity.Property(item => item.RoundsExhausted).HasColumnName("rounds_exhausted").HasConversion<int>();
         entity.Property(item => item.FilesChanged).HasColumnName("files_changed");
         entity.Property(item => item.Summary).HasColumnName("summary");
 

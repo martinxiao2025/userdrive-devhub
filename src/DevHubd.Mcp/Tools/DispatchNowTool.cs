@@ -36,7 +36,7 @@ public sealed class DispatchNowTool
     public async Task<CallToolResult> DispatchAsync(
         [Description("任务 id（.devhub/tasks 中的 id）。")] string taskId,
         [Description("可选：工作区 id；同名任务存在于多个工作区时必须指定。")] string? workspaceId = null,
-        [Description("首选 provider：auto（默认，按可用性选择）/ openai / vscode。")] string provider = "auto",
+        [Description("首选 provider：" + ToolVocabulary.Providers + "（auto 为默认，按可用性选择）。")] string provider = "auto",
         [Description("true 时只判定不写入。")] bool dryRun = false,
         [Description("true 时忽略 manual 暂停强行入队；quota/auth 等硬暂停不可覆盖。")] bool force = false,
         CancellationToken cancellationToken = default)

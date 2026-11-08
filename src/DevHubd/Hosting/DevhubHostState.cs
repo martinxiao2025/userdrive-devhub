@@ -1,4 +1,5 @@
 using DevHubd.Core.Data;
+using DevHubd.Core.Models;
 using DevHubd.Core.Scheduling;
 using DevHubd.Mcp.Abstractions;
 using DevHubd.Mcp.Contracts;
@@ -44,9 +45,8 @@ public sealed class DevHubHostState : ISchedulerStatusSource
     /// <summary>
     /// 组装状态快照。数据库不可用时抛出异常，由工具层转换为 <c>SCHEDULER_UNAVAILABLE</c>。
     /// </summary>
-    /// <param name="verbose">是否要求更详细的信息（当前不影响返回内容）。</param>
     /// <param name="cancellationToken">取消令牌。</param>
-    public async Task<SchedulerStatusSnapshot> GetSnapshotAsync(bool verbose, CancellationToken cancellationToken = default)
+    public async Task<SchedulerStatusSnapshot> GetSnapshotAsync(CancellationToken cancellationToken = default)
     {
         var scheduler = await _stateStore.ReadAsync(cancellationToken).ConfigureAwait(false);
 
@@ -71,8 +71,8 @@ public sealed class DevHubHostState : ISchedulerStatusSource
             Phase = scheduler.Enabled ? "idle" : "paused",
             PauseReason = scheduler.PauseReason,
             IntervalSeconds = scheduler.IntervalSeconds,
-            LastScanAt = scheduler.LastScanAt,
-            NextScanAt = scheduler.NextScanAt,
+            LastScanAt = UtcTime.Normalize(scheduler.LastScanAt),
+            NextScanAt = UtcTime.Normalize(scheduler.NextScanAt),
             Counters = MapCounters(scheduler.Counters),
             Queue = queue,
             Unread = unread,
@@ -83,7 +83,7 @@ public sealed class DevHubHostState : ISchedulerStatusSource
             {
                 Pid = Environment.ProcessId,
                 EngineMode = "mcp+scheduler",
-                StartedAt = _host.StartedAt.ToString("O"),
+                StartedAt = UtcTime.Format(_host.StartedAt),
                 UptimeSeconds = _host.UptimeSeconds,
                 Version = _host.Version,
                 DataDirectory = _host.Paths.DataDirectory,
@@ -223,13 +223,13 @@ public sealed class DevHubHostState : ISchedulerStatusSource
                 State = state.State,
                 Breaker = state.Breaker,
                 Detail = state.Detail,
-                CheckedAt = state.CheckedAt,
+                CheckedAt = UtcTime.Normalize(state.CheckedAt),
             })
             .ToList();
 
         if (list.Count == 0)
         {
-            var checkedAt = DateTimeOffset.UtcNow.ToString("O");
+            var checkedAt = UtcTime.Now();
             list.Add(new ProviderStatus
             {
                 Provider = "openai",

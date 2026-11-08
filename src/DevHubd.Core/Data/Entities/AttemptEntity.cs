@@ -48,6 +48,12 @@ public sealed class AttemptEntity
     /// <summary>true 表示 token 为估算值（存 1），false 表示真实值（存 0）。</summary>
     public bool UsageEstimated { get; set; }
 
+    /// <summary>true 表示 provider 明确返回了用量；false 表示用量不可得（token 列为 null）。</summary>
+    public bool UsageAvailable { get; set; }
+
+    /// <summary>true 表示本回合耗尽了工具轮次预算，最终文本是移除工具后的兜底答复。</summary>
+    public bool RoundsExhausted { get; set; }
+
     /// <summary>改动文件数。</summary>
     public int? FilesChanged { get; set; }
 

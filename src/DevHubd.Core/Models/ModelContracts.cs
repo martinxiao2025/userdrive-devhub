@@ -120,21 +120,32 @@ public sealed record TurnRequest(
 /// <param name="Usage">token 用量；null 表示 provider 未返回。</param>
 /// <param name="FilesChanged">本回合写入的文件（相对写根，斜杠分隔）。</param>
 /// <param name="Error">失败原因；成功时为 null。</param>
+/// <param name="RoundsExhausted">
+/// true 表示工具轮次预算已耗尽，文本是框架移除工具后的兜底答复。
+/// 状态仍是 <see cref="TurnState.Done"/>（框架行为），但调用方必须据此区别于“自然完成”。
+/// </param>
 public sealed record TurnResult(
     TurnState State,
     string Text,
     int ToolCalls,
     TokenUsage? Usage,
     IReadOnlyList<string> FilesChanged,
-    ModelError? Error)
+    ModelError? Error,
+    bool RoundsExhausted = false)
 {
     /// <summary>构造成功结果。</summary>
     /// <param name="text">模型文本。</param>
     /// <param name="toolCalls">工具调用次数。</param>
     /// <param name="usage">用量。</param>
     /// <param name="filesChanged">写入文件。</param>
-    public static TurnResult Done(string text, int toolCalls, TokenUsage? usage, IReadOnlyList<string> filesChanged) =>
-        new(TurnState.Done, text, toolCalls, usage, filesChanged, null);
+    /// <param name="roundsExhausted">是否耗尽了工具轮次预算。</param>
+    public static TurnResult Done(
+        string text,
+        int toolCalls,
+        TokenUsage? usage,
+        IReadOnlyList<string> filesChanged,
+        bool roundsExhausted = false) =>
+        new(TurnState.Done, text, toolCalls, usage, filesChanged, null, roundsExhausted);
 
     /// <summary>构造失败结果。</summary>
     /// <param name="error">错误。</param>

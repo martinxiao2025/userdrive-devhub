@@ -26,17 +26,14 @@ public sealed class SchedulerStatusTool
     /// <summary>
     /// 返回调度器、队列、provider、MCP 端点与宿主进程的状态快照。
     /// </summary>
-    /// <param name="verbose">是否返回更详细信息。</param>
     /// <param name="cancellationToken">取消令牌。</param>
     [McpServerTool(Name = "scheduler_status", ReadOnly = true, Idempotent = true, OpenWorld = false)]
     [Description("查看定时调度器状态：是否启用、档位、扫描间隔、队列计数、provider 健康、MCP 端口与宿主进程信息。")]
-    public async Task<CallToolResult> GetStatusAsync(
-        [Description("预留参数；为 true 时要求更详细的信息。")] bool verbose = false,
-        CancellationToken cancellationToken = default)
+    public async Task<CallToolResult> GetStatusAsync(CancellationToken cancellationToken = default)
     {
         try
         {
-            var snapshot = await _source.GetSnapshotAsync(verbose, cancellationToken).ConfigureAwait(false);
+            var snapshot = await _source.GetSnapshotAsync(cancellationToken).ConfigureAwait(false);
             var json = JsonSerializer.Serialize(snapshot, ToolJson.Options);
             return await ToolResults.SuccessAsync(json, _digest, cancellationToken).ConfigureAwait(false);
         }

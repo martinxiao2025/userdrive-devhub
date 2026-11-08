@@ -20,8 +20,10 @@ public sealed record QueuePageResult(IReadOnlyList<QueueItemSummary> Items, stri
 
 /// <summary>
 /// 一次执行尝试的摘要。
-/// token 字段来自 provider 返回的 usage；provider 未返回时三项均为 null。
+/// token 字段来自 provider 返回的 usage；provider 未返回时三项均为 null，且 <c>usageAvailable=false</c>。
 /// <c>usageEstimated=true</c> 表示数值是按字符数估算的近似值，<b>不是真实 token</b>。
+/// <c>roundsExhausted=true</c> 表示本回合耗尽工具轮次预算，最终文本是移除工具后的兜底答复，
+/// 与模型自然完成不是同一语义（结果状态仍为 succeeded）。
 /// </summary>
 public sealed record AttemptSummary(
     int AttemptNo,
@@ -35,7 +37,9 @@ public sealed record AttemptSummary(
     int? PromptTokens,
     int? CompletionTokens,
     int? TotalTokens,
-    bool UsageEstimated);
+    bool UsageEstimated,
+    bool UsageAvailable,
+    bool RoundsExhausted);
 
 /// <summary>队列项详情。</summary>
 public sealed record QueueItemDetailResult(

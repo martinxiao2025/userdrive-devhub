@@ -19,6 +19,8 @@ namespace DevHubd.Core.Results;
 /// <param name="InputTokens">最近一次 attempt 的输入 token；未获得 usage 时为 null。</param>
 /// <param name="OutputTokens">最近一次 attempt 的输出 token；未获得 usage 时为 null。</param>
 /// <param name="UsageEstimated">true 表示 token 为估算值，不是 provider 返回的真实 token。</param>
+/// <param name="UsageAvailable">true 表示 provider 明确返回了用量；false 表示用量不可得。</param>
+/// <param name="RoundsExhausted">true 表示最近一次 attempt 耗尽了工具轮次预算。</param>
 public sealed record ResultRecord(
     string Id,
     string TaskId,
@@ -32,7 +34,9 @@ public sealed record ResultRecord(
     int? ToolCalls,
     int? InputTokens,
     int? OutputTokens,
-    bool UsageEstimated);
+    bool UsageEstimated,
+    bool UsageAvailable,
+    bool RoundsExhausted);
 
 /// <summary>结果分页。</summary>
 /// <param name="Items">当前页。</param>
@@ -225,7 +229,9 @@ public sealed class ResultStore
             attempt?.ToolCalls,
             attempt?.InputTokens,
             attempt?.OutputTokens,
-            attempt?.UsageEstimated ?? false);
+            attempt?.UsageEstimated ?? false,
+            attempt?.UsageAvailable ?? false,
+            attempt?.RoundsExhausted ?? false);
     }
 
     /// <summary>生成下一页游标（base64url 编码的 createdAt/id）。</summary>

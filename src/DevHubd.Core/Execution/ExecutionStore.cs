@@ -14,6 +14,8 @@ namespace DevHubd.Core.Execution;
 /// <param name="InputTokens">输入 token；provider 未返回时为 null。</param>
 /// <param name="OutputTokens">输出 token；provider 未返回时为 null。</param>
 /// <param name="UsageEstimated">true 表示 token 是按字符数估算的近似值，不是 provider 返回的真实 token。</param>
+/// <param name="UsageAvailable">true 表示 provider 明确返回了用量；false 表示用量不可得。</param>
+/// <param name="RoundsExhausted">true 表示本回合耗尽工具轮次预算，文本是移除工具后的兜底答复。</param>
 /// <param name="FilesChanged">改动文件数。</param>
 /// <param name="Summary">摘要。</param>
 public sealed record AttemptCompletion(
@@ -25,6 +27,8 @@ public sealed record AttemptCompletion(
     int? InputTokens,
     int? OutputTokens,
     bool UsageEstimated,
+    bool UsageAvailable,
+    bool RoundsExhausted,
     int FilesChanged,
     string Summary);
 
@@ -119,6 +123,8 @@ public sealed class ExecutionStore
         attempt.InputTokens = completion.InputTokens;
         attempt.OutputTokens = completion.OutputTokens;
         attempt.UsageEstimated = completion.UsageEstimated;
+        attempt.UsageAvailable = completion.UsageAvailable;
+        attempt.RoundsExhausted = completion.RoundsExhausted;
         attempt.FilesChanged = completion.FilesChanged;
         attempt.Summary = completion.Summary;
 

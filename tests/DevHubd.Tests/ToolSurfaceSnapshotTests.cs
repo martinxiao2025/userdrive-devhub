@@ -17,7 +17,7 @@ public sealed class ToolSurfaceSnapshotTests
     /// <summary>P3 工具面快照：工具名 → 参数名列表（顺序与声明顺序一致）。</summary>
     private static readonly Dictionary<string, string[]> _expectedTools = new(StringComparer.Ordinal)
     {
-        ["scheduler_status"] = new[] { "verbose" },
+        ["scheduler_status"] = Array.Empty<string>(),
         ["queue_list"] = new[] { "status", "limit", "cursor" },
         ["queue_get"] = new[] { "queueItemId" },
         ["dispatch_now"] = new[] { "taskId", "workspaceId", "provider", "dryRun", "force" },
@@ -150,6 +150,83 @@ public sealed class ToolSurfaceSnapshotTests
         // null 字段按约定不序列化。
         Assert.False(root.TryGetProperty("pauseReason", out _));
         Assert.False(root.TryGetProperty("lastScanAt", out _));
+    }
+
+    /// <summary>枚举词表快照：工具描述与错误提示都从这里取值，改动必须显式登记。</summary>
+    [Fact]
+    public void Vocabulary_MatchesSnapshot()
+    {
+        Assert.Equal("pending/claimed/running/succeeded/failed/dead/cancelled/all", ToolVocabulary.QueueStatuses);
+        Assert.Equal("auto/dispatch_only", ToolVocabulary.DeliveryModes);
+        Assert.Equal(
+            "start/pause/resume/scan_now/set_mode/reset_breaker/probe_models/status",
+            ToolVocabulary.SchedulerActions);
+        Assert.Equal("auto/openai/vscode", ToolVocabulary.Providers);
+        Assert.Equal("closed/open/half_open", ToolVocabulary.BreakerStates);
+        Assert.Equal("delivered/awaiting_review/failed", ToolVocabulary.ResultOutcomes);
+        Assert.Equal("ready/blocked/done/cancelled/missing", ToolVocabulary.TaskStatuses);
+    }
+
+    /// <summary>
+    /// 用量与轮次耗尽必须显式出现在契约里：消费方不能靠“token 是否为 0”猜用量是否可得，
+    /// 也不能把轮次耗尽的兜底答复当成自然完成。
+    /// </summary>
+    [Fact]
+    public void UsageAndRoundsFlags_AreSerializedInContracts()
+    {
+        var attempt = new AttemptSummary(
+            1,
+            "openai",
+            "gpt-4.1-mini",
+            "2026-11-08T04:09:03.1234567Z",
+            null,
+            "succeeded",
+            null,
+            2,
+            null,
+            null,
+            null,
+            false,
+            false,
+            true);
+
+        using var attemptDocument = JsonDocument.Parse(JsonSerializer.Serialize(attempt, ToolJson.Options));
+        Assert.False(attemptDocument.RootElement.GetProperty("usageAvailable").GetBoolean());
+        Assert.True(attemptDocument.RootElement.GetProperty("roundsExhausted").GetBoolean());
+
+        var result = new ResultSummary(
+            "r1",
+            "t1",
+            "q1",
+            "openai",
+            "awaiting_review",
+            "摘要",
+            Array.Empty<string>(),
+            "2026-11-08T04:09:03.1234567Z",
+            null,
+            null,
+            null,
+            null,
+            null,
+            false,
+            false,
+            true);
+
+        using var resultDocument = JsonDocument.Parse(JsonSerializer.Serialize(result, ToolJson.Options));
+        Assert.False(resultDocument.RootElement.GetProperty("usageAvailable").GetBoolean());
+        Assert.True(resultDocument.RootElement.GetProperty("roundsExhausted").GetBoolean());
+    }
+
+    /// <summary>时间字段统一 UTC + Z：历史 <c>+00:00</c> 行在出契约时归一。</summary>
+    [Fact]
+    public void UtcTime_FormatsAndNormalizesToZ()
+    {
+        Assert.Equal(
+            "2026-11-08T04:09:03.1234567Z",
+            DevHubd.Core.Models.UtcTime.Normalize("2026-11-08T04:09:03.1234567+00:00"));
+        Assert.EndsWith("Z", DevHubd.Core.Models.UtcTime.Now(), StringComparison.Ordinal);
+        Assert.Null(DevHubd.Core.Models.UtcTime.Normalize(null));
+        Assert.Equal("not-a-time", DevHubd.Core.Models.UtcTime.Normalize("not-a-time"));
     }
 
     /// <summary>构造一个最小快照用于序列化契约断言。</summary>

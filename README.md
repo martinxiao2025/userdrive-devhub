@@ -204,11 +204,12 @@ node scripts/smoke-mcp.mjs
 
 - **多轮累加**：工具调用循环会产生多次请求，每轮响应各带一份 `usage`，落库的是整回合累加值，不是最后一轮。
 - **估算标记**：`usage_estimated=1` 表示该数值是近似估算、**不是真实 token**；当前 BYOK 非流式路径只写入 provider 原值（恒为 `0`）。若后续接入不返回 `usage` 的通道，必须显式置 `1` 并在字段说明中标注，不能混入真实值统计。
+- **用量可得性显式标记**：`usageAvailable` 与 token 三列一起返回。`usageAvailable=false` 表示 provider 没有返回 usage（token 为 `null`，**不是 0**）；`true` 表示数值来自 provider 响应。消费方不要用“token 是否为 0”猜缺失。
 - **查看方式**：
-  - `queue_get` → `attempts[]` 的 `toolCalls` / `promptTokens` / `completionTokens` / `totalTokens` / `usageEstimated`。
-  - `result_list` → 每条结果的 `toolCalls` / `promptTokens` / `completionTokens` / `totalTokens` / `usageEstimated`（取该队列项最近一次 attempt）。
+  - `queue_get` → `attempts[]` 的 `toolCalls` / `promptTokens` / `completionTokens` / `totalTokens` / `usageEstimated` / `usageAvailable` / `roundsExhausted`。
+  - `result_list` → 每条结果的 `toolCalls` / `promptTokens` / `completionTokens` / `totalTokens` / `usageEstimated` / `usageAvailable` / `roundsExhausted`（取该队列项最近一次 attempt）。
   - `scheduler_status` → `tokens` 的累计值（含 `attemptsWithUsage`、`attemptsWithoutUsage`、`estimatedAttempts`，缺失用量单独计数而不是当 0 计入总量）。
-  - 日志：`模型回合完成` / `模型回合结束` 两条记录带 `promptTokens`、`completionTokens`、`totalTokens`、`usageMissing`（或 `usageEstimated`）字段，可与落库值对账。
+  - 日志：`模型回合完成` / `模型回合结束` 两条记录带 `promptTokens`、`completionTokens`、`totalTokens`、`usageMissing`（或 `usageEstimated`）、`roundsExhausted` 字段，可与落库值对账。
 
 ---
 
@@ -258,6 +259,45 @@ node scripts/smoke-mcp.mjs
 
 ---
 
+### 3.5 升级到本版本（含破坏性变更）
+
+升级步骤：停止旧实例 → 替换二进制/插件 → 启动。数据库会在启动时自动从 schema v2 迁移到 v3
+（`attempt` 增加 `usage_available`、`rounds_exhausted`），旧行默认 0，无需手工改库。
+
+**B1 时间格式统一为 UTC + `Z`**
+
+- 旧：`2026-11-08T04:09:03.1234567+00:00`；新：`2026-11-08T04:09:03.1234567Z`。
+- 覆盖所有工具与资源的 `createdAt` / `updatedAt` / `startedAt` / `endedAt` / `readAt` / `seenAt` /
+  `lastScanAt` / `nextScanAt` / `checkedAt`。库内历史行不改写，读侧统一归一后出契约。
+- 迁移：若你的脚本用 `endsWith("+00:00")` 或严格字符串比较判断时间，改为按时间解析（`DateTimeOffset` /
+  `new Date(...)`）。`nextCursor` 不受影响。
+
+**B2 删除 `scheduler_status.verbose`**
+
+- 该参数原本无任何作用，现已从工具签名删除。SDK 会忽略多余参数，旧调用不会报错，
+  但该字段已无效果；请从调用参数中删除，避免误判它会改变返回内容。
+
+**轮次耗尽的语义（新增 `roundsExhausted`）**
+
+- 工具轮次预算耗尽时，回合状态仍是 `succeeded`，但 `queue_get.attempts[]` 与 `result_list.items[]`
+  会带 `roundsExhausted=true`，表示正文是框架移除工具后的兜底答复，**不是**模型自然完成。
+- 背景：旧实现返回错误码 `TOOL_ROUNDS_EXCEEDED`；改用 `Microsoft.Extensions.AI` 后框架会移除工具再调一轮
+  并正常返回，本版不再与框架行为对抗，改为“保持返回路径 + 显式留痕”。自动化流程应把
+  `roundsExhausted=true` 视同需要人工复核。
+- 日志：`模型回合结束` 新增 `roundsExhausted` 字段，可与落库值对账。
+
+**其他执行语义变化**
+
+1. `vscode` 桥取消：宿主改为原样抛出 `OperationCanceledException`（先以 3 秒独立超时发送
+   `DELETE /turns/{id}` 收尾），由 `TurnRunner` 统一映射为 `cancelled`。对外可观察结果与旧版一致。
+2. 连续工具错误达到 3 次：回合失败，`errorKind=tool_error`，`errorCode` 取工具自身稳定码
+   （如 `FILE_NOT_FOUND`），不再是笼统的回合异常。
+
+**新增 `usageAvailable`**：与 token 三列一起返回，`false` 明确表示用量不可得（token 为 `null`），
+不需要再用“token 是否为 0”猜。完整字段与错误码见 [docs/mcp-tool-contract.md](./docs/mcp-tool-contract.md)。
+
+---
+
 ## 4. 已知限制
 
 1. **机器级单实例**：同一台机器同时只允许一个宿主；多工作区由 `workspaces.json` 承载，不是多进程。
@@ -291,20 +331,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -A
 
 ### 6.1 已真实验证
 
-- `dotnet build DevHubd.sln`：0 警告 0 错误；`dotnet test`：106/106 通过、0 跳过（此前的 5 项启动失败路径用例在停止守护进程、互斥体释放后真机跑通，见下一条）。
-- `node scripts/validate-plugin.mjs`（4 项 PASS）、`node scripts/check-encoding.mjs`（128 个文件）、`node scripts/smoke-mcp.mjs`（真实握手 + `tools/list` + `tools/call` + `resources/read`）全部通过。
+- `dotnet build DevHubd.sln`：0 警告 0 错误；`dotnet test`：125/125 通过、0 跳过（此前的 5 项启动失败路径用例在停止守护进程、互斥体释放后真机跑通，见下一条）。
+- `node scripts/validate-plugin.mjs`（4 项 PASS）、`node scripts/check-encoding.mjs`（156 个文件）、`node scripts/smoke-mcp.mjs`（真实握手 + `tools/list` + `tools/call` + `resources/read`）全部通过。
 - 真实 BYOK 回合（2026-11-08）：provider `openai`，端点 `https://api.deepseek.com`，模型 `deepseek-flash`；任务 REAL-001 / REAL-002 / REAL-003 均产出 `awaiting_review` 结果，工作区只改 `out/` 下目标文件。
-- schema 升级：已有 V1 库启动后 `user_version` 由 1 升到 2（新增 `attempt.usage_estimated`），`scheduler_status.host.schemaVersion=2`。
+- schema 升级：已有 V1 库启动后 `user_version` 由 1 升到 2（新增 `attempt.usage_estimated`），`scheduler_status.host.schemaVersion=2`。2026-11-08 增补：真实数据目录的 v2 库启动后自动升到 v3（新增 `attempt.usage_available`、`attempt.rounds_exhausted`），日志 `数据库就绪…（schema v3）`，冒烟返回 `schema=v3`，旧行默认 0。
 - usage 落库核对（REAL-003，新真实回合）：provider 3 轮累计 `prompt_tokens=3087`、`completion_tokens=360`、`total=3447`，`usageMissing=False`；直接读 SQLite 得 `input_tokens=3087, output_tokens=360, usage_estimated=0`；`queue_get`、`result_list`、`scheduler_status.tokens` 三处读回一致，未做任何估算。
 - 按 §1.1 命令自包含发布：产物 103.7 MiB，`-Action start/status/stop` 与 MCP 冒烟连续走通（`startupMs=1966`，停止后 `runtime.json` 被移除、`status` 返回 3）。
-- 启动失败路径真机复跑（2026-11-08，先 `-Action stop` 停掉守护进程并确认 `runtime.json` 移除、`/health` 不可达）：`StartupExitCodeTests` 的退出码 2/3/4/5 四项与 `LoggingTests.SecondInstance_WritesErrorLogWithLockPath` 全部执行且通过，全量 106/106、0 跳过。
+- 启动失败路径真机复跑（2026-11-08，先 `-Action stop` 停掉守护进程并确认 `runtime.json` 移除、`/health` 不可达）：`StartupExitCodeTests` 的退出码 2/3/4/5 四项与 `LoggingTests.SecondInstance_WritesErrorLogWithLockPath` 全部执行且通过，全量通过、0 跳过。
 - VSIX 安装到 VS Code Stable：`code --install-extension` 成功，扩展宿主日志出现 `_doActivateExtension userdrive.devhub-bridge, activationEvent: 'onStartupFinished'`，无报错。
 - 通知闭环：向 `notice` 表造 3 条新通知，VS Code 通知中心各弹一次且标题不重复；ack 后数据库 `acked_at` 写入、`globalState["devhub.noticeSeq"]` 从 0 推进到 3；随后用 `sinceSeq=0` 查询不再返回已确认项。
 - 守护进程侧 `/health` + pid 校验：发现文件 pid 与桥 pid 一致 → `providers = vscode:ready`；把发现文件 pid 改为 30929 → `provider=vscode state=down detail=发现文件 pid=30929 与桥实际 pid=30928 不一致，判定为残留文件`。
 - 真实 `vscode.lm` 桥（2026-11-08）：VS Code Stable 1.145.2，`chat.defaultModel=deepseek-flash`，扩展按 **id → family → name** 选中 `DeepSeek V4.1 Flash`（`id=deepseek-flash`、`family=deepseek`、`vendor=deepseek`），未发生静默回退；`lm-bridge.json` 含 `pid=50432`、`port=49210`、`model=DeepSeek V4.1 Flash`、`modelId/modelFamily/modelVendor`，`/health` 返回 `{"ok":true,"pid":50432,"model":"DeepSeek V4.1 Flash"}` 与发现文件一致，pid 存活校验通过，重启守护进程后 `scheduler_status.providers` 中 `vscode` 为 `ready`。
 - 真实 `vscode.lm` 回合（REAL-005，2026-11-08）：provider `vscode`，耗时 `2.95s`，工具调用 2 次（3 轮：2 次工具调用 + 1 次最终回答，轮次由工具序列推导，扩展未单独上报轮数），改动 1 个文件（新增 `out/summary-lm.md`），结果为 `awaiting_review`，通知与 ack 闭环走通（`{"acknowledged":1}`，unread 4→3）。该通道**取不到 usage**：扩展运行时探测 `LanguageModelChatResponse.usage` 为 `undefined`，attempt 三列为 `NULL`、`usage_estimated=0`，`queue_get`/`result_list` 查询返回 `null`，未做任何估算。
 - 插件包在 Copilot Chat 真机安装（2026-11-08）：命令面板 `Chat: Install Plugin from Source` 选择仓库内 `plugin` 目录，安装落盘 `%USERPROFILE%\.copilot\installed-plugins\_direct\plugin\`（含 `plugin.json`、`mcp.json`、`skills/devhub-scheduler/`）；Customizations 面板显示 `MCP Servers` 中 `devhubd` 为 Running、`Skills` 中 `devhub-scheduler` 为 Loaded。首次输入 `userdrive-devhub` 被拒（`Invalid plugin spec. Use: plugin-name@marketplace-name, owner/repo, or a URL`），改为完整目录路径后安装成功。
-- Chat 内真实模型调用（2026-11-08，DeepSeek V4.1 Flash 三轮）：① `Read skill [devhub-scheduler]` → `scheduler_status{verbose:true}` → `result_list{unreadOnly:true,limit:10}`，10s、输入 185,943 / 输出 1,171 tokens，正确报出 `openai:ready`、`vscode:ready`、`host.pid`、`mcp={bound:true,port:3091}`；② `queue_list{status:"all",limit:100}` → `queue_get{queueItemId:"7405161e…"}` → `result_list{limit:20}`，19s、304,672 / 2,131 tokens，查得 REAL-005（provider `vscode`、耗时 2.95s、`usageEstimated=false`），但当时 `toolCalls` 字段缺失；③ `dispatch_now{taskId:"NOT-EXIST",dryRun:true}` 返回结构化 `UNKNOWN_TASK`（含 `next`），模型按提示核对 `workspaces.json` 后改用 `REAL-005` 重试成功，19s、330,397 / 2,037 tokens。
+- Chat 内真实模型调用（2026-11-08，DeepSeek V4.1 Flash 三轮）：① `Read skill [devhub-scheduler]` → `scheduler_status{verbose:true}`（当时版本仍有该参数，现已在 B2 删除） → `result_list{unreadOnly:true,limit:10}`，10s、输入 185,943 / 输出 1,171 tokens，正确报出 `openai:ready`、`vscode:ready`、`host.pid`、`mcp={bound:true,port:3091}`；② `queue_list{status:"all",limit:100}` → `queue_get{queueItemId:"7405161e…"}` → `result_list{limit:20}`，19s、304,672 / 2,131 tokens，查得 REAL-005（provider `vscode`、耗时 2.95s、`usageEstimated=false`），但当时 `toolCalls` 字段缺失；③ `dispatch_now{taskId:"NOT-EXIST",dryRun:true}` 返回结构化 `UNKNOWN_TASK`（含 `next`），模型按提示核对 `workspaces.json` 后改用 `REAL-005` 重试成功，19s、330,397 / 2,037 tokens。
 - Chat 内修复回归（2026-11-08，同一会话）：`queue_get` 的 `attempts[0].toolCalls=2`；`result_list` 五条结果均返回 `toolCalls`（REAL-005=2、REAL-004=3、REAL-003=2、REAL-002=2、REAL-001=2）；`dispatch_now{taskId:"REAL-005",workspaceId:"devhub-real-turn",dryRun:true}` 由修复前 `"provider":"openai"` 变为 `"provider":"vscode"`（复用的是已存在的 vscode 队列项）。耗时 9s，输入 178,047 / 输出 1,159 tokens。
 
 ### 6.2 仅单测覆盖

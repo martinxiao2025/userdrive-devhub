@@ -1,3 +1,4 @@
+using DevHubd.Core.Models;
 using DevHubd.Core.Queue;
 using DevHubd.Mcp.Abstractions;
 using DevHubd.Mcp.Contracts;
@@ -77,7 +78,7 @@ public sealed class QueueQuerySource : IQueueQuerySource
                 item.Title,
                 item.Status,
                 item.Priority,
-                item.SeenAt))
+                UtcTime.Normalize(item.SeenAt)!))
             .ToArray();
     }
 
@@ -92,10 +93,10 @@ public sealed class QueueQuerySource : IQueueQuerySource
         item.Attempt,
         item.MaxAttempts,
         item.LeaseOwner,
-        item.LeaseExpiresAt,
+        UtcTime.Normalize(item.LeaseExpiresAt),
         item.LastErrorCode,
-        item.CreatedAt,
-        item.UpdatedAt);
+        UtcTime.NormalizeRequired(item.CreatedAt),
+        UtcTime.NormalizeRequired(item.UpdatedAt));
 
     /// <summary>执行尝试投影映射。</summary>
     /// <param name="attempt">Core 投影。</param>
@@ -103,8 +104,8 @@ public sealed class QueueQuerySource : IQueueQuerySource
         attempt.AttemptNo,
         attempt.Provider,
         attempt.Model,
-        attempt.StartedAt,
-        attempt.EndedAt,
+        UtcTime.NormalizeRequired(attempt.StartedAt),
+        UtcTime.Normalize(attempt.EndedAt),
         attempt.Outcome,
         attempt.ErrorCode,
         attempt.ToolCalls,
@@ -113,5 +114,7 @@ public sealed class QueueQuerySource : IQueueQuerySource
         attempt.InputTokens is null && attempt.OutputTokens is null
             ? null
             : (attempt.InputTokens ?? 0) + (attempt.OutputTokens ?? 0),
-        attempt.UsageEstimated);
+        attempt.UsageEstimated,
+        attempt.UsageAvailable,
+        attempt.RoundsExhausted);
 }

@@ -35,12 +35,12 @@ public sealed class SchedulerControlTool
     /// <param name="provider">reset_breaker 的目标 provider。</param>
     /// <param name="cancellationToken">取消令牌。</param>
     [McpServerTool(Name = "scheduler_control", ReadOnly = false, Idempotent = true, OpenWorld = false)]
-    [Description("控制调度器：start/pause/resume/scan_now/set_mode/reset_breaker/probe_models/status。动作会写入审计日志。")]
+    [Description("控制调度器：" + ToolVocabulary.SchedulerActions + "。动作会写入审计日志。")]
     public async Task<CallToolResult> ControlAsync(
-        [Description("动作：start / pause / resume / scan_now / set_mode / reset_breaker / probe_models / status。")]
+        [Description("动作：" + ToolVocabulary.SchedulerActions + "。")]
         string action,
         [Description("可选：操作原因，写入审计记录。")] string? reason = null,
-        [Description("set_mode 的目标档位：auto 或 dispatch_only。")] string? mode = null,
+        [Description("set_mode 的目标档位：" + ToolVocabulary.DeliveryModes + "。")] string? mode = null,
         [Description("reset_breaker 的目标 provider：openai 或 vscode。")] string? provider = null,
         CancellationToken cancellationToken = default)
     {
@@ -61,7 +61,7 @@ public sealed class SchedulerControlTool
                 _ => throw new SchedulerControlException(
                     "INVALID_ACTION",
                     $"未知动作：{action}",
-                    "使用 start/pause/resume/scan_now/set_mode/reset_breaker/probe_models/status 之一。",
+                    "使用 " + ToolVocabulary.SchedulerActions + " 之一。",
                     retryable: true),
             };
 

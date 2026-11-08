@@ -179,8 +179,9 @@ async function main() {
   console.log(`resources/list OK：${uris.join(', ')}`);
 
   const statusTool = tools.tools.find((tool) => tool.name === 'scheduler_status');
-  const verbose = statusTool?.inputSchema?.properties?.verbose;
-  if (!verbose || verbose.type !== 'boolean') throw new Error('scheduler_status.inputSchema 缺少 boolean verbose');
+  if (statusTool?.inputSchema?.properties?.verbose) {
+    throw new Error('scheduler_status 不应再有 verbose 参数（B2 已删除）');
+  }
 
   const call = await request('tools/call', { name: 'scheduler_status', arguments: {} });
   const text = assertToolResult(call, 'scheduler_status');
@@ -193,6 +194,9 @@ async function main() {
   if (snapshot.mode !== 'dispatch_only') throw new Error(`默认档位应为 dispatch_only，实际：${snapshot.mode}`);
   if (!Array.isArray(snapshot.providers) || snapshot.providers.length !== 2) {
     throw new Error(`providers 应包含 openai 与 vscode 两项，实际：${JSON.stringify(snapshot.providers)}`);
+  }
+  if (snapshot.host?.startedAt && !snapshot.host.startedAt.endsWith('Z')) {
+    throw new Error(`时间字段必须统一 UTC + Z，实际：${snapshot.host.startedAt}`);
   }
 
   console.log(`tools/call OK：mode=${snapshot.mode} phase=${snapshot.phase} mcp.port=${snapshot.mcp.port} schema=v${snapshot.host?.schemaVersion}`);

@@ -5,10 +5,17 @@ namespace DevHubd.Core.Providers;
 /// <summary>
 /// 用量完整性跟踪：位于 <c>FunctionInvokingChatClient</c> 内侧，逐轮观察响应是否带真实 usage。
 /// 只要任意一轮缺失，整回合的累加值就不可信，由执行器把用量置为 null（不改写框架的累加逻辑）。
+/// <para>
+/// 同时观察“轮次耗尽”信号：框架在达到 <c>MaximumIterationsPerRequest</c> 时会移除工具再调用最后一轮，
+/// 因此一旦前面带过工具、后续某轮请求的 <see cref="ChatOptions.Tools"/> 为空，就说明预算已耗尽。
+/// 这里只做观察，不干预框架的返回路径。
+/// </para>
 /// </summary>
 internal sealed class UsageTrackingChatClient : DelegatingChatClient
 {
     private int _missingRounds;
+    private int _sawTools;
+    private int _roundsExhausted;
 
     /// <summary>包装底层客户端。</summary>
     /// <param name="innerClient">底层客户端。</param>
@@ -20,12 +27,24 @@ internal sealed class UsageTrackingChatClient : DelegatingChatClient
     /// <summary>是否每一轮都返回了可用 usage。</summary>
     public bool AllRoundsReportedUsage => Volatile.Read(ref _missingRounds) == 0;
 
+    /// <summary>是否耗尽了工具轮次预算（框架已移除工具并产出兜底答复）。</summary>
+    public bool RoundsExhausted => Volatile.Read(ref _roundsExhausted) == 1;
+
     /// <inheritdoc />
     public override async Task<ChatResponse> GetResponseAsync(
         IEnumerable<ChatMessage> messages,
         ChatOptions? options = null,
         CancellationToken cancellationToken = default)
     {
+        if (options?.Tools is { Count: > 0 })
+        {
+            Interlocked.Exchange(ref _sawTools, 1);
+        }
+        else if (Volatile.Read(ref _sawTools) == 1)
+        {
+            Interlocked.Exchange(ref _roundsExhausted, 1);
+        }
+
         var response = await base
             .GetResponseAsync(messages, options, cancellationToken)
             .ConfigureAwait(false);

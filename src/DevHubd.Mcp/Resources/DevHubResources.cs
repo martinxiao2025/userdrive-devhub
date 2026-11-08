@@ -50,7 +50,7 @@ public sealed class DevHubResources
     [Description("调度器、队列、provider 与宿主进程的完整状态快照。")]
     public async Task<string> SchedulerStatusAsync(CancellationToken cancellationToken = default) =>
         await SafeAsync(async () => JsonSerializer.Serialize(
-            await _status.GetSnapshotAsync(false, cancellationToken).ConfigureAwait(false), _json)).ConfigureAwait(false);
+            await _status.GetSnapshotAsync(cancellationToken).ConfigureAwait(false), _json)).ConfigureAwait(false);
 
     /// <summary>待派发与执行中的队列项（最多 100 条）。</summary>
     /// <param name="cancellationToken">取消令牌。</param>

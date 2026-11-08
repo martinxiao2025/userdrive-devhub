@@ -1,3 +1,4 @@
+using DevHubd.Core.Models;
 using DevHubd.Core.Results;
 using DevHubd.Mcp.Abstractions;
 using DevHubd.Mcp.Contracts;
@@ -67,13 +68,15 @@ public sealed class ResultQuerySource : IResultQuerySource
         record.Outcome,
         record.Summary,
         record.Artifacts,
-        record.CreatedAt,
-        record.ReadAt,
+        UtcTime.NormalizeRequired(record.CreatedAt),
+        UtcTime.Normalize(record.ReadAt),
         record.ToolCalls,
         record.InputTokens,
         record.OutputTokens,
         record.InputTokens is null && record.OutputTokens is null
             ? null
             : (record.InputTokens ?? 0) + (record.OutputTokens ?? 0),
-        record.UsageEstimated);
+        record.UsageEstimated,
+        record.UsageAvailable,
+        record.RoundsExhausted);
 }

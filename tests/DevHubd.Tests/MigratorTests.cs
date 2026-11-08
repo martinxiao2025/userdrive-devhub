@@ -134,7 +134,19 @@ public sealed class MigratorTests : IDisposable
         Assert.True(await HasColumnAsync(factory, "attempt", "usage_estimated", ct));
     }
 
-    /// <summary>已有 V1 库升级时必须只补 V2，不重建表，并保持 user_version 递增。</summary>
+    /// <summary>V3 必须给 attempt 增加 usage_available 与 rounds_exhausted，旧行默认 0。</summary>
+    [Fact]
+    public async Task Migrate_AddsUsageAvailableAndRoundsExhaustedColumnsAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var factory = new SqliteConnectionFactory(Path.Combine(_directory, "devhub.db"));
+        await Migrator.MigrateAsync(factory, ct);
+
+        Assert.True(await HasColumnAsync(factory, "attempt", "usage_available", ct));
+        Assert.True(await HasColumnAsync(factory, "attempt", "rounds_exhausted", ct));
+    }
+
+    /// <summary>已有 V1 库升级时必须逐级补 V2/V3，不重建表，并保持 user_version 递增。</summary>
     [Fact]
     public async Task Migrate_FromV1_UpgradesToLatestAsync()
     {
@@ -155,6 +167,8 @@ public sealed class MigratorTests : IDisposable
 
         Assert.Equal(Migrator.CurrentVersion, version);
         Assert.True(await HasColumnAsync(factory, "attempt", "usage_estimated", ct));
+        Assert.True(await HasColumnAsync(factory, "attempt", "usage_available", ct));
+        Assert.True(await HasColumnAsync(factory, "attempt", "rounds_exhausted", ct));
     }
 
     /// <summary>判断指定表是否已有某列。</summary>

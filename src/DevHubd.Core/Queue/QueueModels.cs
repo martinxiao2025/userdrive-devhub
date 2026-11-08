@@ -34,6 +34,8 @@ public sealed record AttemptRecord(
     int? InputTokens,
     int? OutputTokens,
     bool UsageEstimated,
+    bool UsageAvailable,
+    bool RoundsExhausted,
     int? FilesChanged,
     string? Summary);
 

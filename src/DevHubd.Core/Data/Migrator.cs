@@ -13,8 +13,8 @@ namespace DevHubd.Core.Data;
 /// </summary>
 public static class Migrator
 {
-    /// <summary>当前 schema 版本。V1 = 9 张表；V2 = attempt.usage_estimated。</summary>
-    public const int CurrentVersion = 2;
+    /// <summary>当前 schema 版本。V1 = 9 张表；V2 = attempt.usage_estimated；V3 = attempt.usage_available / rounds_exhausted。</summary>
+    public const int CurrentVersion = 3;
 
     /// <summary>V1 的全部 DDL 与初始数据。</summary>
     private const string SchemaV1 = """
@@ -157,6 +157,22 @@ public static class Migrator
         ALTER TABLE attempt ADD COLUMN usage_estimated INTEGER NOT NULL DEFAULT 0;
         """;
 
+    /// <summary>
+    /// V3：attempt 增加 <c>usage_available</c> 与 <c>rounds_exhausted</c>。
+    /// <para>
+    /// <c>usage_available</c>：1 表示 provider 明确返回了用量；0 表示用量不可得（token 列为 NULL）。
+    /// 旧行默认 0，与“token 为 NULL”一致。
+    /// </para>
+    /// <para>
+    /// <c>rounds_exhausted</c>：1 表示回合耗尽工具轮次预算，最终文本是框架移除工具后的兜底答复，
+    /// 与“模型自然完成”不是同一语义。旧行默认 0。
+    /// </para>
+    /// </summary>
+    private const string SchemaV3 = """
+        ALTER TABLE attempt ADD COLUMN usage_available INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE attempt ADD COLUMN rounds_exhausted INTEGER NOT NULL DEFAULT 0;
+        """;
+
     /// <summary>P0 期望存在的 9 张表（用于启动自检与测试断言）。</summary>
     public static readonly IReadOnlyList<string> ExpectedTables = new[]
     {
@@ -200,6 +216,12 @@ public static class Migrator
         {
             await ExecuteScriptAsync(connection, transaction, SchemaV2, cancellationToken).ConfigureAwait(false);
             version = 2;
+        }
+
+        if (version < 3)
+        {
+            await ExecuteScriptAsync(connection, transaction, SchemaV3, cancellationToken).ConfigureAwait(false);
+            version = 3;
         }
 
         using (var stamp = connection.CreateCommand())

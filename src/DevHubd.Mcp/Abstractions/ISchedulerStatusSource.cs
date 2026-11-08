@@ -11,7 +11,6 @@ public interface ISchedulerStatusSource
     /// <summary>
     /// 读取当前调度器状态快照。
     /// </summary>
-    /// <param name="verbose">是否要求更详细的信息（P0 暂不影响返回内容）。</param>
     /// <param name="cancellationToken">取消令牌。</param>
-    Task<SchedulerStatusSnapshot> GetSnapshotAsync(bool verbose, CancellationToken cancellationToken = default);
+    Task<SchedulerStatusSnapshot> GetSnapshotAsync(CancellationToken cancellationToken = default);
 }
