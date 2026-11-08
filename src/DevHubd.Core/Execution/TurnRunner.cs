@@ -188,13 +188,19 @@ public sealed class TurnRunner
         if (result.State == TurnState.Done)
         {
             _logger.LogInformation(
-                "模型回合结束：queueItemId={QueueItemId} attempt={Attempt} turnId={TurnId} provider={Provider} toolCalls={ToolCalls} filesChanged={FilesChanged}",
+                "模型回合结束：queueItemId={QueueItemId} attempt={Attempt} turnId={TurnId} provider={Provider} toolCalls={ToolCalls} filesChanged={FilesChanged} " +
+                "promptTokens={PromptTokens} completionTokens={CompletionTokens} totalTokens={TotalTokens} usageEstimated={UsageEstimated} usageMissing={UsageMissing}",
                 item.Id,
                 item.Attempt,
                 turnId,
                 provider,
                 result.ToolCalls,
-                artifacts.Count);
+                artifacts.Count,
+                result.Usage?.InputTokens ?? 0,
+                result.Usage?.OutputTokens ?? 0,
+                result.Usage is null ? 0 : result.Usage.InputTokens + result.Usage.OutputTokens,
+                result.Usage?.Estimated ?? false,
+                result.Usage is null);
         }
         else
         {

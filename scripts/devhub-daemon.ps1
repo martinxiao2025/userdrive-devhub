@@ -164,6 +164,11 @@ function Start-DaemonProcess {
         $startParameters.ArgumentList = $arguments
     }
 
+    # 注意：Start-Process 启动的子进程会继承当前终端的 Windows 作业对象（Job Object）。
+    # 如果本脚本运行在会被回收的宿主里（IDE 集成终端 / CI 临时作业 / Agent shell），
+    # 终端一关就会把 devhubd 连带杀掉（队列项表现为 LEASE_EXPIRED，日志无正常关闭记录）。
+    # 需要长期驻留时，请先用 Invoke-CimMethod -ClassName Win32_Process -MethodName Create
+    # 起一个脱离作业对象的 wrapper，再由 wrapper 调用本函数；详见 README §3.4。
     $process = Start-Process @startParameters
 
     return [pscustomobject]@{ Process = $process; StdOut = $stdout; StdErr = $stderr }

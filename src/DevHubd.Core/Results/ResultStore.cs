@@ -14,6 +14,9 @@ namespace DevHubd.Core.Results;
 /// <param name="Artifacts">产物相对路径。</param>
 /// <param name="CreatedAt">创建时间。</param>
 /// <param name="ReadAt">已读时间；null 表示未读。</param>
+/// <param name="InputTokens">最近一次 attempt 的输入 token；未获得 usage 时为 null。</param>
+/// <param name="OutputTokens">最近一次 attempt 的输出 token；未获得 usage 时为 null。</param>
+/// <param name="UsageEstimated">true 表示 token 为估算值，不是 provider 返回的真实 token。</param>
 public sealed record ResultRecord(
     string Id,
     string TaskId,
@@ -23,7 +26,10 @@ public sealed record ResultRecord(
     string Summary,
     IReadOnlyList<string> Artifacts,
     string CreatedAt,
-    string? ReadAt);
+    string? ReadAt,
+    int? InputTokens,
+    int? OutputTokens,
+    bool UsageEstimated);
 
 /// <summary>结果分页。</summary>
 /// <param name="Items">当前页。</param>
@@ -74,26 +80,30 @@ public sealed class ResultStore
         using var command = connection.CreateCommand();
 
         var sql = new System.Text.StringBuilder("""
-            SELECT id, task_id, queue_item_id, provider, outcome, summary, artifacts, created_at, read_at
-            FROM result
+            SELECT r.id, r.task_id, r.queue_item_id, r.provider, r.outcome, r.summary, r.artifacts, r.created_at, r.read_at,
+                   a.input_tokens, a.output_tokens, a.usage_estimated
+            FROM result r
+            LEFT JOIN attempt a ON a.id = (
+                SELECT id FROM attempt WHERE queue_item_id = r.queue_item_id ORDER BY attempt_no DESC LIMIT 1
+            )
             WHERE 1 = 1
             """);
 
         if (unreadOnly)
         {
-            sql.Append(" AND read_at IS NULL");
+            sql.Append(" AND r.read_at IS NULL");
         }
 
         if (TryDecodeCursor(cursor, out var cursorCreatedAt, out var cursorId))
         {
             sql.Append("""
-                 AND (created_at < $cc OR (created_at = $cc AND id < $ci))
+                 AND (r.created_at < $cc OR (r.created_at = $cc AND r.id < $ci))
                 """);
             command.Parameters.AddWithValue("$cc", cursorCreatedAt);
             command.Parameters.AddWithValue("$ci", cursorId);
         }
 
-        sql.Append(" ORDER BY created_at DESC, id DESC LIMIT $limit;");
+        sql.Append(" ORDER BY r.created_at DESC, r.id DESC LIMIT $limit;");
         command.CommandText = sql.ToString();
         command.Parameters.AddWithValue("$limit", limit);
 
@@ -198,7 +208,10 @@ public sealed class ResultStore
             reader.GetString(5),
             artifacts,
             reader.GetString(7),
-            reader.IsDBNull(8) ? null : reader.GetString(8));
+            reader.IsDBNull(8) ? null : reader.GetString(8),
+            reader.IsDBNull(9) ? null : reader.GetInt32(9),
+            reader.IsDBNull(10) ? null : reader.GetInt32(10),
+            !reader.IsDBNull(11) && reader.GetInt32(11) == 1);
     }
 
     /// <summary>生成下一页游标（base64url 编码的 createdAt/id）。</summary>

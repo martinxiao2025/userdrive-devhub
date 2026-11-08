@@ -294,6 +294,7 @@ public sealed class ExecutionCoordinator
                     result.ToolCalls,
                     result.Usage?.InputTokens,
                     result.Usage?.OutputTokens,
+                    result.Usage?.Estimated ?? false,
                     result.FilesChanged.Count,
                     Truncate(result.Text)),
                 now,
@@ -371,6 +372,7 @@ public sealed class ExecutionCoordinator
                 result.ToolCalls,
                 result.Usage?.InputTokens,
                 result.Usage?.OutputTokens,
+                result.Usage?.Estimated ?? false,
                 result.FilesChanged.Count,
                 Truncate(error.Message)),
             now,
@@ -550,7 +552,7 @@ public sealed class ExecutionCoordinator
 
         await _store.CompleteAttemptAsync(
             claimed.AttemptId,
-            new AttemptCompletion("failed", null, ModelErrorKinds.ModelError, code, 0, null, null, 0, message),
+            new AttemptCompletion("failed", null, ModelErrorKinds.ModelError, code, 0, null, null, false, 0, message),
             now,
             cancellationToken).ConfigureAwait(false);
 
@@ -576,6 +578,7 @@ public sealed class ExecutionCoordinator
                 0,
                 null,
                 null,
+                false,
                 0,
                 message),
             now,
@@ -603,6 +606,7 @@ public sealed class ExecutionCoordinator
                 0,
                 null,
                 null,
+                false,
                 0,
                 message),
             now,

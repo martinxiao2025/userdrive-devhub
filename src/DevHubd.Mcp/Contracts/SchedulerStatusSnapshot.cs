@@ -44,6 +44,9 @@ public sealed record SchedulerStatusSnapshot
 
     /// <summary>未读结果与失败数。</summary>
     public UnreadCounters Unread { get; init; } = new();
+
+    /// <summary>全部 attempt 的 token 用量汇总（provider 未返回 usage 的不计入）。</summary>
+    public TokenCounters Tokens { get; init; } = new();
 }
 
 /// <summary>累计计数器（§11.1）。</summary>
@@ -103,4 +106,29 @@ public sealed record UnreadCounters
 {
     public int Results { get; init; }
     public int Failures { get; init; }
+}
+
+/// <summary>
+/// token 用量汇总。<see cref="EstimatedAttempts"/> 不为 0 时，对应的 token 是按字符数估算的近似值，
+/// <b>不是 provider 返回的真实 token</b>。
+/// </summary>
+public sealed record TokenCounters
+{
+    /// <summary>输入 token 累计。</summary>
+    public int PromptTokens { get; init; }
+
+    /// <summary>输出 token 累计。</summary>
+    public int CompletionTokens { get; init; }
+
+    /// <summary>总 token 累计（输入 + 输出）。</summary>
+    public int TotalTokens { get; init; }
+
+    /// <summary>有 usage 的 attempt 数。</summary>
+    public int AttemptsWithUsage { get; init; }
+
+    /// <summary>provider 未返回 usage 的 attempt 数。</summary>
+    public int AttemptsWithoutUsage { get; init; }
+
+    /// <summary>用量为估算值的 attempt 数。</summary>
+    public int EstimatedAttempts { get; init; }
 }

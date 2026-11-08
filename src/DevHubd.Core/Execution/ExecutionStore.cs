@@ -10,8 +10,9 @@ namespace DevHubd.Core.Execution;
 /// <param name="ErrorKind">错误分类。</param>
 /// <param name="ErrorCode">错误码。</param>
 /// <param name="ToolCalls">工具调用次数。</param>
-/// <param name="InputTokens">输入 token。</param>
-/// <param name="OutputTokens">输出 token。</param>
+/// <param name="InputTokens">输入 token；provider 未返回时为 null。</param>
+/// <param name="OutputTokens">输出 token；provider 未返回时为 null。</param>
+/// <param name="UsageEstimated">true 表示 token 是按字符数估算的近似值，不是 provider 返回的真实 token。</param>
 /// <param name="FilesChanged">改动文件数。</param>
 /// <param name="Summary">摘要。</param>
 public sealed record AttemptCompletion(
@@ -22,6 +23,7 @@ public sealed record AttemptCompletion(
     int ToolCalls,
     int? InputTokens,
     int? OutputTokens,
+    bool UsageEstimated,
     int FilesChanged,
     string Summary);
 
@@ -95,6 +97,7 @@ public sealed class ExecutionStore
                 tool_calls = $toolCalls,
                 input_tokens = $inputTokens,
                 output_tokens = $outputTokens,
+                usage_estimated = $usageEstimated,
                 files_changed = $filesChanged,
                 summary = $summary
             WHERE id = $id;
@@ -107,6 +110,7 @@ public sealed class ExecutionStore
         command.Parameters.AddWithValue("$toolCalls", completion.ToolCalls);
         command.Parameters.AddWithValue("$inputTokens", (object?)completion.InputTokens ?? DBNull.Value);
         command.Parameters.AddWithValue("$outputTokens", (object?)completion.OutputTokens ?? DBNull.Value);
+        command.Parameters.AddWithValue("$usageEstimated", completion.UsageEstimated ? 1 : 0);
         command.Parameters.AddWithValue("$filesChanged", completion.FilesChanged);
         command.Parameters.AddWithValue("$summary", completion.Summary);
         command.Parameters.AddWithValue("$id", attemptId);

@@ -6,6 +6,7 @@ using DevHubd.Core.Execution;
 using DevHubd.Core.Models;
 using DevHubd.Core.Providers;
 using DevHubd.Core.Queue;
+using DevHubd.Core.Results;
 using DevHubd.Core.Scheduling;
 using DevHubd.Core.Tasks;
 using DevHubd.Core.Workspaces;
@@ -92,6 +93,25 @@ public sealed class P2ExecutionTests : IDisposable
         Assert.Equal("succeeded", await ScalarStringAsync("SELECT outcome FROM attempt;", ct));
 
         var queueItemId = await ScalarStringAsync("SELECT id FROM queue_item;", ct);
+
+        // usage 必须落在 attempt 上并可按队列项读回（真实值，非估算）。
+        Assert.Equal(10L, await ScalarLongAsync("SELECT input_tokens FROM attempt;", ct));
+        Assert.Equal(5L, await ScalarLongAsync("SELECT output_tokens FROM attempt;", ct));
+        Assert.Equal(0L, await ScalarLongAsync("SELECT usage_estimated FROM attempt;", ct));
+
+        var detail = await _queue.GetAsync(queueItemId!, ct);
+        var attempt = Assert.Single(detail!.Attempts);
+        Assert.Equal(10, attempt.InputTokens);
+        Assert.Equal(5, attempt.OutputTokens);
+        Assert.False(attempt.UsageEstimated);
+
+        // result_list 读侧同样要带上同一份用量。
+        var results = await new ResultStore(_factory).ListAsync(false, 10, null, ct);
+        var listed = Assert.Single(results.Items);
+        Assert.Equal(10, listed.InputTokens);
+        Assert.Equal(5, listed.OutputTokens);
+        Assert.False(listed.UsageEstimated);
+
         var turnStart = turnLogger.Collector.GetSnapshot()
             .Single(record => record.Message.Contains("模型回合开始", StringComparison.Ordinal));
         Assert.Contains(queueItemId!, turnStart.Message, StringComparison.Ordinal);

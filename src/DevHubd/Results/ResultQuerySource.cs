@@ -68,5 +68,11 @@ public sealed class ResultQuerySource : IResultQuerySource
         record.Summary,
         record.Artifacts,
         record.CreatedAt,
-        record.ReadAt);
+        record.ReadAt,
+        record.InputTokens,
+        record.OutputTokens,
+        record.InputTokens is null && record.OutputTokens is null
+            ? null
+            : (record.InputTokens ?? 0) + (record.OutputTokens ?? 0),
+        record.UsageEstimated);
 }

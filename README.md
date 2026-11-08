@@ -185,6 +185,24 @@ node scripts/smoke-mcp.mjs
 
 机器解析场景把 `Logging:Console:FormatterName` 设为 `json`（可用环境变量 `Logging__Console__FormatterName=json`）。敏感字段（API key、令牌）不入日志。
 
+### 2.6 token 用量与成本监控
+
+每次真实回合的用量落在 `attempt` 表（`input_tokens` / `output_tokens` / `usage_estimated`），只记录 provider 响应体里 `usage` 的原值，不做换算。
+
+| 场景 | 落库结果 |
+|---|---|
+| provider 每轮都返回 `usage` | `input_tokens` = 各轮 `prompt_tokens` 之和，`output_tokens` = 各轮 `completion_tokens` 之和，`usage_estimated=0` |
+| 任意一轮缺少 `usage` | 整回合记 `NULL`（部分轮次之和不能代表真实总量），查询返回 `promptTokens/completionTokens/totalTokens = null` |
+| 完全没有 `usage` | 同上记 `NULL`，不估算成真实值 |
+
+- **多轮累加**：工具调用循环会产生多次请求，每轮响应各带一份 `usage`，落库的是整回合累加值，不是最后一轮。
+- **估算标记**：`usage_estimated=1` 表示该数值是近似估算、**不是真实 token**；当前 BYOK 非流式路径只写入 provider 原值（恒为 `0`）。若后续接入不返回 `usage` 的通道，必须显式置 `1` 并在字段说明中标注，不能混入真实值统计。
+- **查看方式**：
+  - `queue_get` → `attempts[]` 的 `promptTokens` / `completionTokens` / `totalTokens` / `usageEstimated`。
+  - `result_list` → 每条结果的 `promptTokens` / `completionTokens` / `totalTokens` / `usageEstimated`（取该队列项最近一次 attempt）。
+  - `scheduler_status` → `tokens` 的累计值（含 `attemptsWithUsage`、`attemptsWithoutUsage`、`estimatedAttempts`，缺失用量单独计数而不是当 0 计入总量）。
+  - 日志：`模型回合完成` / `模型回合结束` 两条记录带 `promptTokens`、`completionTokens`、`totalTokens`、`usageMissing`（或 `usageEstimated`）字段，可与落库值对账。
+
 ---
 
 ## 3. 运维
@@ -223,6 +241,14 @@ node scripts/smoke-mcp.mjs
 | 冷启动到 `/health` 就绪 | 约 864 ms |
 | 压缩版（`EnableCompressionInSingleFile=true`） | 50.0 MiB，冷启动约 1355 ms |
 
+### 3.4 后台启动与终端作业对象（重要）
+
+`scripts/devhub-daemon.ps1 -Action start` 用 `Start-Process` 启动守护进程。若这段脚本是在**会被终端回收的宿主**里执行（例如 IDE 的集成终端、CI 的临时作业、Agent 的 shell 工具），子进程会继承该终端所在的 Windows 作业对象（Job Object）；终端一关或作业被终止，`devhubd` 会被**连带杀掉**，表现为队列项 attempt 报 `LEASE_EXPIRED`、日志里没有任何关闭记录。
+
+- 需要长期驻留时，**不要**在可被回收的终端里直接 `start`。改用 `Invoke-CimMethod -ClassName Win32_Process -MethodName Create` 起一个脱离作业对象的 wrapper，由 wrapper 再 `Start-Process`；环境变量在 wrapper 运行时从用户级读取（`[Environment]::GetEnvironmentVariable(name, 'User')`），不要把 key 写进脚本文件。
+- 判断是否被连带回收：看 `runtime.json` 的 `pid` 是否还存在、`/health` 是否可达；进程消失但日志没有正常关闭记录，基本就是作业对象回收。
+- 已有实例时 `-Action start` 会以退出码 2 拒绝启动，先 `-Action stop` 再启动。
+
 ---
 
 ## 4. 已知限制
@@ -230,7 +256,7 @@ node scripts/smoke-mcp.mjs
 1. **机器级单实例**：同一台机器同时只允许一个宿主；多工作区由 `workspaces.json` 承载，不是多进程。
 2. **MCP 端点无静态令牌**：Agent Plugins 规范不作用 `url`/`headers` 占位符，只能依赖"仅回环 + Host/Origin 校验"。
 3. **扩展需单独安装**：插件规范无法下发 VS Code 扩展，`vscode.lm` 桥与通知依赖 `devhub-bridge` VSIX。
-4. **真实模型调用未验证**：本机未填入真实 key，真实 OpenAI 兼容端点回合未实测；配置步骤见 §2.4。占位值（如 `CHANGE_ME`）不会被当成可用凭据：启动探测会显示 `openai:auth` 并提示“仍是占位值”，替换为真实 key 后才会转 `ready`。即便显示 `ready`，也应以一次真实回合的结果为准，不用假 provider 冒充通过。
+4. **真实模型调用**：已用真实 BYOK 跑通（见 §6.1）。占位值（如 `CHANGE_ME`）不会被当成可用凭据：启动探测会显示 `openai:auth` 并提示“仍是占位值”，替换为真实 key 后才会转 `ready`。即便显示 `ready`，也应以一次真实回合的结果为准，不用假 provider 冒充通过。
 5. **`vscode` provider 依赖窗口与模型**：未激活扩展、或 `vscode.lm` 没有可用模型（例如未登录 GitHub Copilot）时 `vscode:down`，不会写出 `lm-bridge.json`；定时任务默认走 `openai`，不依赖窗口（可用 `Execution:ScheduledProvider` 改为 `vscode`，但那样同样受上述条件约束）。
 6. **未启用裁剪**：`PublishTrimmed` 与反射/序列化路径冲突，当前只评估不启用；R2R 会增大体积，未采用。
 7. **无 Web 面板**：本期只提供 MCP 工具面、技能与 VS Code 原生通知。
@@ -258,8 +284,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -A
 
 ### 6.1 已真实验证
 
-- `dotnet build DevHubd.sln`：0 警告 0 错误；`dotnet test`：92/92 通过（xUnit v3 + Microsoft.Testing.Platform，0 跳过）。
-- `node scripts/validate-plugin.mjs`（4 项 PASS）、`node scripts/check-encoding.mjs`（126 个文件）、`node scripts/smoke-mcp.mjs`（真实握手 + `tools/list` + `tools/call` + `resources/read`）全部通过。
+- `dotnet build DevHubd.sln`：0 警告 0 错误；`dotnet test`：104/104 通过（xUnit v3 + Microsoft.Testing.Platform，0 跳过）。
+- `node scripts/validate-plugin.mjs`（4 项 PASS）、`node scripts/check-encoding.mjs`（128 个文件）、`node scripts/smoke-mcp.mjs`（真实握手 + `tools/list` + `tools/call` + `resources/read`）全部通过。
+- 真实 BYOK 回合（2026-11-08）：provider `openai`，端点 `https://api.deepseek.com`，模型 `deepseek-flash`；任务 REAL-001 / REAL-002 / REAL-003 均产出 `awaiting_review` 结果，工作区只改 `out/` 下目标文件。
+- schema 升级：已有 V1 库启动后 `user_version` 由 1 升到 2（新增 `attempt.usage_estimated`），`scheduler_status.host.schemaVersion=2`。
+- usage 落库核对（REAL-003，新真实回合）：provider 3 轮累计 `prompt_tokens=3087`、`completion_tokens=360`、`total=3447`，`usageMissing=False`；直接读 SQLite 得 `input_tokens=3087, output_tokens=360, usage_estimated=0`；`queue_get`、`result_list`、`scheduler_status.tokens` 三处读回一致，未做任何估算。
 - 按 §1.1 命令自包含发布：产物 103.7 MiB，`-Action start/status/stop` 与 MCP 冒烟连续走通（`startupMs=1966`，停止后 `runtime.json` 被移除、`status` 返回 3）。
 - 退出码真机复跑：已有实例运行再启动 → 2；先占用 3091 再启动 → 3。
 - VSIX 安装到 VS Code Stable：`code --install-extension` 成功，扩展宿主日志出现 `_doActivateExtension userdrive.devhub-bridge, activationEvent: 'onStartupFinished'`，无报错。
@@ -274,6 +303,5 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -A
 
 ### 6.3 缺外部条件（未验证）
 
-- **真实 OpenAI 兼容回合**：本机只配置了占位值（`DEVHUB_OPENAI_API_KEY=CHANGE_ME`），未填入真实 key，真实回合未执行；`scheduler_status` 会把占位值判为 `openai:auth`（detail 提示“仍是占位值”），不能作为端到端通过的证据。按 §2.4 换成真实 key 后重跑一次真实回合，记录输入输出与耗时，并确认不再是 `openai:auth`。
 - **真实 `vscode.lm` 回合桥**：扩展已安装并激活，但本机 VS Code 未登录 GitHub Copilot，`vscode.lm` 无可用模型，因此未写出 `lm-bridge.json`；上文的 `/health` + pid 校验是用本地桩端点验证守护进程侧逻辑，不代表真实桥可用。登录 Copilot 并重载窗口后可复测。
 - **插件包安装**：`Chat: Install Plugin from Source` 无法通过 CLI 自动化，未在真机执行；`plugin/` 已通过 `validate-plugin.mjs` 静态校验。

@@ -33,6 +33,7 @@ public sealed record AttemptRecord(
     int? ToolCalls,
     int? InputTokens,
     int? OutputTokens,
+    bool UsageEstimated,
     int? FilesChanged,
     string? Summary);
 

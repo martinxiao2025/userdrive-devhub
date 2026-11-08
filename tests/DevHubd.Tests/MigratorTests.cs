@@ -122,4 +122,65 @@ public sealed class MigratorTests : IDisposable
         foreignKeys.CommandText = "PRAGMA foreign_keys;";
         Assert.Equal(1L, Convert.ToInt64(await foreignKeys.ExecuteScalarAsync(ct)));
     }
+
+    /// <summary>V2 必须给 attempt 增加 usage_estimated，且默认值为 0（真实 token）。</summary>
+    [Fact]
+    public async Task Migrate_AddsUsageEstimatedColumnAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var factory = new SqliteConnectionFactory(Path.Combine(_directory, "devhub.db"));
+        await Migrator.MigrateAsync(factory, ct);
+
+        Assert.True(await HasColumnAsync(factory, "attempt", "usage_estimated", ct));
+    }
+
+    /// <summary>已有 V1 库升级时必须只补 V2，不重建表，并保持 user_version 递增。</summary>
+    [Fact]
+    public async Task Migrate_FromV1_UpgradesToLatestAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var factory = new SqliteConnectionFactory(Path.Combine(_directory, "devhub.db"));
+
+        using (var connection = await factory.OpenAsync(ct))
+        {
+            using var seed = connection.CreateCommand();
+            seed.CommandText = """
+                CREATE TABLE attempt (id TEXT PRIMARY KEY, queue_item_id TEXT NOT NULL);
+                PRAGMA user_version = 1;
+                """;
+            await seed.ExecuteNonQueryAsync(ct);
+        }
+
+        var version = await Migrator.MigrateAsync(factory, ct);
+
+        Assert.Equal(Migrator.CurrentVersion, version);
+        Assert.True(await HasColumnAsync(factory, "attempt", "usage_estimated", ct));
+    }
+
+    /// <summary>判断指定表是否已有某列。</summary>
+    /// <param name="factory">连接工厂。</param>
+    /// <param name="table">表名。</param>
+    /// <param name="column">列名。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private static async Task<bool> HasColumnAsync(
+        SqliteConnectionFactory factory,
+        string table,
+        string column,
+        CancellationToken cancellationToken)
+    {
+        using var connection = await factory.OpenAsync(cancellationToken);
+        using var command = connection.CreateCommand();
+        command.CommandText = $"PRAGMA table_info({table});";
+
+        using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            if (string.Equals(reader.GetString(1), column, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 }

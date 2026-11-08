@@ -42,6 +42,7 @@ public sealed class DevHubHostState : ISchedulerStatusSource
         var queue = await ReadQueueCountersAsync(connection, cancellationToken).ConfigureAwait(false);
         var unread = await ReadUnreadAsync(connection, cancellationToken).ConfigureAwait(false);
         var providers = await ReadProvidersAsync(connection, cancellationToken).ConfigureAwait(false);
+        var tokens = await ReadTokenCountersAsync(connection, cancellationToken).ConfigureAwait(false);
 
         return new SchedulerStatusSnapshot
         {
@@ -55,6 +56,7 @@ public sealed class DevHubHostState : ISchedulerStatusSource
             Counters = MapCounters(scheduler.Counters),
             Queue = queue,
             Unread = unread,
+            Tokens = tokens,
             Providers = providers,
             Mcp = new McpBindingStatus { Bound = true, Port = _host.Options.McpPort },
             Host = new HostStatus
@@ -122,6 +124,45 @@ public sealed class DevHubHostState : ISchedulerStatusSource
         {
             Results = reader.GetInt32(0),
             Failures = reader.IsDBNull(1) ? 0 : reader.GetInt32(1),
+        };
+    }
+
+    /// <summary>
+    /// 汇总全部 attempt 的 token 用量。没有 token 的 attempt（provider 未返回 usage，
+    /// 或尚未真正调用模型就收尾）单列计数，避免把缺失当成 0 混入总量。
+    /// </summary>
+    /// <param name="connection">已打开的连接。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private static async Task<TokenCounters> ReadTokenCountersAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT COALESCE(SUM(input_tokens), 0) AS prompt,
+                   COALESCE(SUM(output_tokens), 0) AS completion,
+                   COUNT(CASE WHEN input_tokens IS NOT NULL OR output_tokens IS NOT NULL THEN 1 END) AS with_usage,
+                   COUNT(CASE WHEN input_tokens IS NULL AND output_tokens IS NULL THEN 1 END) AS without_usage,
+                   COALESCE(SUM(usage_estimated), 0) AS estimated
+            FROM attempt;
+            """;
+
+        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            return new TokenCounters();
+        }
+
+        var prompt = reader.GetInt32(0);
+        var completion = reader.GetInt32(1);
+        return new TokenCounters
+        {
+            PromptTokens = prompt,
+            CompletionTokens = completion,
+            TotalTokens = prompt + completion,
+            AttemptsWithUsage = reader.GetInt32(2),
+            AttemptsWithoutUsage = reader.GetInt32(3),
+            EstimatedAttempts = reader.GetInt32(4),
         };
     }
 

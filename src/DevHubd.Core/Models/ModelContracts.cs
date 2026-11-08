@@ -139,8 +139,9 @@ public sealed record TurnResult(
     /// <summary>构造失败结果。</summary>
     /// <param name="error">错误。</param>
     /// <param name="toolCalls">已发生的工具调用次数。</param>
-    public static TurnResult Failed(ModelError error, int toolCalls = 0) =>
-        new(TurnState.Failed, string.Empty, toolCalls, null, Array.Empty<string>(), error);
+    /// <param name="usage">失败前已产生的用量；null 表示未获得或不可信。</param>
+    public static TurnResult Failed(ModelError error, int toolCalls = 0, TokenUsage? usage = null) =>
+        new(TurnState.Failed, string.Empty, toolCalls, usage, Array.Empty<string>(), error);
 
     /// <summary>构造取消结果。</summary>
     /// <param name="error">取消原因。</param>

@@ -18,7 +18,11 @@ public sealed record QueueItemSummary(
 /// <summary>队列分页结果。</summary>
 public sealed record QueuePageResult(IReadOnlyList<QueueItemSummary> Items, string? NextCursor);
 
-/// <summary>一次执行尝试的摘要。</summary>
+/// <summary>
+/// 一次执行尝试的摘要。
+/// token 字段来自 provider 返回的 usage；provider 未返回时三项均为 null。
+/// <c>usageEstimated=true</c> 表示数值是按字符数估算的近似值，<b>不是真实 token</b>。
+/// </summary>
 public sealed record AttemptSummary(
     int AttemptNo,
     string Provider,
@@ -26,7 +30,11 @@ public sealed record AttemptSummary(
     string StartedAt,
     string? EndedAt,
     string? Outcome,
-    string? ErrorCode);
+    string? ErrorCode,
+    int? PromptTokens,
+    int? CompletionTokens,
+    int? TotalTokens,
+    bool UsageEstimated);
 
 /// <summary>队列项详情。</summary>
 public sealed record QueueItemDetailResult(

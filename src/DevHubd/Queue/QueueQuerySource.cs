@@ -106,5 +106,11 @@ public sealed class QueueQuerySource : IQueueQuerySource
         attempt.StartedAt,
         attempt.EndedAt,
         attempt.Outcome,
-        attempt.ErrorCode);
+        attempt.ErrorCode,
+        attempt.InputTokens,
+        attempt.OutputTokens,
+        attempt.InputTokens is null && attempt.OutputTokens is null
+            ? null
+            : (attempt.InputTokens ?? 0) + (attempt.OutputTokens ?? 0),
+        attempt.UsageEstimated);
 }

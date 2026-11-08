@@ -3,13 +3,13 @@ using Microsoft.Data.Sqlite;
 namespace DevHubd.Core.Data;
 
 /// <summary>
-/// 数据库迁移器：以 <c>PRAGMA user_version</c> 记录版本，P0 只包含 V1（9 张表 + 索引 + 单例行）。
+/// 数据库迁移器：以 <c>PRAGMA user_version</c> 记录版本，按版本号顺序执行增量迁移（V1 → V2 …）。
 /// 迁移在单个事务内完成，失败整体回滚；重复调用幂等。
 /// </summary>
 public static class Migrator
 {
-    /// <summary>当前 schema 版本，对应 §8.2 的 9 张表。</summary>
-    public const int CurrentVersion = 1;
+    /// <summary>当前 schema 版本。V1 = 9 张表；V2 = attempt.usage_estimated。</summary>
+    public const int CurrentVersion = 2;
 
     /// <summary>V1 的全部 DDL 与初始数据。</summary>
     private const string SchemaV1 = """
@@ -144,6 +144,14 @@ public static class Migrator
         VALUES (1, 1, 'dispatch_only', NULL, 30, '{}', strftime('%Y-%m-%dT%H:%M:%fZ','now'));
         """;
 
+    /// <summary>
+    /// V2：attempt 增加 <c>usage_estimated</c>。0 表示 provider 真实返回的 token；
+    /// 1 表示按请求/响应字符数推算的近似值，<b>不是真实 token</b>。
+    /// </summary>
+    private const string SchemaV2 = """
+        ALTER TABLE attempt ADD COLUMN usage_estimated INTEGER NOT NULL DEFAULT 0;
+        """;
+
     /// <summary>P0 期望存在的 9 张表（用于启动自检与测试断言）。</summary>
     public static readonly IReadOnlyList<string> ExpectedTables = new[]
     {
@@ -160,6 +168,7 @@ public static class Migrator
 
     /// <summary>
     /// 迁移到最新版本；已是最新则直接返回当前版本。
+    /// 按 <c>user_version</c> 顺序补执行缺失的增量脚本，已有的库只跑新增的那一段。
     /// </summary>
     /// <param name="factory">连接工厂。</param>
     /// <param name="cancellationToken">取消令牌。</param>
@@ -176,11 +185,16 @@ public static class Migrator
 
         using var transaction = connection.BeginTransaction();
 
-        using (var script = connection.CreateCommand())
+        if (version < 1)
         {
-            script.Transaction = transaction;
-            script.CommandText = SchemaV1;
-            await script.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await ExecuteScriptAsync(connection, transaction, SchemaV1, cancellationToken).ConfigureAwait(false);
+            version = 1;
+        }
+
+        if (version < 2)
+        {
+            await ExecuteScriptAsync(connection, transaction, SchemaV2, cancellationToken).ConfigureAwait(false);
+            version = 2;
         }
 
         using (var stamp = connection.CreateCommand())
@@ -193,6 +207,23 @@ public static class Migrator
 
         transaction.Commit();
         return CurrentVersion;
+    }
+
+    /// <summary>在迁移事务内执行一段 DDL。</summary>
+    /// <param name="connection">已打开的连接。</param>
+    /// <param name="transaction">迁移事务。</param>
+    /// <param name="script">DDL 文本。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private static async Task ExecuteScriptAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string script,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = script;
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>读取当前 schema 版本。</summary>

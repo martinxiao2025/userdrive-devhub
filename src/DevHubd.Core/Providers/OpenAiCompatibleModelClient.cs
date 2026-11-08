@@ -119,6 +119,12 @@ public sealed class OpenAiCompatibleModelClient : IModelClient
         var toolCalls = 0;
         var model = request.Model ?? _options.Model;
 
+        // 多轮工具调用会产生多次请求，每次响应各带一份 usage，必须跨轮累加才能得到整回合的真实用量。
+        var inputTokens = 0;
+        var outputTokens = 0;
+        var usageRounds = 0;
+        var usageMissing = false;
+
         for (var round = 1; round <= request.Budget.MaxToolRounds; round++)
         {
             var payload = BuildPayload(model, messages, request.Tools);
@@ -130,7 +136,7 @@ public sealed class OpenAiCompatibleModelClient : IModelClient
             }
             catch (ModelCallException exception)
             {
-                return TurnResult.Failed(exception.Error, toolCalls);
+                return TurnResult.Failed(exception.Error, toolCalls, BuildUsage());
             }
 
             using (document)
@@ -138,13 +144,27 @@ public sealed class OpenAiCompatibleModelClient : IModelClient
                 var root = document.RootElement;
                 if (!TryGetAssistantMessage(root, out var message))
                 {
-                    return TurnResult.Failed(new ModelError(
-                        ModelErrorKinds.ModelError,
-                        "MALFORMED_RESPONSE",
-                        "模型响应缺少 choices[0].message。"), toolCalls);
+                    return TurnResult.Failed(
+                        new ModelError(
+                            ModelErrorKinds.ModelError,
+                            "MALFORMED_RESPONSE",
+                            "模型响应缺少 choices[0].message。"),
+                        toolCalls,
+                        BuildUsage());
                 }
 
-                var usage = ReadUsage(root);
+                var roundUsage = ReadUsage(root);
+                if (roundUsage is null)
+                {
+                    // 任意一轮缺失 usage，都无法得出整回合的精确值；宁可记 null，也不把部分值当真实总量。
+                    usageMissing = true;
+                }
+                else
+                {
+                    inputTokens += roundUsage.InputTokens;
+                    outputTokens += roundUsage.OutputTokens;
+                    usageRounds++;
+                }
 
                 if (!message.TryGetProperty("tool_calls", out var calls) ||
                     calls.ValueKind != JsonValueKind.Array ||
@@ -155,12 +175,18 @@ public sealed class OpenAiCompatibleModelClient : IModelClient
                         ? content.GetString() ?? string.Empty
                         : string.Empty;
 
+                    var usage = BuildUsage();
                     _logger.LogInformation(
-                        "模型回合完成：turnId={TurnId} provider={Provider} rounds={Rounds} toolCalls={ToolCalls}",
+                        "模型回合完成：turnId={TurnId} provider={Provider} rounds={Rounds} toolCalls={ToolCalls} " +
+                        "promptTokens={PromptTokens} completionTokens={CompletionTokens} totalTokens={TotalTokens} usageMissing={UsageMissing}",
                         request.TurnId,
                         ProviderName,
                         round,
-                        toolCalls);
+                        toolCalls,
+                        usage?.InputTokens ?? 0,
+                        usage?.OutputTokens ?? 0,
+                        (usage?.InputTokens ?? 0) + (usage?.OutputTokens ?? 0),
+                        usage is null);
 
                     return TurnResult.Done(text, toolCalls, usage, dispatcher.ChangedFiles);
                 }
@@ -193,10 +219,22 @@ public sealed class OpenAiCompatibleModelClient : IModelClient
             }
         }
 
-        return TurnResult.Failed(new ModelError(
-            ModelErrorKinds.BudgetExceeded,
-            "TOOL_ROUNDS_EXCEEDED",
-            $"工具轮数超过上限 {request.Budget.MaxToolRounds}。"), toolCalls);
+        return TurnResult.Failed(
+            new ModelError(
+                ModelErrorKinds.BudgetExceeded,
+                "TOOL_ROUNDS_EXCEEDED",
+                $"工具轮数超过上限 {request.Budget.MaxToolRounds}。"),
+            toolCalls,
+            BuildUsage());
+
+        /// <summary>
+        /// 汇总本回合的真实用量：只有每一轮都返回 usage 时才给出总数，
+        /// 否则返回 null（部分轮次缺失时总数不可信，不能当作真实 token 落库）。
+        /// </summary>
+        TokenUsage? BuildUsage() =>
+            usageRounds > 0 && !usageMissing
+                ? new TokenUsage(inputTokens, outputTokens, Estimated: false)
+                : null;
     }
 
     /// <summary>执行一次工具调用；工具失败以文本回填给模型，由模型自行纠正。</summary>

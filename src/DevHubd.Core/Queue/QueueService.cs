@@ -564,7 +564,7 @@ public sealed class QueueService
         {
             command.CommandText = """
                 SELECT id, attempt_no, provider, model, started_at, ended_at, outcome, error_kind, error_code,
-                       tool_calls, input_tokens, output_tokens, files_changed, summary
+                       tool_calls, input_tokens, output_tokens, usage_estimated, files_changed, summary
                 FROM attempt
                 WHERE queue_item_id = $id
                 ORDER BY attempt_no DESC;
@@ -587,8 +587,9 @@ public sealed class QueueService
                     reader.IsDBNull(9) ? null : reader.GetInt32(9),
                     reader.IsDBNull(10) ? null : reader.GetInt32(10),
                     reader.IsDBNull(11) ? null : reader.GetInt32(11),
-                    reader.IsDBNull(12) ? null : reader.GetInt32(12),
-                    reader.IsDBNull(13) ? null : reader.GetString(13)));
+                    reader.GetInt32(12) == 1,
+                    reader.IsDBNull(13) ? null : reader.GetInt32(13),
+                    reader.IsDBNull(14) ? null : reader.GetString(14)));
             }
         }
 
