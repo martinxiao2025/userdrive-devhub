@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text.Json;
 using DevHubd.Core.Data;
 using DevHubd.Core.Data.Entities;
@@ -79,16 +80,28 @@ public sealed class TaskScanner
             rowsById[row.Id] = row;
         }
 
-        // 已交付（审批通过）的任务不允许被文件里的旧状态退回可执行态。
-        // 这层防御针对历史遗留的"库已交付、文件未落"半成品；正常路径下审批已先写文件再提交。
-        var deliveredIds = existing
-            .Where(row => string.Equals(row.ApprovalState, "approved", StringComparison.Ordinal))
-            .Select(row => row.Id)
-            .ToHashSet(StringComparer.Ordinal);
+        // 待审结果按（任务 id，分发时内容哈希）识别。它的存在说明"状态由审批决策决定"：
+        // 文件因审批回写成功但库提交失败而短暂显示 done 时，扫描不得用文件覆盖库内状态，
+        // 否则会出现"待审结果还在、任务视图却已 done"的另一种半边态。
+        var pendingReviewPairs = (await db.Results
+                .AsNoTracking()
+                .Where(result => result.Outcome == "awaiting_review")
+                .Join(
+                    db.QueueItems.AsNoTracking(),
+                    result => result.QueueItemId,
+                    item => item.Id,
+                    (result, item) => new { result.TaskId, item.TaskHash })
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false))
+            .Select(entry => (entry.TaskId, entry.TaskHash))
+            .ToHashSet();
+
+        var pendingReviewIds = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var (sourcePath, document) in accepted)
         {
-            if (!rowsById.TryGetValue(document.Id, out var row))
+            var isNew = !rowsById.TryGetValue(document.Id, out var row);
+            if (row is null)
             {
                 row = new TaskViewEntity
                 {
@@ -100,11 +113,15 @@ public sealed class TaskScanner
                 rowsById[document.Id] = row;
             }
 
+            // 覆盖式写入前先记住旧值：审批态与待审判断都依赖"库里的上一次内容"。
+            var previousHash = row.ContentHash;
+            var previousPayload = row.Payload;
+            var substantiveChange = !isNew && HasSubstantiveChange(previousPayload, document.RawJson);
+
             // 覆盖式写入：与原 ON CONFLICT (workspace_id, id) DO UPDATE 的列集合一一对应。
             row.SourcePath = sourcePath;
             row.ContentHash = document.ContentHash;
             row.Title = document.Title;
-            row.Status = deliveredIds.Contains(document.Id) ? "done" : document.Status;
             row.Priority = document.Priority;
             row.WriteScope = JsonSerializer.Serialize(document.WriteScope);
             row.Payload = document.RawJson;
@@ -112,7 +129,45 @@ public sealed class TaskScanner
             row.DependsOn = document.DependsOn.Count == 0 ? null : JsonSerializer.Serialize(document.DependsOn);
             row.SeenAt = now;
             row.UpdatedAt = now;
+
+            if (!isNew && string.Equals(row.ApprovalState, "approved", StringComparison.Ordinal))
+            {
+                // 已审批任务的重做通道：只有实质字段变化才视为新需求，重置审批态并允许重新派发；
+                // 仅 status（或格式）变化保持已交付，避免"把文件改回 ready"绕过审批语义。
+                if (substantiveChange)
+                {
+                    row.ApprovalState = "none";
+                    row.Status = document.Status;
+                }
+                else
+                {
+                    row.Status = "done";
+                }
+
+                continue;
+            }
+
+            if (!isNew && pendingReviewPairs.Contains((document.Id, previousHash)))
+            {
+                // 待审期间状态以库为准。内容只是格式/status 变化时保持原内容哈希，
+                // 让入队闸门仍能按 hash 认出"这份内容已有待审结果"，不被重复派发。
+                if (!substantiveChange)
+                {
+                    row.ContentHash = previousHash;
+                }
+
+                pendingReviewIds.Add(document.Id);
+                continue;
+            }
+
+            row.Status = document.Status;
         }
+
+        // 已经在循环里把"实质变更的已审批任务"重置为 none，这里只收集仍然有效的已交付任务。
+        var deliveredIds = rowsById.Values
+            .Where(row => string.Equals(row.ApprovalState, "approved", StringComparison.Ordinal))
+            .Select(row => row.Id)
+            .ToHashSet(StringComparer.Ordinal);
 
         var acceptedIds = accepted.Select(entry => entry.Document.Id).ToHashSet(StringComparer.Ordinal);
         var markedMissing = 0;
@@ -138,6 +193,7 @@ public sealed class TaskScanner
         {
             if (document.DependsOn.Count == 0 ||
                 deliveredIds.Contains(document.Id) ||
+                pendingReviewIds.Contains(document.Id) ||
                 !string.Equals(document.Status, "ready", StringComparison.Ordinal))
             {
                 continue;
@@ -170,6 +226,7 @@ public sealed class TaskScanner
             {
                 if (!string.Equals(document.Status, "ready", StringComparison.Ordinal) ||
                     deliveredIds.Contains(document.Id) ||
+                    pendingReviewIds.Contains(document.Id) ||
                     knownRoles.Contains(document.Role))
                 {
                     continue;
@@ -186,5 +243,99 @@ public sealed class TaskScanner
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
 
         return new TaskScanResult(scanned, accepted.Count, scanned - accepted.Count, markedMissing, problems);
+    }
+
+    /// <summary>
+    /// 判断任务文件的实质字段是否变化：忽略 <c>status</c> 与 JSON 格式（缩进、键序、换行），
+    /// 只有 prompt / writeScope / role / 验收条件等需求字段变化才算"新需求"。
+    /// 任一侧无法解析时按"未变化"保守处理，避免把格式损坏误判成新任务而触发重派。
+    /// </summary>
+    /// <param name="storedPayload">库中保存的上一次任务原文。</param>
+    /// <param name="currentRawJson">本次扫描读到的新任务原文。</param>
+    private static bool HasSubstantiveChange(string? storedPayload, string currentRawJson)
+    {
+        var previous = CanonicalizeWithoutStatus(storedPayload);
+        var current = CanonicalizeWithoutStatus(currentRawJson);
+        return previous is not null &&
+               current is not null &&
+               !string.Equals(previous, current, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// 把任务 JSON 规范化成可比较的 SHA-256：去掉顶层 <c>status</c>，对象键按序数排序，
+    /// 数组保持原顺序。返回 null 表示不是合法的 JSON 对象。
+    /// </summary>
+    /// <param name="json">任务原文。</param>
+    private static string? CanonicalizeWithoutStatus(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                return null;
+            }
+
+            using var buffer = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(buffer))
+            {
+                writer.WriteStartObject();
+                foreach (var property in document.RootElement
+                             .EnumerateObject()
+                             .Where(property => !string.Equals(property.Name, "status", StringComparison.Ordinal))
+                             .OrderBy(property => property.Name, StringComparer.Ordinal))
+                {
+                    writer.WritePropertyName(property.Name);
+                    WriteCanonical(writer, property.Value);
+                }
+
+                writer.WriteEndObject();
+            }
+
+            return Convert.ToHexString(SHA256.HashData(buffer.ToArray()));
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>递归写入规范化 JSON：对象键排序，数组与标量原样输出。</summary>
+    /// <param name="writer">目标写入器。</param>
+    /// <param name="element">JSON 节点。</param>
+    private static void WriteCanonical(Utf8JsonWriter writer, JsonElement element)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Object:
+                writer.WriteStartObject();
+                foreach (var property in element.EnumerateObject().OrderBy(property => property.Name, StringComparer.Ordinal))
+                {
+                    writer.WritePropertyName(property.Name);
+                    WriteCanonical(writer, property.Value);
+                }
+
+                writer.WriteEndObject();
+                break;
+
+            case JsonValueKind.Array:
+                writer.WriteStartArray();
+                foreach (var item in element.EnumerateArray())
+                {
+                    WriteCanonical(writer, item);
+                }
+
+                writer.WriteEndArray();
+                break;
+
+            default:
+                element.WriteTo(writer);
+                break;
+        }
     }
 }

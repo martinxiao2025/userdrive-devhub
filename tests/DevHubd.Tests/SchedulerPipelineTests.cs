@@ -6,6 +6,7 @@ using DevHubd.Core.Execution;
 using DevHubd.Core.Input;
 using DevHubd.Core.Providers;
 using DevHubd.Core.Queue;
+using DevHubd.Core.Results;
 using DevHubd.Core.Scheduling;
 using DevHubd.Core.Tasks;
 using DevHubd.Core.Workspaces;
@@ -14,6 +15,7 @@ using DevHubd.Queue;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
+using CoreResultDecisionStatus = DevHubd.Core.Results.ResultDecisionStatus;
 
 namespace DevHubd.Tests;
 
@@ -141,8 +143,36 @@ public sealed class SchedulerPipelineTests : IDisposable
     }
 
     /// <summary>
+    /// 待审任务跨三个 tick 只执行一次：入队闸门以结果状态（awaiting_review / delivered）判定，
+    /// 即使队列项已终态、任务文件仍是 ready，也不得再派发同一份内容。
+    /// </summary>
+    [Fact]
+    public async Task TickAsync_PendingReviewAcrossThreeTicks_EnqueuesOnceAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "待审任务", "ready", 10);
+
+        await _engine.TickAsync(ct);
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+
+        // 模拟回合完成但结果待审：队列项终态、结果 awaiting_review、任务文件保持 ready。
+        var queueItemId = (await ReadColumnAsync("SELECT id FROM queue_item;", ct)).Single();
+        await InsertAwaitingResultAsync(queueItemId, "res-1", ct);
+        await ExecuteAsync("UPDATE queue_item SET status = 'succeeded';", ct);
+
+        await _engine.TickAsync(ct);
+        await _engine.TickAsync(ct);
+        await _engine.TickAsync(ct);
+
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+        Assert.Equal(1, await CountRowsAsync("SELECT COUNT(*) FROM result;", ct));
+    }
+
+    /// <summary>
     /// 重派去重不依赖任务文件字节：同一任务连续两轮"执行→驳回→重派"都必须真的入队，
-    /// 即使驳回回写后的文件字节完全一致。
+    /// 即使驳回回写后的文件字节完全一致；去重键形如 <c>hash:r&lt;已驳回次数&gt;</c>。
     /// </summary>
     [Fact]
     public async Task TickAsync_AfterTwoRejections_RedispatchesWithUnchangedFileBytesAsync()
@@ -152,39 +182,83 @@ public sealed class SchedulerPipelineTests : IDisposable
         WriteWorkspaces(("alpha", root));
         WriteTask(root, "T-001", "连续驳回", "ready", 10);
         var file = Path.Combine(root, ".devhub", "tasks", "T-001.json");
+        var decisions = new ResultDecisionStore(_factory);
 
         await _engine.TickAsync(ct);
         Assert.Equal(1, await CountQueueItemsAsync(ct));
 
-        // 第一轮驳回：把文件写成审批回写后的规范形态，并记录字节哈希。
-        await ExecuteAsync(
-            """
-            UPDATE queue_item SET status = 'succeeded';
-            UPDATE task_view SET status = 'ready', approval_state = 'rejected';
-            """,
-            ct);
-        Assert.True(await TaskFileStatusUpdater.TrySetStatusAsync(file, "ready", ct));
-        var canonicalHash = await ComputeHashAsync(file, ct);
+        // 第一轮：回合完成并进入待审，随后驳回（走真实审批存储，写审计与通知）。
+        var firstQueue = (await ReadColumnAsync("SELECT id FROM queue_item;", ct)).Single();
+        await InsertAwaitingResultAsync(firstQueue, "res-1", ct);
+        await ExecuteAsync($"UPDATE queue_item SET status = 'succeeded' WHERE id = '{firstQueue}';", ct);
+        var firstDecision = await decisions.DecideAsync("res-1", approve: false, "第一轮驳回", null, ct);
+        Assert.Equal(CoreResultDecisionStatus.Decided, firstDecision.Status);
 
-        // 第二轮派发必须真的发生（修复前这里会 deduped=1）。
+        // 驳回回写后的文件即为规范字节形态，记录哈希用于第二轮对比。
+        var canonicalHash = await ComputeHashAsync(file, ct);
         await _engine.TickAsync(ct);
         Assert.Equal(2, await CountQueueItemsAsync(ct));
 
-        // 第二轮驳回：文件本来就是规范形态，回写后字节不变。
-        await ExecuteAsync(
-            """
-            UPDATE queue_item SET status = 'succeeded' WHERE status = 'pending';
-            UPDATE task_view SET status = 'ready', approval_state = 'rejected';
-            """,
-            ct);
-        Assert.True(await TaskFileStatusUpdater.TrySetStatusAsync(file, "ready", ct));
+        // 第二轮：文件字节不变，仍必须重派。
+        var secondQueue = (await ReadColumnAsync(
+            "SELECT id FROM queue_item WHERE status = 'pending';", ct)).Single();
         Assert.Equal(canonicalHash, await ComputeHashAsync(file, ct));
+        await InsertAwaitingResultAsync(secondQueue, "res-2", ct);
+        await ExecuteAsync($"UPDATE queue_item SET status = 'succeeded' WHERE id = '{secondQueue}';", ct);
+        var secondDecision = await decisions.DecideAsync("res-2", approve: false, "第二轮驳回", null, ct);
+        Assert.Equal(CoreResultDecisionStatus.Decided, secondDecision.Status);
 
         await _engine.TickAsync(ct);
         Assert.Equal(3, await CountQueueItemsAsync(ct));
+        Assert.Equal(canonicalHash, await ComputeHashAsync(file, ct));
 
         var keys = await ReadDedupeKeysAsync(ct);
         Assert.Equal(3, keys.Distinct(StringComparer.Ordinal).Count());
+        Assert.Contains(keys, key => key.EndsWith(":r0", StringComparison.Ordinal));
+        Assert.Contains(keys, key => key.EndsWith(":r1", StringComparison.Ordinal));
+        Assert.Contains(keys, key => key.EndsWith(":r2", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// 已审批任务的重做通道：任务文件仅改 <c>status</c> 不触发重派；
+    /// 实质字段（prompt 等）变化才视为新需求，重置审批态并重新入队。
+    /// </summary>
+    [Fact]
+    public async Task TickAsync_ApprovedTask_RedispatchesOnlyOnSubstantiveChangeAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "已交付任务", "ready", 10, prompt: "原始需求");
+        var file = Path.Combine(root, ".devhub", "tasks", "T-001.json");
+
+        await _engine.TickAsync(ct);
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+
+        // 模拟审批已通过：库 done/approved，文件被回写成 done。
+        await ExecuteAsync(
+            """
+            UPDATE queue_item SET status = 'succeeded';
+            UPDATE task_view SET status = 'done', approval_state = 'approved';
+            """,
+            ct);
+        Assert.True(await TaskFileStatusUpdater.TrySetStatusAsync(file, "done", ct));
+
+        // 仅 status 改回 ready：不是新需求，不得重派。
+        Assert.True(await TaskFileStatusUpdater.TrySetStatusAsync(file, "ready", ct));
+        await _engine.TickAsync(ct);
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+        Assert.Equal(
+            new[] { "done|approved" },
+            await ReadColumnAsync("SELECT status || '|' || approval_state FROM task_view WHERE id = 'T-001';", ct));
+
+        // 实质字段变化：视为新需求，审批态重置并重派。
+        WriteTask(root, "T-001", "已交付任务", "ready", 10, prompt: "新的验收条件");
+        await _engine.TickAsync(ct);
+        Assert.Equal(2, await CountQueueItemsAsync(ct));
+        Assert.Equal(
+            new[] { "ready|none" },
+            await ReadColumnAsync("SELECT status || '|' || approval_state FROM task_view WHERE id = 'T-001';", ct));
     }
 
     /// <summary>两个工作区存在同名任务：task_view 与队列项都按 workspace 隔离。</summary>
@@ -531,6 +605,9 @@ public sealed class SchedulerPipelineTests : IDisposable
     /// <param name="title">标题。</param>
     /// <param name="status">状态。</param>
     /// <param name="priority">优先级。</param>
+    /// <param name="role">执行角色。</param>
+    /// <param name="dependsOn">前置任务。</param>
+    /// <param name="prompt">任务需求正文（用于验证"实质字段变化"）。</param>
     private static void WriteTask(
         string workspaceRoot,
         string id,
@@ -538,7 +615,8 @@ public sealed class SchedulerPipelineTests : IDisposable
         string status,
         int priority,
         string? role = null,
-        string[]? dependsOn = null)
+        string[]? dependsOn = null,
+        string prompt = "执行该任务")
     {
         var payload = new Dictionary<string, object?>
         {
@@ -548,7 +626,7 @@ public sealed class SchedulerPipelineTests : IDisposable
             ["priority"] = priority,
             ["delivery"] = "review",
             ["writeScope"] = Array.Empty<string>(),
-            ["prompt"] = "执行该任务",
+            ["prompt"] = prompt,
         };
 
         if (role is not null)
@@ -569,12 +647,37 @@ public sealed class SchedulerPipelineTests : IDisposable
 
     /// <summary>统计队列项数量。</summary>
     /// <param name="cancellationToken">取消令牌。</param>
-    private async Task<int> CountQueueItemsAsync(CancellationToken cancellationToken)
+    private async Task<int> CountQueueItemsAsync(CancellationToken cancellationToken) =>
+        await CountRowsAsync("SELECT COUNT(*) FROM queue_item;", cancellationToken);
+
+    /// <summary>执行一条返回单值的 COUNT 查询。</summary>
+    /// <param name="sql">查询语句。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private async Task<int> CountRowsAsync(string sql, CancellationToken cancellationToken)
     {
         using var connection = await _factory.OpenAsync(cancellationToken);
         using var command = connection.CreateCommand();
-        command.CommandText = "SELECT COUNT(*) FROM queue_item;";
+        command.CommandText = sql;
         return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken));
+    }
+
+    /// <summary>插入一条待审批结果，模拟后台回合已完成但尚未决策。</summary>
+    /// <param name="queueItemId">队列项 id。</param>
+    /// <param name="resultId">结果 id。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private async Task InsertAwaitingResultAsync(string queueItemId, string resultId, CancellationToken cancellationToken)
+    {
+        using var connection = await _factory.OpenAsync(cancellationToken);
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            INSERT INTO result (id, task_id, queue_item_id, provider, outcome, summary, artifacts, created_at, read_at)
+            VALUES ($id, 'T-001', $queue, 'openai', 'awaiting_review', '待审', '[]', '2026-01-01T00:00:00Z', NULL);
+            UPDATE task_view SET approval_state = 'pending' WHERE id = 'T-001';
+            """;
+        command.Parameters.AddWithValue("$id", resultId);
+        command.Parameters.AddWithValue("$queue", queueItemId);
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
     /// <summary>计算文件字节的 SHA-256，用于断言写入前后字节形态是否变化。</summary>

@@ -93,16 +93,33 @@ public sealed class QueueService
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        // 重派去重按"任务队列代次"而非文件字节：同一任务每次成功入队都会产生新代次，
-        // 驳回后即使任务文件字节完全没变（规范形态），也仍能再次派发。
-        var generations = (await db.QueueItems
+        // 入队闸门以"结果状态"判定，而不是队列行计数：同一任务当前内容哈希若已有
+        // awaiting_review / delivered 的结果，就不派发。否则队列项一旦进入终态，
+        // 每一轮 tick 都会把同一份内容再跑一次（实测 90 秒内重复执行 4 次）。
+        var blockedPairs = (await db.Results
                 .AsNoTracking()
-                .Where(item => item.WorkspaceId == workspaceId)
-                .GroupBy(item => item.TaskId)
-                .Select(group => new { TaskId = group.Key, Count = group.Count() })
+                .Where(result => result.Outcome == "awaiting_review" || result.Outcome == "delivered")
+                .Join(
+                    db.QueueItems.AsNoTracking(),
+                    result => result.QueueItemId,
+                    item => item.Id,
+                    (result, item) => new { result.TaskId, item.TaskHash })
                 .ToListAsync(cancellationToken)
                 .ConfigureAwait(false))
-            .ToDictionary(entry => entry.TaskId, entry => entry.Count, StringComparer.Ordinal);
+            .Select(entry => (entry.TaskId, entry.TaskHash))
+            .ToHashSet();
+
+        // 驳回次数取审计（result.rejected）里的持久计数：被驳回的结果 outcome 会变成 failed，
+        // 与传输失败产生的 failed 结果无法区分，因此不能直接数 result.outcome。
+        var rejectedCounts = await LoadRejectedCountsAsync(db, cancellationToken).ConfigureAwait(false);
+
+        // 已用过的去重键后缀：计数一律 max+1，即使将来清理队列行也不会回退、不会撞旧键。
+        var usedKeys = await db.QueueItems
+            .AsNoTracking()
+            .Where(item => item.WorkspaceId == workspaceId)
+            .Select(item => new { item.TaskId, item.DedupeKey })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
 
         // 一次性取回本工作区所有"未结束"的 task_id：任务在 task_view 中天然唯一，
         // 因此快照判断与逐条 EXISTS 等价，但把 N 次查询收敛成 1 次。
@@ -127,14 +144,27 @@ public sealed class QueueService
                 continue;
             }
 
+            // 该内容已有待审或已交付结果：不派发，计入去重（否则终态队列行会诱发重复执行）。
+            if (blockedPairs.Contains((task.Id, task.ContentHash)))
+            {
+                deduped++;
+                continue;
+            }
+
             if (dryRun)
             {
                 enqueued++;
                 continue;
             }
 
-            var generation = generations.GetValueOrDefault(task.Id) + 1;
-            var dedupeKey = BuildDedupeKey(workspaceId, task.Id, generation);
+            var prefix = RoundPrefix(workspaceId, task.Id, task.ContentHash);
+            var used = usedKeys
+                .Where(key => string.Equals(key.TaskId, task.Id, StringComparison.Ordinal))
+                .Select(key => ParseRound(key.DedupeKey, prefix))
+                .DefaultIfEmpty(-1)
+                .Max();
+            var round = Math.Max(rejectedCounts.GetValueOrDefault(task.Id), used + 1);
+            var dedupeKey = BuildDedupeKey(workspaceId, task.Id, task.ContentHash, round);
             var inserted = await InsertIgnoreConflictAsync(
                 db,
                 workspaceId,
@@ -208,13 +238,20 @@ public sealed class QueueService
                 return new ManualEnqueueResult(false, true, latest.Id, "deduped", latest.PreferredProvider);
             }
 
-            var generation = await db.QueueItems
+            var prefix = RoundPrefix(workspaceId, task.Id, task.ContentHash);
+            var usedKeys = await db.QueueItems
                 .AsNoTracking()
-                .CountAsync(
-                    item => item.WorkspaceId == workspaceId && item.TaskId == task.Id,
-                    cancellationToken)
-                .ConfigureAwait(false) + 1;
-            dedupeKey = BuildDedupeKey(workspaceId, task.Id, generation);
+                .Where(item => item.WorkspaceId == workspaceId && item.TaskId == task.Id)
+                .Select(item => item.DedupeKey)
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false);
+            var used = usedKeys
+                .Select(key => ParseRound(key, prefix))
+                .DefaultIfEmpty(-1)
+                .Max();
+            var rejected = (await LoadRejectedCountsAsync(db, cancellationToken).ConfigureAwait(false))
+                .GetValueOrDefault(task.Id);
+            dedupeKey = BuildDedupeKey(workspaceId, task.Id, task.ContentHash, Math.Max(rejected, used + 1));
         }
 
         var existing = await db.QueueItems
@@ -721,12 +758,59 @@ public sealed class QueueService
         return new QueueItemDetail(item, title, attempts.Select(ToDomain).ToList());
     }
 
-    /// <summary>构造 dedupe_key：<c>workspace:task:g&lt;generation&gt;</c>（任务队列代次，与文件字节无关）。</summary>
+    /// <summary>
+    /// 构造 dedupe_key：<c>workspace:task:&lt;contentHash&gt;:r&lt;已驳回次数&gt;</c>。
+    /// 键里带内容哈希，任务实质变更后自然产生新键；已驳回次数保证同一内容每轮驳回后可再次派发，
+    /// 与任务文件的字节形态（缩进、换行）无关。
+    /// </summary>
     /// <param name="workspaceId">工作区 id。</param>
     /// <param name="taskId">任务 id。</param>
-    /// <param name="generation">该任务第几次入队（从 1 开始）。</param>
-    public static string BuildDedupeKey(string workspaceId, string taskId, int generation) =>
-        $"{workspaceId}:{taskId}:g{generation}";
+    /// <param name="contentHash">任务内容哈希。</param>
+    /// <param name="rejectedCount">该任务已驳回次数（max+1 语义，见调用方）。</param>
+    public static string BuildDedupeKey(string workspaceId, string taskId, string contentHash, int rejectedCount) =>
+        $"{RoundPrefix(workspaceId, taskId, contentHash)}{rejectedCount}";
+
+    /// <summary>去重键中"轮次"后缀之前的前缀。</summary>
+    /// <param name="workspaceId">工作区 id。</param>
+    /// <param name="taskId">任务 id。</param>
+    /// <param name="contentHash">任务内容哈希。</param>
+    private static string RoundPrefix(string workspaceId, string taskId, string contentHash) =>
+        $"{workspaceId}:{taskId}:{contentHash}:r";
+
+    /// <summary>从既有去重键解析轮次；不属于当前前缀的键返回 -1。</summary>
+    /// <param name="dedupeKey">既有去重键。</param>
+    /// <param name="prefix">当前任务 + 内容哈希的前缀。</param>
+    private static int ParseRound(string dedupeKey, string prefix) =>
+        dedupeKey.StartsWith(prefix, StringComparison.Ordinal) &&
+        int.TryParse(dedupeKey.AsSpan(prefix.Length), NumberStyles.Integer, CultureInfo.InvariantCulture, out var round)
+            ? round
+            : -1;
+
+    /// <summary>
+    /// 统计每个任务的已驳回次数。以审计 <c>result.rejected</c>（subject 为结果 id）为准：
+    /// 被驳回的结果 outcome 会变成 <c>failed</c>，与传输失败产生的 failed 无法区分。
+    /// </summary>
+    /// <param name="db">数据库上下文。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private static async Task<Dictionary<string, int>> LoadRejectedCountsAsync(
+        DevHubDbContext db,
+        CancellationToken cancellationToken)
+    {
+        var rows = await db.Audits
+            .AsNoTracking()
+            .Where(audit => audit.Action == "result.rejected" && audit.Subject != null)
+            .Join(
+                db.Results.AsNoTracking(),
+                audit => audit.Subject!,
+                result => result.Id,
+                (audit, result) => result.TaskId)
+            .GroupBy(taskId => taskId)
+            .Select(group => new { TaskId = group.Key, Count = group.Count() })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        return rows.ToDictionary(entry => entry.TaskId, entry => entry.Count, StringComparer.Ordinal);
+    }
 
     /// <summary>当前 UTC 时间（ISO-8601，固定 +00:00 偏移，保证字符串可直接比较）。</summary>
     private static string Now() => DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture);

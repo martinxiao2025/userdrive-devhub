@@ -360,6 +360,28 @@ COUNT(attempt WHERE queue_item_id = ?
 
 ## 6. 变更记录
 
+### 入队闸门与已交付任务重做 — 2026-11-09
+
+- **入队闸门改按结果状态判定**：`EnqueueReadyTasksAsync` 先查 `result` 与 `queue_item` 的
+  `(task_id, task_hash)`：同一任务当前内容哈希若已存在 `awaiting_review` 或 `delivered` 结果，
+  直接按去重跳过。队列项进入终态不再意味着“可以再跑一遍”，修复了待审任务每个 tick 被重复派发
+  （实测 90 秒内执行 4 次、产生 4 条结果与 4 条通知）。
+- **去重键**：`workspace:task:<contentHash>:r<已驳回次数>`。`r<n>` 的 n 取审计
+  `result.rejected` 的持久计数（被驳回的结果 outcome 会变成 `failed`，与传输失败的 `failed`
+  无法区分，故不能直接数 `result.outcome`），再与既有键中的最大后缀取 `max` 后 `+1`，
+  保证队列清理后计数不回退、不撞旧键。上一版 `workspace:task:g<generation>` 作废。
+- **已交付任务的重做通道**：扫描时比较任务文件 JSON 的规范化内容（去掉顶层 `status`、排序对象键），
+  实质字段（prompt、writeScope、role、验收条件等）变化才把 `approval_state` 重置为 `none`
+  并按文件状态重新入队；仅 `status` 改回 `ready`、或仅缩进/换行变化不触发重派。
+- **反向不一致选择“库为准”**：审批决策后 `status` / `approval_state` 以数据库为准——存在
+  `awaiting_review` 结果时，扫描不拿文件里的 `done` 覆盖库内状态。代价：决策未完成期间
+  用户手改文件 `status` 不会立即生效，需等审批/驳回落地；好处是不需要第二条补偿写路径，
+  也不会出现“文件已 done、扫描把视图也改成 done”的半边态。文件先写、库提交失败时，
+  重试审批即可自愈，且不会因格式化导致内容哈希变化而重复派发（无实质变化时保留原内容哈希）。
+- 测试：`TickAsync_PendingReviewAcrossThreeTicks_EnqueuesOnceAsync`、
+  `TickAsync_AfterTwoRejections_RedispatchesWithUnchangedFileBytesAsync`、
+  `TickAsync_ApprovedTask_RedispatchesOnlyOnSubstantiveChangeAsync`。
+
 ### 交付态与重派修正 — 2026-11-08（不可回退、去重代次、角色预算、提问过滤）
 
 - **交付态不可回退**：`result_approve` / `result_reject` 改为**先写任务文件、后提交数据库**；
@@ -368,7 +390,8 @@ COUNT(attempt WHERE queue_item_id = ?
   的任务不会被文件状态覆盖回 `ready/blocked/missing`；入队查询同时排除 `approval_state='approved'`。
   测试：只读任务文件审批回滚、历史半边态扫描后仍 `done` 且不入队。
 - **重派去重与文件字节解耦**：`dedupe_key` 从 `workspace:task:contentHash` 改为
-  `workspace:task:g<generation>`（该任务已有队列项数 + 1）。任务内容哈希仍写入 `queue_item.task_hash`
+  `workspace:task:g<generation>`（该任务已有队列项数 + 1）。（已被 2026-11-09 的
+  `workspace:task:<contentHash>:r<n>` 方案取代：`COUNT(*)+1` 在队列清理后会回退。）任务内容哈希仍写入 `queue_item.task_hash`
   供追溯，但不参与去重；手动派发在存在进行中队列项时仍返回 `deduped`。
   测试：规范字节文件连续两轮“执行→驳回→重派”均真实入队，且第二轮驳回前后文件哈希一致。
 - **角色预算生效**：`maxRounds → MaxToolRounds`、`maxToolCalls → 工具调用总数`、
