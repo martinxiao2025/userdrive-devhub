@@ -24,6 +24,8 @@ public sealed class ToolSurfaceSnapshotTests
         ["scheduler_control"] = new[] { "action", "reason", "mode", "provider" },
         ["result_list"] = new[] { "unreadOnly", "limit", "cursor" },
         ["result_ack"] = new[] { "ids", "all" },
+        ["result_approve"] = new[] { "resultId", "comment" },
+        ["result_reject"] = new[] { "resultId", "comment" },
         ["input_request_list"] = new[] { "workspaceId", "taskId", "status", "limit", "cursor" },
         ["input_request_get"] = new[] { "id" },
         ["input_request_answer"] = new[] { "id", "answer", "optionId", "answeredBy", "idempotencyKey" },

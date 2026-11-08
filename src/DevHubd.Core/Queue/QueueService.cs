@@ -556,6 +556,7 @@ public sealed class QueueService
                 task.Priority,
                 task.RoleId,
                 task.SeenAt,
+                task.ApprovalState,
             })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
@@ -568,7 +569,8 @@ public sealed class QueueService
                 row.Status,
                 row.Priority,
                 row.RoleId,
-                row.SeenAt))
+                row.SeenAt,
+                row.ApprovalState ?? "none"))
             .ToList();
     }
 

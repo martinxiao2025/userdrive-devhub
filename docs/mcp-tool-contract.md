@@ -66,6 +66,7 @@
 | 结果终态（`result.outcome`） | `delivered` / `awaiting_review` / `failed` |
 | 任务状态（`devhub://tasks`） | `ready` / `blocked` / `done` / `cancelled` / `missing` |
 | 问题单状态（`input_request.*`） | `open` / `answered` / `expired` / `cancelled` / `all`（仅过滤用） |
+| 任务审批状态（`devhub://tasks.approvalState`） | `none` / `pending` / `approved` / `rejected` |
 
 ---
 
@@ -225,6 +226,29 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 语义：仅 `open` 可撤销；挂起队列项一并终止（`status=cancelled`、`last_error_code=INPUT_REQUEST_CLOSED`），任务不会在缺少输入时继续执行。
 错误码：`UNKNOWN_INPUT_REQUEST`、`INPUT_REQUEST_CLOSED`。
 
+### 3.12 `result_approve`
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `resultId` | string | 结果 id |
+| `comment` | string? | 审批意见，写入审计 |
+
+返回：`{ resultId, outcome:"delivered", taskId, decidedAt }`。
+语义：仅 `awaiting_review` 可审批；通过后结果终态置 `delivered`，`task_view.approval_state` 置 `approved`，
+并写 `audit(action='result.approved', actor='mcp')`。
+错误码：`UNKNOWN_RESULT`、`RESULT_NOT_PENDING`（均 retryable=false）。
+
+### 3.13 `result_reject`
+
+参数：`resultId`、`comment?`。
+返回：`{ resultId, outcome:"failed", taskId, decidedAt }`。
+语义：驳回后结果终态置 `failed`，`task_view.approval_state` 置 `rejected`，写 `audit(action='result.rejected')`
+与 `notice.kind='failure'`（去重键 `result-rejected:<resultId>`）。
+错误码：`UNKNOWN_RESULT`、`RESULT_NOT_PENDING`。
+
+两个工具同向重复提交是幂等的（`decidedAt=null`，不重复写审计/通知）；反向提交返回
+`RESULT_NOT_PENDING`，不覆盖既有终态。审批不修改任务文件。
+
 ---
 
 ## 4. 资源清单（只读）
@@ -235,7 +259,7 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 | `devhub://results/unread` | 未读结果列表 |
 | `devhub://scheduler/queue` | 队列快照 |
 | `devhub://scheduler/status` | 与 `scheduler_status` 同一快照 |
-| `devhub://tasks` | 任务物化视图（含 `roleId` 与 `seenAt`；`blocked` 表示依赖未满足或角色未声明） |
+| `devhub://tasks` | 任务物化视图（含 `roleId`、`seenAt`、`approvalState`；`blocked` 表示依赖未满足或角色未声明） |
 
 资源与同名工具使用同一序列化配置，时间同为 UTC + Z。
 
@@ -299,25 +323,23 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 - `scheduler_status` 新增只读字段 `roles[]`（`id/name/delivery/maxParallel/running`）；`running` 为 `claimed/running` 队列项的实时计数。
 - 启动时若找到 `plugin/plugin.json`（或 `DEVHUB_PLUGIN_DIR`），角色声明必须全部通过校验，否则以退出码 **6** 终止并逐条打印文件与字段名。
 
-### 待实施 — 2026-11-08（契约先行，未上线）
+### U11 — 2026-11-08（审批闸门：结果通过/驳回）
 
-> 以下工具当前实现不存在：调用会返回 `UNKNOWN_TOOL`。schema v5、`scheduler_status.roles`、
-> `task_upsert`、`ask_input` 与问题单四工具已分别在 U7–U10 上线（见下方变更记录），仅剩审批闸门待实施。
-> 方案见 `.trae/documents/架构增量方案-角色调度与不确定项回流.md`。上线时必须同步 `ToolVocabulary`、工具快照测试与本文件。
-
-**`result_approve` / `result_reject`**
-
-参数：`resultId`、`comment?`。返回：`{ resultId, outcome:"delivered"|"failed", taskId, decidedAt }`。
-错误：`UNKNOWN_RESULT`、`RESULT_NOT_PENDING`。
-
-**新增错误码（只增不改）**
-
-`NEEDS_INPUT`、`INPUT_TIMEOUT`、`INPUT_NOT_ALLOWED`、`UNKNOWN_INPUT_REQUEST`、`INPUT_REQUEST_CLOSED`、`INVALID_ANSWER`、`ANSWER_CONFLICT`、`INVALID_ROLE`、`TASK_CONFLICT`、`TASK_CHANGED`、`DEPENDENCY_UNMET`、`UNKNOWN_RESULT`、`RESULT_NOT_PENDING`、`AMBIGUOUS_WORKSPACE`。
-
-**schema v5（U7 已执行，见上一条变更记录）**
-
-只做 `ALTER TABLE ADD COLUMN` 与新增表（`input_request`、`role_view`），**不修改任何既有 `CHECK`、不重建表**。
-`queue_item` 新增 `role_id/hold_kind/hold_ref`；`task_view` 新增 `role_id/depends_on/approval_state`。
+- 工具面新增 `result_approve` / `result_reject`（共 14 个），参数与语义见 §3.12–§3.13。
+  两个工具同向重复提交幂等（`decidedAt=null`、不重复写审计/通知），反向提交返回 `RESULT_NOT_PENDING`。
+- 交付判定收紧：`task.requiresApproval=true` 时，即便全局档位与任务档位都是 `auto` 也进入
+  `awaiting_review`；任务级声明不能让全局 `auto` 绕过人工闸门。
+- 结果落库为 `awaiting_review` 时把 `task_view.approval_state` 置 `pending`；交付成功（`delivered`）时
+  清回 `none`，避免驳回后的旧状态残留。审批通过/驳回分别置 `approved`/`rejected`。
+- 审批写 `audit`：`result.approved` / `result.rejected`，`actor` 固定 `mcp`（契约暂未开放调用方声明）。
+  `comment` 截断到 200 字符写入 `audit.detail`。
+- 驳回额外写 `notice.kind='failure'`，去重键 `result-rejected:<resultId>`，正文优先取驳回原因，否则取结果摘要；
+  通过不写通知（结果本身已由 `result_list` 可见）。
+- `devhub://tasks` 条目新增 `approvalState`；审批**不修改任务文件**，任务清单仍由工作区维护。
+- 新增错误码（只增不改）：`UNKNOWN_RESULT`、`RESULT_NOT_PENDING`；连同前序单元累计新增
+  `NEEDS_INPUT`、`INPUT_TIMEOUT`、`INPUT_NOT_ALLOWED`、`UNKNOWN_INPUT_REQUEST`、`INPUT_REQUEST_CLOSED`、
+  `INVALID_ANSWER`、`ANSWER_CONFLICT`、`INVALID_ROLE`、`TASK_CONFLICT`、`TASK_CHANGED`、
+  `DEPENDENCY_UNMET`、`AMBIGUOUS_WORKSPACE`。
 
 ### v4 — 2026-11-08（数据修正，无字段变化）
 

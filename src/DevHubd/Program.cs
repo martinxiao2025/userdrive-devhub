@@ -266,6 +266,8 @@ internal static class Program
             serviceProvider.GetRequiredService<IDbContextFactory<DevHubDbContext>>()));
         builder.Services.AddSingleton(serviceProvider => new ResultStore(
             serviceProvider.GetRequiredService<IDbContextFactory<DevHubDbContext>>()));
+        builder.Services.AddSingleton(serviceProvider => new ResultDecisionStore(
+            serviceProvider.GetRequiredService<IDbContextFactory<DevHubDbContext>>()));
         builder.Services.AddSingleton(serviceProvider => new NoticeStore(
             serviceProvider.GetRequiredService<IDbContextFactory<DevHubDbContext>>()));
         builder.Services.AddSingleton(serviceProvider => new RoleSnapshotStore(
@@ -281,6 +283,7 @@ internal static class Program
             serviceProvider.GetRequiredService<HostInfo>()));
         builder.Services.AddSingleton<IQueueQuerySource, QueueQuerySource>();
         builder.Services.AddSingleton<IResultQuerySource, ResultQuerySource>();
+        builder.Services.AddSingleton<IResultDecisionSource, ResultDecisionService>();
         builder.Services.AddSingleton<IToolDigestSource, ToolDigestSource>();
         builder.Services.AddSingleton<ILimitsSource, LimitsSource>();
         builder.Services.AddSingleton<IDispatchService, DispatchService>();

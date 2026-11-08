@@ -281,6 +281,16 @@ v2/v3 的 `attempt` 用量列保持原语义，v5 只做 `ALTER TABLE ADD COLUMN
 - 超时（`Execution:InputTimeoutHours`，默认 24）由每次 tick 的过期扫描置 `expired`，队列项失败为
   `INPUT_TIMEOUT`；任务文件内容变更时旧问题单自动取消，队列项记 `TASK_CHANGED`。
 
+**审批闸门（结果通过/驳回）**
+
+- `task.requiresApproval=true` 时，即便全局档位与任务档位都是 `auto`，结果也停在 `awaiting_review`；
+  任务级声明收紧后不能被全局 `auto` 绕过。
+- 待审结果用 `result_list` 查看，`result_approve` 置 `delivered`、`result_reject` 置 `failed`；
+  两者都会回写 `devhub://tasks` 的 `approvalState`（`pending/approved/rejected`）并写 `audit`。
+- 驳回额外写 `notice.kind='failure'`（`result-rejected:<resultId>`），通过不写通知。
+- 同向重复提交幂等（`decidedAt=null`）；反向提交返回 `RESULT_NOT_PENDING`，不覆盖既有终态。
+- 审批**不改任务文件**：任务清单仍由工作区维护，避免调度器改写用户文件。
+
 **B1 时间格式统一为 UTC + `Z`**
 
 - 旧：`2026-11-08T04:09:03.1234567+00:00`；新：`2026-11-08T04:09:03.1234567Z`。
@@ -348,11 +358,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -A
 
 ### 6.1 已真实验证
 
-- `dotnet build DevHubd.sln`：0 警告 0 错误；`dotnet test`：147/147 通过、0 跳过（此前的 5 项启动失败路径用例在停止守护进程、互斥体释放后真机跑通，见下一条）。
-- `node scripts/validate-plugin.mjs`（5 项 PASS，含 `roles/` 角色字段校验）、`node scripts/check-encoding.mjs`（187 个文件）、`node scripts/smoke-mcp.mjs`（真实握手 + `tools/list` + `tools/call` + `resources/read`）全部通过。
+- `dotnet build DevHubd.sln`：0 警告 0 错误；`dotnet test`：153/153 通过、0 跳过（此前的 5 项启动失败路径用例在停止守护进程、互斥体释放后真机跑通，见下一条）。
+- `node scripts/validate-plugin.mjs`（5 项 PASS，含 `roles/` 角色字段校验）、`node scripts/check-encoding.mjs`（193 个文件）、`node scripts/smoke-mcp.mjs`（真实握手 + `tools/list` + `tools/call` + `resources/read`）全部通过。
 - 角色声明与快照（2026-11-08，U7）：临时数据目录从零启动，日志为 `数据库就绪…（schema v5）`、`角色快照已同步：declared=3 added=3 updated=0 removed=0 unchanged=0`；经真实 MCP 握手调用 `scheduler_status` 返回 `roles[]` 三项（`implementer` maxParallel=2、`reviewer` 1、`triage` 1，`running` 均为 0）；`/health` 的 `tables` 含 `role_view`、`input_request`。声明非法路径由 `StartupExitCodeTests` 真机复跑：退出码 6 且日志含 `缺少必填字段`。
-- 任务模型与 `task_upsert`（2026-11-08，U8）：临时工作区经真实 MCP 调用 `task_upsert`（`role=reviewer`、`requiresApproval=true`、`source=conversation`）返回 `contentHash` 并落盘 `.devhub/tasks/T-900.json`；`scheduler_control(scan_now)` 后 `resources/read devhub://tasks` 显示该任务 `status=ready`、`roleId=reviewer`，队列项按 `reviewer` 入队（无 API key 时按既有语义失败为 `MISSING_API_KEY`）。当时 `tools/list` 已含 8 个工具（U9/U10 后为 12 个），冒烟通过。
+- 任务模型与 `task_upsert`（2026-11-08，U8）：临时工作区经真实 MCP 调用 `task_upsert`（`role=reviewer`、`requiresApproval=true`、`source=conversation`）返回 `contentHash` 并落盘 `.devhub/tasks/T-900.json`；`scheduler_control(scan_now)` 后 `resources/read devhub://tasks` 显示该任务 `status=ready`、`roleId=reviewer`，队列项按 `reviewer` 入队（无 API key 时按既有语义失败为 `MISSING_API_KEY`）。当时 `tools/list` 已含 8 个工具（U11 后为 14 个），冒烟通过。
 - 问题单回流（2026-11-08，U9/U10）：真实 MCP 握手后 `tools/list` 返回 12 个工具（新增 `input_request_list/get/answer/cancel`），`scheduler_status.host.schemaVersion=5`；真机调用 `input_request_list` 返回 `{"items":[]}`（空态不输出 `nextCursor`）。提问挂起、同题去重、任务变更取消、回答恢复（含相同答案 `duplicate` 与不同答案 `ANSWER_CONFLICT`）、超时置 `expired`、撤销终止队列项由 `InputRequestTests` 与 `P2ExecutionTests` 覆盖。
+- 审批闸门（2026-11-08，U11）：真实 MCP 握手 `tools/list` 返回 14 个工具（新增 `result_approve` / `result_reject`）；`devhub://tasks` 每个条目均含 `approvalState`，当前真实数据全部为 `none`。真机调用 `result_approve` 传入不存在的 id 返回 `isError=true`、`code=UNKNOWN_RESULT`、`retryable=false`，错误信封与契约一致。通过→`delivered`/`approved`、驳回→`failed`/`rejected` 与通知、同向幂等（`duplicate`）、反向 `RESULT_NOT_PENDING`、`requiresApproval` 在 `auto` 档位下仍待审，由 `ResultDecisionTests`（5 项）与 `P2ExecutionTests` 覆盖。
 - schema 升级：已有 V1 库启动后 `user_version` 由 1 升到 2（新增 `attempt.usage_estimated`），`scheduler_status.host.schemaVersion=2`。2026-11-08 增补：v3 新增 `attempt.usage_available`、`attempt.rounds_exhausted`；v4 回填旧行 `usage_available`（token 非空即标 1，token 为 `NULL` 保持 0）。真实数据目录启动日志为 `数据库就绪…（schema v4）`，冒烟返回 `schema=v4`。
 - v2 → v4 迁移安全核对（2026-11-08，**真实 v2 库副本** `%TEMP%\devhub-migrate-check\devhub.db`，先 `VACUUM INTO` 出干净副本，全程只动副本）：迁移前 `user_version=2`、`integrity_check=ok`、`foreign_key_violations=0`；各表行数 task_view=5、queue_item=5、attempt=6、result=5、notice=5、provider_state=2、scheduler_state=1、scope_lock=0、audit=1。迁移后 `MigrateAsync` 返回 4，行数逐表完全一致，既有主键 **missing=0**（9 张表全部），`integrity_check=ok`、外键无违规；旧行 `rounds_exhausted` 全为 0，`usage_available` 与 token 是否为空严格对应（6 条旧 attempt 中 4 条有 token 被标 1、2 条 token 为 `NULL` 保持 0）；重复迁移幂等返回 4。结论 `PASS`，不以“启动成功 + schema v4”替代行数与主键证据。
 - 真实 BYOK 回合复验（REAL-006，2026-11-08，当前代码 `Microsoft.Extensions.AI` 重构后）：provider `openai`（`https://api.deepseek.com` / `deepseek-flash`），队列项 `7ce12702856e45d49d1ea363fa8acf27`，`attempt=1`、`outcome=succeeded`、`toolCalls=2`、`promptTokens=3050`、`completionTokens=312`、`totalTokens=3362`、`usageEstimated=false`、`usageAvailable=true`、`roundsExhausted=false`；直接读 SQLite 的 `attempt` 行为 `input_tokens=3050, output_tokens=312, usage_available=1, rounds_exhausted=0`，与 `queue_get` 一致；结果为 `awaiting_review`（`resultId=aab6bf06aea94714accd80a789449521`），产物 `work/7ce1270…/out/summary-u5-byok.md`。

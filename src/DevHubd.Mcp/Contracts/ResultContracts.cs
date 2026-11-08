@@ -43,3 +43,11 @@ public sealed record ResultPageResult(IReadOnlyList<ResultSummary> Items, string
 /// <summary>结果确认（ack）的返回。</summary>
 /// <param name="Acknowledged">本次实际标记为已读的条数。</param>
 public sealed record ResultAckResult(int Acknowledged);
+
+/// <summary>审批结果（<c>result_approve</c> / <c>result_reject</c> 共用）。</summary>
+/// <param name="ResultId">结果 id。</param>
+/// <param name="Outcome">决定后的终态：<c>delivered</c> / <c>failed</c>。</param>
+/// <param name="TaskId">任务 id。</param>
+/// <param name="DecidedAt">本次决定时间；幂等重复提交时为 null。</param>
+public sealed record ResultDecisionResult(string ResultId, string Outcome, string TaskId, string? DecidedAt);
+

@@ -87,6 +87,7 @@ public sealed class TaskScanner
                 {
                     WorkspaceId = workspace.Id,
                     Id = document.Id,
+                    ApprovalState = "none",
                 };
                 db.TaskViews.Add(row);
                 rowsById[document.Id] = row;

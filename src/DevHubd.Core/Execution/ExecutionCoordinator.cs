@@ -321,6 +321,13 @@ public sealed class ExecutionCoordinator
                 now,
                 cancellationToken).ConfigureAwait(false);
 
+            await _store.SetApprovalStateAsync(
+                item.WorkspaceId,
+                item.TaskId,
+                outcome.DeliveryOutcome == "awaiting_review" ? "pending" : "none",
+                now,
+                cancellationToken).ConfigureAwait(false);
+
             await _store.InsertNoticeAsync(
                 $"result:{item.Id}:{outcome.DeliveryOutcome}:{item.Attempt}",
                 "result",

@@ -280,6 +280,33 @@ public sealed class ExecutionStore
         return id;
     }
 
+    /// <summary>
+    /// 回写任务的审批状态（<c>none/pending/approved/rejected</c>）。
+    /// 只更新既有 <c>task_view</c> 行；任务文件已删除时静默跳过，不在这里创建行。
+    /// </summary>
+    /// <param name="workspaceId">工作区 id。</param>
+    /// <param name="taskId">任务 id。</param>
+    /// <param name="state">目标审批状态。</param>
+    /// <param name="now">时间戳。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    public async Task SetApprovalStateAsync(
+        string workspaceId,
+        string taskId,
+        string state,
+        string now,
+        CancellationToken cancellationToken = default)
+    {
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        await db.TaskViews
+            .Where(task => task.WorkspaceId == workspaceId && task.Id == taskId)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(task => task.ApprovalState, state)
+                    .SetProperty(task => task.UpdatedAt, now),
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
     /// <summary>写入一条通知；dedupe_key 冲突时静默跳过（同一状态进入只提醒一次）。</summary>
     /// <param name="dedupeKey">去重键：kind:subject:state:attempt。</param>
     /// <param name="kind">result / failure / breaker / auth / provider。</param>

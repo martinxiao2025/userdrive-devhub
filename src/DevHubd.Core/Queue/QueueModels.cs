@@ -71,6 +71,14 @@ public sealed record ClaimedQueueItem(QueueItem Item, string AttemptId);
 public sealed record TaskRow(string Id, string Title, string Status, string ContentHash, int Priority);
 
 /// <summary>任务物化视图条目（只读资源 <c>devhub://tasks</c> 使用）。</summary>
+/// <param name="WorkspaceId">工作区 id。</param>
+/// <param name="Id">任务 id。</param>
+/// <param name="Title">标题。</param>
+/// <param name="Status">ready / blocked / done / cancelled / missing。</param>
+/// <param name="Priority">优先级。</param>
+/// <param name="RoleId">角色 id。</param>
+/// <param name="SeenAt">扫描时间。</param>
+/// <param name="ApprovalState">none / pending / approved / rejected（U11）。</param>
 public sealed record TaskListItem(
     string WorkspaceId,
     string Id,
@@ -78,5 +86,6 @@ public sealed record TaskListItem(
     string Status,
     int Priority,
     string RoleId,
-    string SeenAt);
+    string SeenAt,
+    string ApprovalState);
 

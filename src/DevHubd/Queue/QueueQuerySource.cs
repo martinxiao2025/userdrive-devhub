@@ -79,7 +79,8 @@ public sealed class QueueQuerySource : IQueueQuerySource
                 item.Status,
                 item.Priority,
                 item.RoleId,
-                UtcTime.Normalize(item.SeenAt)!))
+                UtcTime.Normalize(item.SeenAt)!,
+                item.ApprovalState))
             .ToArray();
     }
 

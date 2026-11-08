@@ -301,11 +301,12 @@ public sealed class TurnRunner
     }
 
     /// <summary>
-    /// 计算实际交付档位：运行时档位为 <c>auto</c> 且任务声明 <c>auto</c> 才交付；任务可收紧但不可放宽。
-    /// 运行时档位来自 <see cref="EffectiveDeliveryMode"/>，与 <c>scheduler_state.mode</c> 保持一致。
+    /// 解析交付档位：任务显式 <c>requiresApproval</c>、全局档位或任务档位任一不是 <c>auto</c> 时进入待审。
+    /// 任务级声明优先于全局档位，避免全局 auto 绕过任务自带的人工闸门。
     /// </summary>
     /// <param name="task">任务文档。</param>
     private string ResolveDeliveryOutcome(TaskDocument task) =>
+        !task.RequiresApproval &&
         string.Equals(_deliveryMode.Value, "auto", StringComparison.Ordinal) &&
         string.Equals(task.Delivery, "auto", StringComparison.Ordinal)
             ? "delivered"

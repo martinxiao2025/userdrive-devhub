@@ -222,6 +222,32 @@ public sealed class P2ExecutionTests : IDisposable
         Assert.Equal("awaiting_review", await ScalarStringAsync("SELECT outcome FROM result;", ct));
     }
 
+    /// <summary>M1c：任务显式 <c>requiresApproval=true</c> 时，即便全局与任务档位都是 auto 也必须待审。</summary>
+    [Fact]
+    public async Task Pump_TaskRequiresApproval_KeepsAwaitingReviewInAutoModeAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "需要审批", "ready", 10, delivery: "auto", requiresApproval: true);
+        await PrepareQueueAsync(ct);
+
+        var fake = new FakeModelClient(
+            "openai",
+            (_, _, _) => Task.FromResult(TurnResult.Done("已完成。", 0, new TokenUsage(1, 1, false), Array.Empty<string>())));
+
+        var coordinator = CreateCoordinator(
+            fake,
+            new ExecutionOptions { DeliveryMode = "auto" },
+            deliveryMode: new EffectiveDeliveryMode("auto"));
+
+        await coordinator.PumpAsync(ct);
+        await WaitUntilAsync(async () => await CountAsync("SELECT COUNT(*) FROM result;", ct) == 1, ct);
+
+        Assert.Equal("awaiting_review", await ScalarStringAsync("SELECT outcome FROM result;", ct));
+        Assert.Equal("pending", await ScalarStringAsync("SELECT approval_state FROM task_view WHERE id = 'T-001';", ct));
+    }
+
     /// <summary>
     /// 验收 2：鉴权失败按 provider 隔离——openai 进入 auth + open，vscode 状态不受影响；
     /// 且资源类失败不消耗 attempt。
@@ -559,7 +585,8 @@ public sealed class P2ExecutionTests : IDisposable
         string title,
         string status,
         int priority,
-        string delivery = "review")
+        string delivery = "review",
+        bool requiresApproval = false)
     {
         var payload = new
         {
@@ -568,6 +595,7 @@ public sealed class P2ExecutionTests : IDisposable
             status,
             priority,
             delivery,
+            requiresApproval,
             writeScope = Array.Empty<string>(),
             prompt = "执行该任务",
         };

@@ -94,4 +94,10 @@ public static class DevHubErrorCodes
 
     /// <summary>已回答的问题单收到不同答案，拒绝覆盖。</summary>
     public const string AnswerConflict = "ANSWER_CONFLICT";
+
+    /// <summary>结果不存在。</summary>
+    public const string UnknownResult = "UNKNOWN_RESULT";
+
+    /// <summary>结果不处于待审批状态，不能通过或驳回。</summary>
+    public const string ResultNotPending = "RESULT_NOT_PENDING";
 }

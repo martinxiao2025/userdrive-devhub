@@ -29,6 +29,14 @@ public interface IQueueQuerySource
 }
 
 /// <summary>任务物化视图条目（只读资源 <c>devhub://tasks</c>）。</summary>
+/// <param name="WorkspaceId">工作区 id。</param>
+/// <param name="TaskId">任务 id。</param>
+/// <param name="Title">标题。</param>
+/// <param name="Status">ready / blocked / done / cancelled / missing。</param>
+/// <param name="Priority">优先级。</param>
+/// <param name="RoleId">角色 id。</param>
+/// <param name="SeenAt">扫描时间。</param>
+/// <param name="ApprovalState">none / pending / approved / rejected。</param>
 public sealed record TaskListItemResult(
     string WorkspaceId,
     string TaskId,
@@ -36,7 +44,8 @@ public sealed record TaskListItemResult(
     string Status,
     int Priority,
     string RoleId,
-    string SeenAt);
+    string SeenAt,
+    string ApprovalState);
 
 /// <summary>手动派发结果状态。</summary>
 public enum DispatchStatus
