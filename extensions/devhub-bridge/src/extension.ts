@@ -24,6 +24,8 @@ interface TurnRecord {
   toolCalls: number;
   inputTokens?: number;
   outputTokens?: number;
+  /** provider 表示数值来自 vscode.lm 的真实 usage；none 表示拿不到，已如实留空。 */
+  usageSource?: 'provider' | 'none';
   filesChanged: string[];
   errorKind?: string;
   errorCode?: string;
@@ -142,15 +144,13 @@ async function startBridge(context: vscode.ExtensionContext): Promise<void> {
     return;
   }
 
-  const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
-  if (models.length === 0) {
-    void vscode.window.showWarningMessage('DevHub：没有可用的 vscode.lm 模型，回合桥未启动。');
+  const model = await selectTargetModel();
+  if (!model) {
     return;
   }
 
   bridgeToken = crypto.randomBytes(32).toString('hex');
   const token = bridgeToken;
-  const model = models[0];
 
   const server = http.createServer((request, response) => {
     void handleRequest(request, response, token, model);
@@ -168,9 +168,91 @@ async function startBridge(context: vscode.ExtensionContext): Promise<void> {
 
   bridgeServer = server;
   const port = (server.address() as AddressInfo).port;
-  writeDiscoveryFile(port, token, model.name);
+  writeDiscoveryFile(port, token, model);
   context.subscriptions.push({ dispose: () => void stopBridge() });
-  void vscode.window.showInformationMessage(`DevHub 回合桥已启动（端口 ${port}，模型 ${model.name}）。`);
+  void vscode.window.showInformationMessage(
+    `DevHub 回合桥已启动（端口 ${port}，模型 ${model.name} / ${model.id}）。`,
+  );
+}
+
+/** 目标模型 id：优先精确匹配该值。 */
+const TARGET_MODEL_ID = 'deepseek-flash';
+
+/** 目标模型显示名：id / family 都匹配不上时的最后兜底。 */
+const TARGET_MODEL_NAME = 'DeepSeek V4.1 Flash';
+
+/** 模型的可读描述（用于失败时输出完整清单）。 */
+interface ModelDescription {
+  id: string;
+  family: string;
+  name: string;
+  vendor: string;
+}
+
+/**
+ * 按 id → family → name 的顺序选择目标模型。
+ * 找不到目标时不回退到其它模型，写入可用模型清单并提示用户。
+ */
+async function selectTargetModel(): Promise<vscode.LanguageModelChat | undefined> {
+  let models: vscode.LanguageModelChat[];
+  try {
+    // 不限定 vendor：第三方 provider 注册的模型也能被纳入清单。
+    models = await vscode.lm.selectChatModels({});
+  } catch (error) {
+    writeModelDiagnostics([], `selectChatModels 失败：${(error as Error).message}`);
+    void vscode.window.showErrorMessage(`DevHub：读取 vscode.lm 模型失败（${(error as Error).message}）。`);
+    return undefined;
+  }
+
+  const chosen =
+    models.find((candidate) => candidate.id === TARGET_MODEL_ID) ??
+    models.find((candidate) => candidate.family === TARGET_MODEL_ID) ??
+    models.find((candidate) => candidate.name === TARGET_MODEL_NAME);
+
+  if (chosen) {
+    return chosen;
+  }
+
+  const available = models.map(describeModel);
+  writeModelDiagnostics(available, `未找到目标模型 ${TARGET_MODEL_ID} / ${TARGET_MODEL_NAME}`);
+  const listing =
+    available.length === 0
+      ? '（没有任何可用模型）'
+      : available.map((item) => `${item.id}｜${item.family}｜${item.name}｜${item.vendor}`).join('；');
+  void vscode.window.showErrorMessage(
+    `DevHub：未找到 ${TARGET_MODEL_NAME}（id=${TARGET_MODEL_ID}），回合桥未启动。可用模型：${listing}`,
+  );
+  return undefined;
+}
+
+/** 把 vscode.lm 模型转成可输出的描述。 */
+function describeModel(model: vscode.LanguageModelChat): ModelDescription {
+  return { id: model.id, family: model.family, name: model.name, vendor: model.vendor };
+}
+
+/**
+ * 选不到模型时写出诊断文件，便于在不看扩展宿主日志的情况下定位。
+ * @param available 实际可用模型清单
+ * @param reason 失败原因
+ */
+function writeModelDiagnostics(available: ModelDescription[], reason: string): void {
+  try {
+    const directory = dataDirectory();
+    fs.mkdirSync(directory, { recursive: true });
+    const target = path.join(directory, 'lm-bridge.error.json');
+    const temporary = `${target}.${process.pid}.tmp`;
+    const payload = {
+      reason,
+      targetId: TARGET_MODEL_ID,
+      targetName: TARGET_MODEL_NAME,
+      availableModels: available,
+      at: new Date().toISOString(),
+    };
+    fs.writeFileSync(temporary, JSON.stringify(payload, null, 2), { encoding: 'utf8' });
+    fs.renameSync(temporary, target);
+  } catch {
+    // 诊断文件写失败不影响主流程。
+  }
 }
 
 /**
@@ -202,9 +284,9 @@ async function stopBridge(): Promise<void> {
  * 原子写出发现文件。
  * @param port 监听端口
  * @param token 访问令牌
- * @param model 模型名
+ * @param model 选中的模型
  */
-function writeDiscoveryFile(port: number, token: string, model: string): void {
+function writeDiscoveryFile(port: number, token: string, model: vscode.LanguageModelChat): void {
   const directory = dataDirectory();
   fs.mkdirSync(directory, { recursive: true });
   const target = path.join(directory, 'lm-bridge.json');
@@ -213,7 +295,10 @@ function writeDiscoveryFile(port: number, token: string, model: string): void {
     pid: process.pid,
     port,
     token,
-    model,
+    model: model.name,
+    modelId: model.id,
+    modelFamily: model.family,
+    modelVendor: model.vendor,
     startedAt: new Date().toISOString(),
   };
   fs.writeFileSync(temporary, JSON.stringify(payload), { encoding: 'utf8' });
@@ -317,11 +402,29 @@ function serializeTurn(record: TurnRecord): Record<string, unknown> {
     toolCalls: record.toolCalls,
     inputTokens: record.inputTokens,
     outputTokens: record.outputTokens,
+    usageSource: record.usageSource,
     filesChanged: record.filesChanged,
     errorKind: record.errorKind,
     errorCode: record.errorCode,
     errorMessage: record.errorMessage,
   };
+}
+
+/**
+ * 读取 vscode.lm 响应上的 usage。当前 d.ts（1.95）未声明该字段，
+ * 用运行时探测兼容新版本：存在且字段完整才返回，否则返回 undefined。
+ * @param response 模型响应
+ */
+function readResponseUsage(
+  response: vscode.LanguageModelChatResponse,
+): { promptTokens: number; completionTokens: number } | undefined {
+  const usage = (response as unknown as {
+    usage?: { promptTokens?: number; completionTokens?: number };
+  }).usage;
+  if (!usage || typeof usage.promptTokens !== 'number' || typeof usage.completionTokens !== 'number') {
+    return undefined;
+  }
+  return { promptTokens: usage.promptTokens, completionTokens: usage.completionTokens };
 }
 
 /**
@@ -339,7 +442,11 @@ async function runTurn(record: TurnRecord, request: TurnRequest, model: vscode.L
   ];
 
   const deadline = Date.now() + Math.max(1, request.timeoutSeconds) * 1000;
-  let promptChars = messages[0].content.length;
+  // 多轮请求各自带回 usage，需要跨轮累加；任意一轮缺失则整回合按"拿不到"处理。
+  let promptTokens = 0;
+  let completionTokens = 0;
+  let usageSeen = false;
+  let usageMissing = false;
 
   try {
     for (let round = 0; round < Math.max(1, request.maxRounds); round++) {
@@ -364,10 +471,25 @@ async function runTurn(record: TurnRecord, request: TurnRequest, model: vscode.L
         }
       }
 
+      const roundUsage = readResponseUsage(response);
+      if (roundUsage) {
+        promptTokens += roundUsage.promptTokens;
+        completionTokens += roundUsage.completionTokens;
+        usageSeen = true;
+      } else {
+        usageMissing = true;
+      }
+
       if (calls.length === 0) {
         record.text = text;
-        record.inputTokens = Math.ceil(promptChars / 4);
-        record.outputTokens = Math.ceil(text.length / 4);
+        if (usageSeen && !usageMissing) {
+          record.inputTokens = promptTokens;
+          record.outputTokens = completionTokens;
+          record.usageSource = 'provider';
+        } else {
+          // 拿不到真实 usage 时如实留空，不用字符数估算冒充 token。
+          record.usageSource = 'none';
+        }
         record.state = 'done';
         record.resolveFinished();
         return;
@@ -393,7 +515,6 @@ async function runTurn(record: TurnRecord, request: TurnRequest, model: vscode.L
       // 工具调用由助手发出，工具结果必须以用户消息回填（LanguageModelChatMessage.Assistant 不接受 ToolResultPart）。
       messages.push(vscode.LanguageModelChatMessage.Assistant(calls));
       messages.push(vscode.LanguageModelChatMessage.User(results));
-      promptChars += results.length * 200;
     }
 
     fail(record, 'budget_exceeded', 'MAX_TOOL_ROUNDS', '达到工具轮数上限');

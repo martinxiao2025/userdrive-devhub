@@ -174,6 +174,9 @@ node scripts/smoke-mcp.mjs
 - **定时任务的 provider 由 `Execution:ScheduledProvider` 决定**：扫描入队时读取该配置（默认 `openai`），写入队列项的 `preferred_provider`。只接受 `openai` / `vscode`，非法值回退 `openai` 并在启动日志记 Warning。修改后需重启守护进程，且只影响**之后新入队**的队列项；已在队列中的项保留入队时的 provider。
 - **手动 `dispatch_now`**：`provider=auto` 时按 `openai` → `vscode` 选第一个 `ready` 且熔断关闭的；两者都不可用时回退 `openai` 入队；显式传 `openai` / `vscode` 时若该 provider 不可用会直接拒绝（`ProviderUnavailable`），不会自动换通道。手动派发的 `provider` 只作用于该次入队的队列项，**不会改变** `Execution:ScheduledProvider`。
 - **`vscode` 就绪条件**：VS Code 已安装并激活 `devhub-bridge` 扩展，且 `vscode.lm` 有可用模型（例如已登录 GitHub Copilot）→ 扩展写出 `lm-bridge.json` → 宿主 `GET /health` 成功且返回 pid 与发现文件 pid 一致。任一环节不满足即为 `down`。
+- **启用桥**：VS Code 用户设置里 `"devhub.bridge.enabled": true`（扩展默认关闭）。修改后重载扩展宿主即可写出 `lm-bridge.json`；已启动的桥不会因再次改配置而重启，需要重载窗口（或让扩展宿主重启）。
+- **模型选择（不静默回退）**：扩展按 **id → family → name** 顺序匹配目标模型：先找 `id = deepseek-flash`，再找 `family = deepseek-flash`，最后找 `name = DeepSeek V4.1 Flash`。都匹配不到时**不会**回退到第一个可用模型，而是弹出错误提示，并把实际可用模型的 `id｜family｜name｜vendor` 清单写到数据目录的 `lm-bridge.error.json`，方便定位。
+- **发现文件字段**：`lm-bridge.json` 除 `pid/port/token/model` 外，还带 `modelId` / `modelFamily` / `modelVendor`，`/health` 返回的 `model` 与发现文件一致。
 
 ### 2.5 日志
 
@@ -194,6 +197,8 @@ node scripts/smoke-mcp.mjs
 | provider 每轮都返回 `usage` | `input_tokens` = 各轮 `prompt_tokens` 之和，`output_tokens` = 各轮 `completion_tokens` 之和，`usage_estimated=0` |
 | 任意一轮缺少 `usage` | 整回合记 `NULL`（部分轮次之和不能代表真实总量），查询返回 `promptTokens/completionTokens/totalTokens = null` |
 | 完全没有 `usage` | 同上记 `NULL`，不估算成真实值 |
+
+- **通道差异**：BYOK（`openai`）非流式响应带 `usage`，落真实 token；`vscode.lm` 桥在 VS Code 1.145 的 `LanguageModelChatResponse` 上**取不到 usage**（扩展运行时探测不到 `usage` 字段），因此该通道的 attempt 三列均为 `NULL`、`usageEstimated=0`，查询也会明确返回 `null`——不用字符数估算冒充 token。需要成本核算时以 BYOK 通道的数值为准。
 
 - **多轮累加**：工具调用循环会产生多次请求，每轮响应各带一份 `usage`，落库的是整回合累加值，不是最后一轮。
 - **估算标记**：`usage_estimated=1` 表示该数值是近似估算、**不是真实 token**；当前 BYOK 非流式路径只写入 provider 原值（恒为 `0`）。若后续接入不返回 `usage` 的通道，必须显式置 `1` 并在字段说明中标注，不能混入真实值统计。
@@ -294,6 +299,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -A
 - VSIX 安装到 VS Code Stable：`code --install-extension` 成功，扩展宿主日志出现 `_doActivateExtension userdrive.devhub-bridge, activationEvent: 'onStartupFinished'`，无报错。
 - 通知闭环：向 `notice` 表造 3 条新通知，VS Code 通知中心各弹一次且标题不重复；ack 后数据库 `acked_at` 写入、`globalState["devhub.noticeSeq"]` 从 0 推进到 3；随后用 `sinceSeq=0` 查询不再返回已确认项。
 - 守护进程侧 `/health` + pid 校验：发现文件 pid 与桥 pid 一致 → `providers = vscode:ready`；把发现文件 pid 改为 30929 → `provider=vscode state=down detail=发现文件 pid=30929 与桥实际 pid=30928 不一致，判定为残留文件`。
+- 真实 `vscode.lm` 桥（2026-11-08）：VS Code Stable 1.145.2，`chat.defaultModel=deepseek-flash`，扩展按 **id → family → name** 选中 `DeepSeek V4.1 Flash`（`id=deepseek-flash`、`family=deepseek`、`vendor=deepseek`），未发生静默回退；`lm-bridge.json` 含 `pid=50432`、`port=49210`、`model=DeepSeek V4.1 Flash`、`modelId/modelFamily/modelVendor`，`/health` 返回 `{"ok":true,"pid":50432,"model":"DeepSeek V4.1 Flash"}` 与发现文件一致，pid 存活校验通过，重启守护进程后 `scheduler_status.providers` 中 `vscode` 为 `ready`。
+- 真实 `vscode.lm` 回合（REAL-005，2026-11-08）：provider `vscode`，耗时 `2.95s`，工具调用 2 次（3 轮：2 次工具调用 + 1 次最终回答，轮次由工具序列推导，扩展未单独上报轮数），改动 1 个文件（新增 `out/summary-lm.md`），结果为 `awaiting_review`，通知与 ack 闭环走通（`{"acknowledged":1}`，unread 4→3）。该通道**取不到 usage**：扩展运行时探测 `LanguageModelChatResponse.usage` 为 `undefined`，attempt 三列为 `NULL`、`usage_estimated=0`，`queue_get`/`result_list` 查询返回 `null`，未做任何估算。
 
 ### 6.2 仅单测覆盖
 
@@ -303,5 +310,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -A
 
 ### 6.3 缺外部条件（未验证）
 
-- **真实 `vscode.lm` 回合桥**：扩展已安装并激活，但本机 VS Code 未登录 GitHub Copilot，`vscode.lm` 无可用模型，因此未写出 `lm-bridge.json`；上文的 `/health` + pid 校验是用本地桩端点验证守护进程侧逻辑，不代表真实桥可用。登录 Copilot 并重载窗口后可复测。
 - **插件包安装**：`Chat: Install Plugin from Source` 无法通过 CLI 自动化，未在真机执行；`plugin/` 已通过 `validate-plugin.mjs` 静态校验。

@@ -15,7 +15,7 @@ namespace DevHubd.Tests;
 /// <c>vscode</c> 回合桥的协议级验收：发现文件 + <c>/health</c> 的 pid 校验、
 /// 回合 <c>POST /turns</c> → 轮询终态、桥关闭时的错误分类。
 /// 真实的 VS Code 扩展桥无法在无 GUI 环境中启动，本测试用最小 TCP 服务模拟协议；
-/// 真实扩展联调标注为"未验证"。
+/// 真实扩展联调在 VS Code Stable 1.145.2 上单独验证（见 README §6.1）。
 /// </summary>
 public sealed class VsCodeLmBridgeTests : IAsyncLifetime
 {
@@ -118,6 +118,26 @@ public sealed class VsCodeLmBridgeTests : IAsyncLifetime
         Assert.Equal(2, result.ToolCalls);
         Assert.Equal(new[] { "a.txt" }, result.FilesChanged);
         Assert.Equal(11, result.Usage!.InputTokens);
+        Assert.False(result.Usage.Estimated);
+    }
+
+    /// <summary>
+    /// 桥未标注 <c>usageSource=provider</c>（扩展拿不到真实 usage）时，
+    /// 即使响应里带了 token 数字也不采信，Usage 为 null。
+    /// </summary>
+    [Fact]
+    public async Task RunTurn_WithoutProviderUsage_LeavesUsageNullAsync()
+    {
+        await using var bridge = await FakeBridge.StartAsync(FakeBridge.CorrectPid, usageSource: "none");
+        WriteDiscovery(pid: FakeBridge.CorrectPid, bridge.Port);
+
+        var result = await CreateClient().RunTurnAsync(
+            CreateRequest(),
+            new NoopDispatcher(),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(TurnState.Done, result.State);
+        Assert.Null(result.Usage);
     }
 
     /// <summary>写出发现文件（camelCase，与扩展约定一致）。</summary>
@@ -195,10 +215,11 @@ public sealed class VsCodeLmBridgeTests : IAsyncLifetime
         private readonly CancellationTokenSource _stop = new();
         private readonly Task _loop;
 
-        private FakeBridge(TcpListener listener, int pid)
+        private FakeBridge(TcpListener listener, int pid, string usageSource)
         {
             _listener = listener;
             Pid = pid;
+            UsageSource = usageSource;
             Port = ((IPEndPoint)listener.LocalEndpoint).Port;
             _loop = AcceptLoopAsync();
         }
@@ -206,13 +227,17 @@ public sealed class VsCodeLmBridgeTests : IAsyncLifetime
         /// <summary>监听端口。</summary>
         public int Port { get; }
 
+        /// <summary>回合响应里的 usage 来源标记。</summary>
+        public string UsageSource { get; }
+
         /// <summary>启动桥。</summary>
         /// <param name="pid">桥自称的 pid。</param>
-        public static Task<FakeBridge> StartAsync(int pid)
+        /// <param name="usageSource">回合响应的 <c>usageSource</c>；默认 <c>provider</c>。</param>
+        public static Task<FakeBridge> StartAsync(int pid, string usageSource = "provider")
         {
             var listener = new TcpListener(IPAddress.Loopback, 0);
             listener.Start();
-            return Task.FromResult(new FakeBridge(listener, pid));
+            return Task.FromResult(new FakeBridge(listener, pid, usageSource));
         }
 
         /// <summary>桥自称的 pid。</summary>
@@ -291,6 +316,7 @@ public sealed class VsCodeLmBridgeTests : IAsyncLifetime
                         toolCalls = 2,
                         inputTokens = 11,
                         outputTokens = 7,
+                        usageSource = UsageSource,
                         filesChanged = new[] { "a.txt" },
                     })),
                 ("DELETE", var p) when p.StartsWith("/turns/", StringComparison.Ordinal) => (200, "{}"),

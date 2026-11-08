@@ -215,12 +215,17 @@ public sealed class VsCodeLmBridgeClient : IModelClient
             switch (status.State)
             {
                 case "done":
+                    // 只有扩展明确标注 usageSource=provider 才采信 token；
+                    // 扩展拿不到真实 usage 时会留空并标 none，绝不把估算值当真实 token。
+                    var usage = string.Equals(status.UsageSource, "provider", StringComparison.Ordinal) &&
+                                (status.InputTokens is not null || status.OutputTokens is not null)
+                        ? new TokenUsage(status.InputTokens ?? 0, status.OutputTokens ?? 0, Estimated: false)
+                        : null;
+
                     return TurnResult.Done(
                         status.Text ?? string.Empty,
                         status.ToolCalls,
-                        status.InputTokens is null && status.OutputTokens is null
-                            ? null
-                            : new TokenUsage(status.InputTokens ?? 0, status.OutputTokens ?? 0, Estimated: true),
+                        usage,
                         status.FilesChanged ?? Array.Empty<string>());
 
                 case "failed":
@@ -342,8 +347,9 @@ public sealed class VsCodeLmBridgeClient : IModelClient
     /// <param name="State">running / done / failed / cancelled。</param>
     /// <param name="Text">模型文本。</param>
     /// <param name="ToolCalls">工具调用次数。</param>
-    /// <param name="InputTokens">输入 token（估算）。</param>
-    /// <param name="OutputTokens">输出 token（估算）。</param>
+    /// <param name="InputTokens">输入 token；扩展拿不到真实 usage 时为 null。</param>
+    /// <param name="OutputTokens">输出 token；扩展拿不到真实 usage 时为 null。</param>
+    /// <param name="UsageSource">provider 表示真实 usage；none 表示未获得。</param>
     /// <param name="ErrorKind">错误分类。</param>
     /// <param name="ErrorCode">错误码。</param>
     /// <param name="ErrorMessage">错误说明。</param>
@@ -354,6 +360,7 @@ public sealed class VsCodeLmBridgeClient : IModelClient
         int ToolCalls,
         int? InputTokens,
         int? OutputTokens,
+        string? UsageSource,
         string? ErrorKind,
         string? ErrorCode,
         string? ErrorMessage,
