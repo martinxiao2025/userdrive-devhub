@@ -118,7 +118,8 @@ public sealed class DispatchService : IDispatchService
             _ => DispatchStatus.Enqueued,
         };
 
-        return new DispatchOutcome(status, workspace.Id, result.QueueItemId, resolved, null);
+        // deduped / active_exists 时返回已存在队列项的真实 provider，避免把复用的队列项报成本次解析的 provider。
+        return new DispatchOutcome(status, workspace.Id, result.QueueItemId, result.Provider ?? resolved, null);
     }
 
     /// <summary>

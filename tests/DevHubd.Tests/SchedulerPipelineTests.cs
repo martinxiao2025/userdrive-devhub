@@ -190,6 +190,32 @@ public sealed class SchedulerPipelineTests : IDisposable
         Assert.Equal(1, await CountQueueItemsAsync(ct));
     }
 
+    /// <summary>
+    /// 命中已存在的队列项时，返回该队列项的真实 provider，而不是本次请求解析出的 provider；
+    /// 否则 Chat 侧会把"复用 vscode 队列项"误读成"新派给了 openai"。
+    /// </summary>
+    [Fact]
+    public async Task DispatchNow_WhenAlreadyEnqueued_ReturnsExistingProviderAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "唯一任务", "ready", 10);
+        await new TaskScanner(_factory).ScanAsync(new WorkspaceDefinition("alpha", root, true), ct);
+
+        var task = await _queue.GetTaskAsync("alpha", "T-001", ct);
+        var enqueued = await _queue.EnqueueTaskAsync("alpha", task!, "vscode", dryRun: false, ct);
+        Assert.Equal("vscode", enqueued.Provider);
+
+        var dispatcher = new DispatchService(_registry, _queue, _stateStore, new ProviderStateStore(_factory));
+        var outcome = await dispatcher.DispatchNowAsync("T-001", "alpha", "auto", dryRun: false, force: false, ct);
+
+        Assert.Equal(DispatchStatus.Deduped, outcome.Status);
+        Assert.Equal("vscode", outcome.Provider);
+        Assert.Equal(enqueued.QueueItemId, outcome.QueueItemId);
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+    }
+
     /// <summary>任务不是 ready 时拒绝派发。</summary>
     [Fact]
     public async Task DispatchNow_TaskNotReady_ReturnsTaskNotReadyAsync()

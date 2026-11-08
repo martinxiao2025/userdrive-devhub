@@ -69,6 +69,7 @@ public sealed class ResultQuerySource : IResultQuerySource
         record.Artifacts,
         record.CreatedAt,
         record.ReadAt,
+        record.ToolCalls,
         record.InputTokens,
         record.OutputTokens,
         record.InputTokens is null && record.OutputTokens is null

@@ -14,6 +14,7 @@ namespace DevHubd.Core.Results;
 /// <param name="Artifacts">产物相对路径。</param>
 /// <param name="CreatedAt">创建时间。</param>
 /// <param name="ReadAt">已读时间；null 表示未读。</param>
+/// <param name="ToolCalls">最近一次 attempt 的工具调用次数；未记录时为 null。</param>
 /// <param name="InputTokens">最近一次 attempt 的输入 token；未获得 usage 时为 null。</param>
 /// <param name="OutputTokens">最近一次 attempt 的输出 token；未获得 usage 时为 null。</param>
 /// <param name="UsageEstimated">true 表示 token 为估算值，不是 provider 返回的真实 token。</param>
@@ -27,6 +28,7 @@ public sealed record ResultRecord(
     IReadOnlyList<string> Artifacts,
     string CreatedAt,
     string? ReadAt,
+    int? ToolCalls,
     int? InputTokens,
     int? OutputTokens,
     bool UsageEstimated);
@@ -81,7 +83,7 @@ public sealed class ResultStore
 
         var sql = new System.Text.StringBuilder("""
             SELECT r.id, r.task_id, r.queue_item_id, r.provider, r.outcome, r.summary, r.artifacts, r.created_at, r.read_at,
-                   a.input_tokens, a.output_tokens, a.usage_estimated
+                   a.tool_calls, a.input_tokens, a.output_tokens, a.usage_estimated
             FROM result r
             LEFT JOIN attempt a ON a.id = (
                 SELECT id FROM attempt WHERE queue_item_id = r.queue_item_id ORDER BY attempt_no DESC LIMIT 1
@@ -211,7 +213,8 @@ public sealed class ResultStore
             reader.IsDBNull(8) ? null : reader.GetString(8),
             reader.IsDBNull(9) ? null : reader.GetInt32(9),
             reader.IsDBNull(10) ? null : reader.GetInt32(10),
-            !reader.IsDBNull(11) && reader.GetInt32(11) == 1);
+            reader.IsDBNull(11) ? null : reader.GetInt32(11),
+            !reader.IsDBNull(12) && reader.GetInt32(12) == 1);
     }
 
     /// <summary>生成下一页游标（base64url 编码的 createdAt/id）。</summary>

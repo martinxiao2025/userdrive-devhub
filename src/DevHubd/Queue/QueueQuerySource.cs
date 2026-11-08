@@ -107,6 +107,7 @@ public sealed class QueueQuerySource : IQueueQuerySource
         attempt.EndedAt,
         attempt.Outcome,
         attempt.ErrorCode,
+        attempt.ToolCalls,
         attempt.InputTokens,
         attempt.OutputTokens,
         attempt.InputTokens is null && attempt.OutputTokens is null

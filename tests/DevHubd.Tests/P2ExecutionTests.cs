@@ -104,13 +104,15 @@ public sealed class P2ExecutionTests : IDisposable
         Assert.Equal(10, attempt.InputTokens);
         Assert.Equal(5, attempt.OutputTokens);
         Assert.False(attempt.UsageEstimated);
+        Assert.Equal(0, attempt.ToolCalls);
 
-        // result_list 读侧同样要带上同一份用量。
+        // result_list 读侧同样要带上同一份用量与工具调用次数。
         var results = await new ResultStore(_factory).ListAsync(false, 10, null, ct);
         var listed = Assert.Single(results.Items);
         Assert.Equal(10, listed.InputTokens);
         Assert.Equal(5, listed.OutputTokens);
         Assert.False(listed.UsageEstimated);
+        Assert.Equal(0, listed.ToolCalls);
 
         var turnStart = turnLogger.Collector.GetSnapshot()
             .Single(record => record.Message.Contains("模型回合开始", StringComparison.Ordinal));

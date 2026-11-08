@@ -10,6 +10,7 @@ namespace DevHubd.Mcp.Contracts;
 /// <param name="Artifacts">产物相对路径。</param>
 /// <param name="CreatedAt">创建时间。</param>
 /// <param name="ReadAt">已读时间；null 表示未读。</param>
+/// <param name="ToolCalls">最近一次 attempt 的工具调用次数；未记录时为 null。</param>
 /// <param name="PromptTokens">最近一次 attempt 的输入 token；未获得 usage 时为 null。</param>
 /// <param name="CompletionTokens">最近一次 attempt 的输出 token；未获得 usage 时为 null。</param>
 /// <param name="TotalTokens">输入 + 输出；两者都为 null 时为 null。</param>
@@ -24,6 +25,7 @@ public sealed record ResultSummary(
     IReadOnlyList<string> Artifacts,
     string CreatedAt,
     string? ReadAt,
+    int? ToolCalls,
     int? PromptTokens,
     int? CompletionTokens,
     int? TotalTokens,

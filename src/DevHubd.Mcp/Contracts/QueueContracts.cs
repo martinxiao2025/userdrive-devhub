@@ -31,6 +31,7 @@ public sealed record AttemptSummary(
     string? EndedAt,
     string? Outcome,
     string? ErrorCode,
+    int? ToolCalls,
     int? PromptTokens,
     int? CompletionTokens,
     int? TotalTokens,

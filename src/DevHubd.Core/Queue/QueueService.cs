@@ -92,7 +92,7 @@ public sealed class QueueService
         {
             var dedupeKey = BuildDedupeKey(workspaceId, task.Id, task.ContentHash);
 
-            if (await HasActiveItemAsync(connection, transaction, workspaceId, task.Id, cancellationToken).ConfigureAwait(false))
+            if (await FindActiveItemAsync(connection, transaction, workspaceId, task.Id, cancellationToken).ConfigureAwait(false) is not null)
             {
                 skippedActive++;
                 continue;
@@ -154,17 +154,19 @@ public sealed class QueueService
         var existing = await FindByDedupeKeyAsync(connection, transaction, dedupeKey, cancellationToken).ConfigureAwait(false);
         if (existing is not null)
         {
-            return new ManualEnqueueResult(false, true, existing, "deduped");
+            // 返回已有队列项的真实 provider，而不是本次请求的 provider——否则 deduped 会误导调用方。
+            return new ManualEnqueueResult(false, true, existing.Id, "deduped", existing.Provider);
         }
 
-        if (await HasActiveItemAsync(connection, transaction, workspaceId, task.Id, cancellationToken).ConfigureAwait(false))
+        var active = await FindActiveItemAsync(connection, transaction, workspaceId, task.Id, cancellationToken).ConfigureAwait(false);
+        if (active is not null)
         {
-            return new ManualEnqueueResult(false, true, null, "active_exists");
+            return new ManualEnqueueResult(false, true, active.Id, "active_exists", active.Provider);
         }
 
         if (dryRun)
         {
-            return new ManualEnqueueResult(true, false, null, "would_enqueue");
+            return new ManualEnqueueResult(true, false, null, "would_enqueue", provider);
         }
 
         var id = Guid.NewGuid().ToString("N");
@@ -190,7 +192,7 @@ public sealed class QueueService
         }
 
         transaction.Commit();
-        return new ManualEnqueueResult(true, false, id, "pending");
+        return new ManualEnqueueResult(true, false, id, "pending", provider);
     }
 
     /// <summary>读取任务完整文档（从 <c>task_view.payload</c> 还原并复用同一套校验）。</summary>
@@ -606,8 +608,14 @@ public sealed class QueueService
     /// <summary>当前 UTC 时间（ISO-8601，固定 +00:00 偏移，保证字符串可直接比较）。</summary>
     private static string Now() => DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture);
 
-    /// <summary>同一任务是否已有未结束的队列项，避免内容变更后重复派发同一任务。</summary>
-    private static async Task<bool> HasActiveItemAsync(
+    /// <summary>同一任务已存在的未结束队列项（<c>pending</c>/<c>claimed</c>/<c>running</c>）。</summary>
+    /// <param name="Id">队列项 id。</param>
+    /// <param name="Provider">该队列项的首选 provider。</param>
+    private sealed record ExistingQueueItem(string Id, string Provider);
+
+    /// <summary>查找同一任务未结束的队列项，避免内容变更后重复派发同一任务。</summary>
+    /// <returns>已存在的队列项；没有则返回 null。</returns>
+    private static async Task<ExistingQueueItem?> FindActiveItemAsync(
         SqliteConnection connection,
         SqliteTransaction transaction,
         string workspaceId,
@@ -617,19 +625,19 @@ public sealed class QueueService
         using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
-            SELECT 1 FROM queue_item
+            SELECT id, preferred_provider FROM queue_item
             WHERE workspace_id = $workspace AND task_id = $task AND status IN ('pending','claimed','running')
             LIMIT 1;
             """;
         command.Parameters.AddWithValue("$workspace", workspaceId);
         command.Parameters.AddWithValue("$task", taskId);
 
-        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-        return result is not null;
+        return await ReadExistingAsync(command, cancellationToken).ConfigureAwait(false);
     }
 
-    /// <summary>按 dedupe_key 查已有队列项 id。</summary>
-    private static async Task<string?> FindByDedupeKeyAsync(
+    /// <summary>按 dedupe_key 查已有队列项。</summary>
+    /// <returns>命中的队列项；没有则返回 null。</returns>
+    private static async Task<ExistingQueueItem?> FindByDedupeKeyAsync(
         SqliteConnection connection,
         SqliteTransaction transaction,
         string dedupeKey,
@@ -637,10 +645,26 @@ public sealed class QueueService
     {
         using var command = connection.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = "SELECT id FROM queue_item WHERE dedupe_key = $key LIMIT 1;";
+        command.CommandText = "SELECT id, preferred_provider FROM queue_item WHERE dedupe_key = $key LIMIT 1;";
         command.Parameters.AddWithValue("$key", dedupeKey);
 
-        return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) as string;
+        return await ReadExistingAsync(command, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>读取"id + preferred_provider"两列的一行；无行返回 null。</summary>
+    /// <param name="command">已配置好 SQL 与参数的查询命令。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private static async Task<ExistingQueueItem?> ReadExistingAsync(
+        SqliteCommand command,
+        CancellationToken cancellationToken)
+    {
+        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            return null;
+        }
+
+        return new ExistingQueueItem(reader.GetString(0), reader.GetString(1));
     }
 
     /// <summary>插入队列项；dedupe_key 冲突时返回 false（幂等）。</summary>
