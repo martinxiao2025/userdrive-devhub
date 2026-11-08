@@ -361,6 +361,31 @@ public sealed class MigratorTests : IDisposable
         Assert.Equal(string.Empty, Convert.ToString(await command.ExecuteScalarAsync(ct)));
     }
 
+    /// <summary>
+    /// 第六轮 5：极简库谎报 user_version=6 且缺 rerun_pending 时，必须给出明确可操作的错误，
+    /// 而不是落到 SQLite "no such column"。
+    /// </summary>
+    [Fact]
+    public async Task Migrate_V7_WhenRerunPendingMissing_ThrowsClearErrorAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var factory = new SqliteConnectionFactory(Path.Combine(_directory, "devhub.db"));
+
+        using (var connection = await factory.OpenAsync(ct))
+        {
+            using var seed = connection.CreateCommand();
+            seed.CommandText = """
+                CREATE TABLE task_view (workspace_id TEXT, id TEXT);
+                PRAGMA user_version = 6;
+                """;
+            await seed.ExecuteNonQueryAsync(ct);
+        }
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => Migrator.MigrateAsync(factory, ct));
+        Assert.Contains("rerun_pending", exception.Message, StringComparison.Ordinal);
+    }
+
     /// <summary>已有 V1 库升级时必须逐级补 V2/V3/V4，不重建表，并保持 user_version 递增。</summary>
     [Fact]
     public async Task Migrate_FromV1_UpgradesToLatestAsync()

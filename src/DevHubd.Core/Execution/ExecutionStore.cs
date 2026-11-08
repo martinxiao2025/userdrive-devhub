@@ -163,6 +163,42 @@ public sealed class ExecutionStore
     }
 
     /// <summary>
+    /// 仅当队列项仍由指定执行者持有且处于 <c>claimed/running</c> 时置为 <c>succeeded</c>。
+    /// 条件更新是原子闸门：决策可能在上一次心跳成功后把该项置 <c>cancelled</c>，
+    /// 返回 false 时调用方必须丢弃回合结果，不能覆盖终态。
+    /// </summary>
+    /// <param name="queueItemId">队列项 id。</param>
+    /// <param name="ownerId">执行者标识（租约持有者）。</param>
+    /// <param name="now">时间戳。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    /// <returns>true 表示本次调用完成了终态迁移。</returns>
+    public async Task<bool> TrySetSucceededAsync(
+        string queueItemId,
+        string ownerId,
+        string now,
+        CancellationToken cancellationToken = default)
+    {
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var affected = await db.QueueItems
+            .Where(item =>
+                item.Id == queueItemId &&
+                item.LeaseOwner == ownerId &&
+                (item.Status == "claimed" || item.Status == "running"))
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(item => item.Status, "succeeded")
+                    .SetProperty(item => item.LeaseOwner, (string?)null)
+                    .SetProperty(item => item.LeaseExpiresAt, (string?)null)
+                    .SetProperty(item => item.LastErrorCode, (string?)null)
+                    .SetProperty(item => item.LastError, (string?)null)
+                    .SetProperty(item => item.UpdatedAt, now),
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        return affected == 1;
+    }
+
+    /// <summary>
     /// 把队列项放回 pending（可重试或资源类错误退避）。
     /// <c>attempt</c> 单调递增、不再回退：重试预算由
     /// <see cref="CountConsumingAttemptsAsync"/> 按"非 NEEDS_INPUT 回合数"口径单独判定。

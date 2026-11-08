@@ -632,6 +632,66 @@ public sealed class SchedulerPipelineTests : IDisposable
     }
 
     /// <summary>
+    /// 第六轮 4：取消挂起在 input 上的队列项时，必须同时清 hold 并关闭对应问题单，
+    /// 否则会留下无人认领的 open 问题单与残留 hold。
+    /// </summary>
+    [Fact]
+    public async Task Decide_WhenCancellingInputHold_ClearsHoldAndClosesRequestAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "挂起任务", "ready", 10);
+
+        await _engine.TickAsync(ct);
+        var firstQueue = (await ReadColumnAsync("SELECT id FROM queue_item;", ct)).Single();
+        await InsertAwaitingResultAsync(firstQueue, "res-1", cancellationToken: ct);
+        await ExecuteAsync($"UPDATE queue_item SET status = 'succeeded' WHERE id = '{firstQueue}';", ct);
+
+        var dispatcher = new DispatchService(_registry, _queue, _stateStore, new ProviderStateStore(_factory));
+        var forced = await dispatcher.DispatchNowAsync(
+            "T-001", "alpha", "auto", dryRun: false, force: true, requestId: null, ct);
+        Assert.Equal(DispatchStatus.Enqueued, forced.Status);
+
+        await ExecuteAsync(
+            $"""
+            UPDATE queue_item
+               SET hold_kind = 'input',
+                   hold_ref = 'IR-1'
+             WHERE id = '{forced.QueueItemId}';
+
+            INSERT INTO input_request (
+                id, workspace_id, task_id, queue_item_id, role_id, status, question,
+                allow_free_text, dedupe_key, created_at, expires_at)
+            VALUES ('IR-1', 'alpha', 'T-001', '{forced.QueueItemId}', 'implementer', 'open', '需要什么格式？',
+                    1, 'IR-1', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z');
+            """,
+            ct);
+
+        await new ResultDecisionStore(_factory).DecideAsync("res-1", approve: true, "通过", null, ct);
+
+        var holdKind = (await ReadColumnAsync(
+            $"SELECT COALESCE(hold_kind, '') FROM queue_item WHERE id = '{forced.QueueItemId}';", ct)).Single();
+        var holdRef = (await ReadColumnAsync(
+            $"SELECT COALESCE(hold_ref, '') FROM queue_item WHERE id = '{forced.QueueItemId}';", ct)).Single();
+        var inputStatus = (await ReadColumnAsync(
+            "SELECT status FROM input_request WHERE id = 'IR-1';", ct)).Single();
+        var answeredAtPresent = (await ReadColumnAsync(
+            "SELECT CASE WHEN answered_at IS NULL THEN '0' ELSE '1' END FROM input_request WHERE id = 'IR-1';",
+            ct)).Single();
+
+        Assert.Equal(
+            new[] { "cancelled" },
+            await ReadColumnAsync(
+                $"SELECT status FROM queue_item WHERE id = '{forced.QueueItemId}';", ct));
+        Assert.True(
+            holdKind.Length == 0 && holdRef.Length == 0 && inputStatus == "cancelled" && answeredAtPresent == "1",
+            $"取消挂起项未闭环：holdKind={holdKind}, holdRef={holdRef}, inputStatus={inputStatus}, " +
+            $"answeredAtPresent={answeredAtPresent}");
+        Assert.Equal(1, await CountRowsAsync("SELECT COUNT(*) FROM audit WHERE action = 'queue.superseded';", ct));
+    }
+
+    /// <summary>
     /// 任务已 done 时，历史遗留的非终态队列项也不得再被认领执行（force 并行项的兜底闸门）。
     /// </summary>
     [Fact]

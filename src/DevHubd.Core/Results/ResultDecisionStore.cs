@@ -195,6 +195,8 @@ public sealed class ResultDecisionStore
                 SET status = 'cancelled',
                     lease_owner = NULL,
                     lease_expires_at = NULL,
+                    hold_kind = NULL,
+                    hold_ref = NULL,
                     last_error_code = {0},
                     last_error = {1},
                     updated_at = {2}
@@ -213,6 +215,35 @@ public sealed class ResultDecisionStore
                     entity.QueueItemId,
                 },
                 cancellationToken).ConfigureAwait(false);
+
+            if (cancelledCount > 0)
+            {
+                // 被取消的挂起项不能留下悬挂的问题单：关单并落关闭时间。
+                // input_request 没有独立的 closed_at 列，answered_at 是唯一可用的关闭时间戳。
+                await db.Database.ExecuteSqlRawAsync(
+                    """
+                    UPDATE input_request
+                    SET status = 'cancelled',
+                        answered_at = COALESCE(answered_at, {0})
+                    WHERE status = 'open'
+                      AND queue_item_id IN (
+                          SELECT id FROM queue_item
+                          WHERE workspace_id = {1}
+                            AND task_id = {2}
+                            AND id <> {3}
+                            AND status = 'cancelled'
+                            AND last_error_code = {4});
+                    """,
+                    new object[]
+                    {
+                        now,
+                        workspaceId,
+                        entity.TaskId,
+                        entity.QueueItemId,
+                        DevHubErrorCodes.SupersededByDecision,
+                    },
+                    cancellationToken).ConfigureAwait(false);
+            }
         }
 
         db.Audits.Add(new AuditEntity

@@ -128,13 +128,19 @@ public sealed class UserConfigTests : IDisposable
             """,
             new UTF8Encoding(false));
 
-        var config = DevHubUserConfig.Load(path);
+        // 本机可能已配置 DEVHUB__Model__OpenAi__* 用于真实模型复验，必须隔离，避免环境覆盖污染断言。
+        WithClearedEnvironment(
+            new[] { "DEVHUB__Model__OpenAi__BaseUrl", "DEVHUB__Model__OpenAi__Model" },
+            () =>
+            {
+                var config = DevHubUserConfig.Load(path);
 
-        Assert.Empty(config.Problems);
-        Assert.Equal("https://example.test/v1", config.OpenAi.BaseUrl);
-        Assert.Equal("custom-model", config.OpenAi.Model);
-        Assert.Equal(2, config.Execution.MaxParallel);
-        Assert.Equal(42, config.Execution.MaxDurationSeconds);
+                Assert.Empty(config.Problems);
+                Assert.Equal("https://example.test/v1", config.OpenAi.BaseUrl);
+                Assert.Equal("custom-model", config.OpenAi.Model);
+                Assert.Equal(2, config.Execution.MaxParallel);
+                Assert.Equal(42, config.Execution.MaxDurationSeconds);
+            });
     }
 
     /// <summary>配置文件出现 apiKey 明文时记录问题，key 仍只从环境变量读取。</summary>
@@ -151,11 +157,17 @@ public sealed class UserConfigTests : IDisposable
             """,
             new UTF8Encoding(false));
 
-        var config = DevHubUserConfig.Load(path);
+        // 同上：本机若配置了 DEVHUB__Model__OpenAi__BaseUrl，会覆盖文件值。
+        WithClearedEnvironment(
+            new[] { "DEVHUB__Model__OpenAi__BaseUrl" },
+            () =>
+            {
+                var config = DevHubUserConfig.Load(path);
 
-        Assert.Single(config.Problems);
-        Assert.Contains("apiKey", config.Problems[0], StringComparison.OrdinalIgnoreCase);
-        Assert.Equal("https://example.test/v1", config.OpenAi.BaseUrl);
+                Assert.Single(config.Problems);
+                Assert.Contains("apiKey", config.Problems[0], StringComparison.OrdinalIgnoreCase);
+                Assert.Equal("https://example.test/v1", config.OpenAi.BaseUrl);
+            });
     }
 
     /// <summary>环境变量存在时被读取，删除后返回 null。</summary>

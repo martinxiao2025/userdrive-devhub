@@ -411,10 +411,18 @@ public static class Migrator
             // 极简自建库保持原结构，只做值归一化，避免因缺列导致重建失败。
             var rerunType = await GetColumnTypeAsync(connection, transaction, "task_view", "rerun_pending", cancellationToken)
                 .ConfigureAwait(false);
+            if (rerunType is null)
+            {
+                // 真实 v2/v5/v6 库都有该列；缺列说明 user_version 被谎报或表被手工改动。
+                // 不做兼容：给出可操作的错误，避免继续走到 SQL 报 "no such column"。
+                throw new InvalidOperationException(
+                    "无法升级到 schema v7：task_view 缺少 rerun_pending 列，但 user_version 已声明为 6。" +
+                    "该库不是受支持的 v6 形态（版本号被谎报或表被手工改动）；请从备份恢复，或删除该库让 devhubd 重建。");
+            }
+
             var fullSchema = await HasColumnAsync(connection, transaction, "task_view", "source_path", cancellationToken)
                 .ConfigureAwait(false);
             var needsRebuild = fullSchema &&
-                               rerunType is not null &&
                                !rerunType.Contains("TEXT", StringComparison.OrdinalIgnoreCase);
 
             await ExecuteScriptAsync(

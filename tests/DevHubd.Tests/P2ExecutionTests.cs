@@ -931,6 +931,172 @@ public sealed class P2ExecutionTests : IDisposable
         """,
         cancellationToken);
 
+    /// <summary>
+    /// 第六轮 1：心跳续租失败必须取消回合并立即给 attempt 落终态，
+    /// 不能等下次启动被 AbandonOrphanAttemptsAsync 误记成 PROCESS_RESTART。
+    /// </summary>
+    [Fact]
+    public async Task Pump_WhenLeaseLost_CancelsTurnAndClosesAttemptAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "写一份报告", "ready", 10);
+        await PrepareQueueAsync(ct);
+
+        var fake = new FakeModelClient(
+            "openai",
+            async (_, _, token) =>
+            {
+                await Task.Delay(TimeSpan.FromSeconds(7), token).ConfigureAwait(false);
+                return TurnResult.Done("迟到的结果。", 0, new TokenUsage(1, 1, false), Array.Empty<string>());
+            });
+
+        var coordinator = CreateCoordinator(fake, new ExecutionOptions
+        {
+            HeartbeatSeconds = 5,
+            LeaseSeconds = 30,
+        });
+
+        var pump = coordinator.PumpAsync(ct);
+        Assert.Equal(1, await pump);
+
+        await WaitUntilAsync(
+            async () => await ScalarStringAsync("SELECT status FROM queue_item;", ct) == "running",
+            ct);
+
+        // 模拟租约易主：与决策 supersede 清租约、置 cancelled 的效果等价。
+        await ExecuteAsync("UPDATE queue_item SET lease_owner = 'thief';", ct);
+
+        var settledWhileTurnRunning = await WaitUntilOrFalseAsync(
+            async () => await ScalarStringAsync("SELECT ended_at FROM attempt;", ct) is not null,
+            ct,
+            TimeSpan.FromSeconds(6.5));
+
+        // 无论修复前后都等执行器彻底退出，避免清理与后台写入竞争。
+        await WaitUntilOrFalseAsync(
+            () => Task.FromResult(coordinator.ActiveCount == 0),
+            ct,
+            TimeSpan.FromSeconds(8));
+
+        Assert.True(settledWhileTurnRunning, "租约丢失后 attempt 未在回合仍在跑时立即落终态。");
+        Assert.Equal("abandoned", await ScalarStringAsync("SELECT outcome FROM attempt;", ct));
+        Assert.Equal("lease_lost", await ScalarStringAsync("SELECT error_kind FROM attempt;", ct));
+        Assert.Equal("SUPERSEDED_BY_DECISION", await ScalarStringAsync("SELECT error_code FROM attempt;", ct));
+        Assert.Equal(0L, await CountAsync("SELECT COUNT(*) FROM result;", ct));
+        Assert.Equal("running", await ScalarStringAsync("SELECT status FROM queue_item;", ct));
+    }
+
+    /// <summary>
+    /// 第六轮 2：决策发生在最后一次心跳成功之后、回合结束之前时，
+    /// 落库前必须复核队列项仍处于 claimed/running 且租约归自己，否则丢弃结果。
+    /// </summary>
+    [Fact]
+    public async Task Settle_WhenQueueItemSupersededBeforeTurnEnds_DiscardsResultAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "写一份报告", "ready", 10);
+        await PrepareQueueAsync(ct);
+
+        // 造一条同任务的 awaiting_review 结果，让决策走进 supersede 分支。
+        await ExecuteAsync(
+            """
+            INSERT INTO queue_item (
+                id, workspace_id, task_id, task_hash, dedupe_key, status, priority, attempt,
+                max_attempts, preferred_provider, available_at, created_at, updated_at)
+            SELECT 'Q0', workspace_id, task_id, task_hash, 'seeded-awaiting', 'succeeded', priority, 1,
+                   max_attempts, preferred_provider, available_at, created_at, updated_at
+            FROM queue_item LIMIT 1;
+
+            INSERT INTO result (
+                id, task_id, queue_item_id, provider, outcome, summary, artifacts, created_at)
+            VALUES ('res-1', 'T-001', 'Q0', 'openai', 'awaiting_review', '待审', NULL, '2026-01-01T00:00:00Z');
+            """,
+            ct);
+
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeModelClient(
+            "openai",
+            async (_, _, token) =>
+            {
+                started.TrySetResult();
+                await release.Task.WaitAsync(token).ConfigureAwait(false);
+                return TurnResult.Done("迟到的成功结果。", 0, new TokenUsage(1, 1, false), Array.Empty<string>());
+            });
+
+        var coordinator = CreateCoordinator(fake, new ExecutionOptions
+        {
+            HeartbeatSeconds = 5,
+            LeaseSeconds = 30,
+        });
+
+        var pump = coordinator.PumpAsync(ct);
+        Assert.Equal(1, await pump);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5), ct);
+
+        var initialLease = await ScalarStringAsync(
+            "SELECT lease_expires_at FROM queue_item WHERE id <> 'Q0';", ct);
+
+        try
+        {
+            // 等 lease_expires_at 被推进：证明至少一次心跳成功且租约仍归自己。
+            await WaitUntilAsync(
+                async () => await ScalarStringAsync(
+                    "SELECT lease_expires_at FROM queue_item WHERE id <> 'Q0';", ct) != initialLease,
+                ct,
+                TimeSpan.FromSeconds(8));
+
+            // 心跳已成功、回合尚未结束：此刻决策把运行中的项置 cancelled，复现真实窗口。
+            await new ResultDecisionStore(_factory).DecideAsync("res-1", approve: true, "通过", null, ct);
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+
+        await WaitUntilOrFalseAsync(
+            () => Task.FromResult(coordinator.ActiveCount == 0),
+            ct,
+            TimeSpan.FromSeconds(8));
+
+        var status = await ScalarStringAsync("SELECT status FROM queue_item WHERE id <> 'Q0';", ct);
+        var resultCount = await CountAsync("SELECT COUNT(*) FROM result;", ct);
+        Assert.True(
+            status == "cancelled" && resultCount == 1L,
+            $"队列项应保持 cancelled 且不产生第二个结果：status={status}, resultCount={resultCount}");
+        Assert.Equal(
+            "SUPERSEDED_BY_DECISION",
+            await ScalarStringAsync("SELECT last_error_code FROM queue_item WHERE id <> 'Q0';", ct));
+        Assert.Equal("abandoned", await ScalarStringAsync("SELECT outcome FROM attempt;", ct));
+        Assert.Equal("SUPERSEDED_BY_DECISION", await ScalarStringAsync("SELECT error_code FROM attempt;", ct));
+    }
+
+    /// <summary>轮询等待条件成立；超时返回 false 而不是抛异常。</summary>
+    /// <param name="condition">条件。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    /// <param name="timeout">超时。</param>
+    private static async Task<bool> WaitUntilOrFalseAsync(
+        Func<Task<bool>> condition,
+        CancellationToken cancellationToken,
+        TimeSpan timeout)
+    {
+        var deadline = DateTimeOffset.UtcNow.Add(timeout);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (await condition())
+            {
+                return true;
+            }
+
+            await Task.Delay(25, cancellationToken);
+        }
+
+        return false;
+    }
+
     /// <summary>构建执行协调器。</summary>
     /// <param name="fake">假模型客户端。</param>
     /// <param name="options">执行配置。</param>

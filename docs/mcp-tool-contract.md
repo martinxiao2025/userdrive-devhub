@@ -65,7 +65,7 @@
 | 手动派发 provider（`dispatch_now.provider`） | `auto` / `openai` / `vscode` |
 | provider 熔断状态 | `closed` / `open` / `half_open` |
 | 结果终态（`result.outcome`） | `delivered` / `awaiting_review` / `failed` |
-| 手动派发状态（`dispatch_now.status`） | `enqueued` / `deduped` / `active_exists` / `delivered_exists` / `pending_review` / `would_enqueue`（dryRun） |
+| 手动派发状态（`dispatch_now.status`） | `enqueued` / `deduped` / `active_exists` / `delivered_exists` / `would_enqueue`（dryRun）。待审结果存在时**不以 status 返回**，而是错误码 `RESULT_AWAITING_REVIEW` |
 | 任务状态（`devhub://tasks`） | `ready` / `blocked` / `done` / `cancelled` / `missing` |
 | 问题单状态（`input_request.*`） | `open` / `answered` / `expired` / `cancelled` / `all`（仅过滤用） |
 | 任务审批状态（`devhub://tasks.approvalState`） | `none` / `pending` / `approved` / `rejected` |
@@ -142,8 +142,12 @@
 | `requestId` | string? | null | 幂等键（1–100 字符）；同键重复调用返回首次创建的队列项 |
 
 返回 `{ taskId, workspaceId, status, queueItemId, provider, dryRun }`，`status` 取值：
-`pending`（已入队）/ `deduped`（同 `requestId` 或同内容已交付）/ `pending_review`（待审结果存在）/
-`delivered_exists`（同内容已交付）/ `active_exists`（活跃队列项存在）/ `would_enqueue`（dryRun）。
+`enqueued`（已入队；核心层 `ManualEnqueueResult.Status` 为 `pending`，MCP 对外统一为 `enqueued`）/
+`deduped`（同一 `requestId` 或同一 `dedupe_key` 幂等命中，仅表示已在队列）/
+`delivered_exists`（同内容已交付）/
+`active_exists`（活跃队列项存在）/ `would_enqueue`（dryRun）。
+待审结果存在（核心层 `pending_review`）不进入成功 `status`，由工具层返回错误码
+`RESULT_AWAITING_REVIEW`。
 
 手动入口与定时派发走同一道闸：同一 `workspaceId` + `taskId`
 ① 已有活跃队列项、② 已有待审结果（`result.outcome='awaiting_review'`）、
@@ -386,8 +390,9 @@ COUNT(attempt WHERE queue_item_id = ?
 - **`delivered_exists` 不再被吞成 `deduped`**：`DispatchStatus` 新增 `DeliveredExists`，
   `DispatchService` 不再把它映射为 `Deduped`；`DispatchNowTool` 改用
   `DispatchStatusText` 显式输出 snake_case（修复 `activeexists` 这类枚举名小写），
-  `enqueued/deduped/active_exists/delivered_exists/pending_review/would_enqueue` 与 §2 逐字一致。
-  `deduped` 仅表示同一 `dedupe_key` 已入队（幂等命中，含相同 `requestId`）。
+  `enqueued/deduped/active_exists/delivered_exists/would_enqueue` 与 §2 逐字一致；
+  `pending_review` 不属于成功状态，工具层按错误码 `RESULT_AWAITING_REVIEW` 返回。
+  `deduped` 仅表示同一 `dedupe_key` 已入队（幂等命中，含相同 `requestId`），不代表同内容已交付。
 - **`force` 并行项在任务 done 后不再执行**：审批决策落地时，同 `workspace_id` + `task_id`
   的其余 `pending/claimed/running` 队列项被置 `cancelled`
   （`last_error_code=SUPERSEDED_BY_DECISION`，清租约，写 `audit(action='queue.superseded')`）；

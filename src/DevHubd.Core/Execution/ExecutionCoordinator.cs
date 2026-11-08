@@ -269,40 +269,51 @@ public sealed class ExecutionCoordinator
         }
 
         using var heartbeatStop = new CancellationTokenSource();
-        var heartbeat = HeartbeatLoopAsync(item, heartbeatStop, cancellationToken);
+        // 心跳失败必须真正传到回合：只取消心跳自身的话，回合会继续消耗 provider 预算
+        // 并可能继续写工作区，租约丢失就形同虚设。
+        using var roundCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            heartbeatStop.Token);
+        var heartbeat = HeartbeatLoopAsync(claimed, heartbeatStop, cancellationToken);
 
         TurnRunOutcome outcome;
         try
         {
-            outcome = await _runner.RunAsync(item, task, workspace, cancellationToken).ConfigureAwait(false);
+            outcome = await _runner.RunAsync(item, task, workspace, roundCancellation.Token)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (heartbeatStop.IsCancellationRequested)
+        {
+            // 租约丢失已由心跳循环落 attempt 终态；取消异常不再冒泡成通用失败。
+            return;
         }
         finally
         {
             await heartbeatStop.CancelAsync().ConfigureAwait(false);
         }
 
-        var leaseHeld = await heartbeat.ConfigureAwait(false);
-        if (!leaseHeld)
+        if (!await heartbeat.ConfigureAwait(false))
         {
-            _logger.LogWarning(
-                "租约已丢失，放弃落库：queueItemId={QueueItemId} attempt={Attempt}",
-                item.Id,
-                item.Attempt);
+            // 租约已丢失：attempt 终态已由心跳循环写入，回合产出一律丢弃，不改队列、不写结果。
             return;
         }
 
         await SettleAsync(claimed, task, outcome).ConfigureAwait(false);
     }
 
-    /// <summary>心跳循环：续租失败即取消回合；返回 false 表示租约丢失。</summary>
-    /// <param name="item">队列项。</param>
+    /// <summary>
+    /// 心跳循环：续租失败即把 attempt 落为 <c>abandoned + SUPERSEDED_BY_DECISION</c>，
+    /// 同时取消回合；返回 false 表示租约丢失。
+    /// </summary>
+    /// <param name="claimed">已认领项（需要 attempt id 落终态）。</param>
     /// <param name="stop">用于取消回合的令牌源。</param>
     /// <param name="cancellationToken">执行令牌。</param>
     private async Task<bool> HeartbeatLoopAsync(
-        QueueItem item,
+        ClaimedQueueItem claimed,
         CancellationTokenSource stop,
         CancellationToken cancellationToken)
     {
+        var item = claimed.Item;
         try
         {
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(stop.Token, cancellationToken);
@@ -317,6 +328,9 @@ public sealed class ExecutionCoordinator
 
                 if (!renewed)
                 {
+                    // 续租失败说明该项已被决策取消或租约被回收：立即收尾 attempt，
+                    // 不等下次启动被 AbandonOrphanAttemptsAsync 误记成 PROCESS_RESTART。
+                    await CancelSupersededAttemptAsync(claimed, outcome: null).ConfigureAwait(false);
                     await stop.CancelAsync().ConfigureAwait(false);
                     return false;
                 }
@@ -344,6 +358,19 @@ public sealed class ExecutionCoordinator
 
         if (result.State == TurnState.Done)
         {
+            // 落库前复核所有权：决策可能在上一次心跳成功之后、回合结束之前把该项置 cancelled。
+            // 无条件写 succeeded 会把它改回去并写出第二个结果，绕过 supersede。
+            if (!await _store.TrySetSucceededAsync(item.Id, _ownerId, now, cancellationToken).ConfigureAwait(false))
+            {
+                await CancelSupersededAttemptAsync(claimed, outcome).ConfigureAwait(false);
+                _logger.LogWarning(
+                    "队列项已取消或租约易主，丢弃回合结果：queueItemId={QueueItemId} attempt={Attempt} turnId={TurnId}",
+                    item.Id,
+                    item.Attempt,
+                    outcome.TurnId);
+                return;
+            }
+
             await _store.CompleteAttemptAsync(
                 claimed.AttemptId,
                 new AttemptCompletion(
@@ -362,8 +389,6 @@ public sealed class ExecutionCoordinator
                 now,
                 cancellationToken).ConfigureAwait(false);
 
-            await _store.SetTerminalAsync(item.Id, "succeeded", null, null, now, cancellationToken)
-                .ConfigureAwait(false);
             await _providerStates.RecordSuccessAsync(outcome.Provider, cancellationToken).ConfigureAwait(false);
 
             var summary = string.IsNullOrWhiteSpace(result.Text) ? "回合完成，模型未返回文本。" : Truncate(result.Text);
@@ -411,6 +436,47 @@ public sealed class ExecutionCoordinator
             "回合失败但未提供错误信息。");
 
         await HandleFailureAsync(claimed, task, outcome, error, now, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 租约丢失或被决策取代时立即收尾 attempt：<c>abandoned + lease_lost + SUPERSEDED_BY_DECISION</c>。
+    /// <para>
+    /// <c>attempt.outcome</c> 的 CHECK 只允许 succeeded/failed/abandoned，因此用 abandoned 承载取消档；
+    /// 此处只写本进程独占的 attempt 行，绝不回写已易主的 queue_item。
+    /// </para>
+    /// </summary>
+    /// <param name="claimed">已认领项。</param>
+    /// <param name="outcome">回合产出；租约在回合中途丢失时为 null。</param>
+    private async Task CancelSupersededAttemptAsync(ClaimedQueueItem claimed, TurnRunOutcome? outcome)
+    {
+        var cancellationToken = CancellationToken.None;
+        var now = Now();
+        const string message = "队列项租约已丢失（同任务决策已落地或租约被回收），回合已取消。";
+        var result = outcome?.Result;
+
+        await _store.CompleteAttemptAsync(
+            claimed.AttemptId,
+            new AttemptCompletion(
+                "abandoned",
+                outcome?.Model,
+                ModelErrorKinds.LeaseLost,
+                DevHubErrorCodes.SupersededByDecision,
+                result?.ToolCalls ?? 0,
+                result?.Usage?.InputTokens,
+                result?.Usage?.OutputTokens,
+                result?.Usage?.Estimated ?? false,
+                result?.Usage is not null,
+                result?.RoundsExhausted ?? false,
+                result?.FilesChanged.Count ?? 0,
+                message),
+            now,
+            cancellationToken).ConfigureAwait(false);
+
+        _logger.LogWarning(
+            "租约已丢失，回合已取消并落 attempt 终态：queueItemId={QueueItemId} attempt={Attempt} errorCode={ErrorCode}",
+            claimed.Item.Id,
+            claimed.Item.Attempt,
+            DevHubErrorCodes.SupersededByDecision);
     }
 
     /// <summary>失败分流：按错误分类决定重试、熔断、转人工或终止。</summary>
