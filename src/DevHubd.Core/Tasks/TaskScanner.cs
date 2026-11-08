@@ -1,4 +1,3 @@
-using System.Security.Cryptography;
 using System.Text.Json;
 using DevHubd.Core.Data;
 using DevHubd.Core.Data.Entities;
@@ -80,21 +79,24 @@ public sealed class TaskScanner
             rowsById[row.Id] = row;
         }
 
-        // 待审结果按（任务 id，分发时内容哈希）识别。它的存在说明"状态由审批决策决定"：
-        // 文件因审批回写成功但库提交失败而短暂显示 done 时，扫描不得用文件覆盖库内状态，
-        // 否则会出现"待审结果还在、任务视图却已 done"的另一种半边态。
-        var pendingReviewPairs = (await db.Results
+        // 待审结果按（workspace_id，task_id）识别——这是本工作区内的事实，不参与哈希比较。
+        // 它的存在说明"状态由审批决策决定"：文件因审批回写成功但库提交失败而短暂显示 done 时，
+        // 扫描不得用文件覆盖库内状态，否则会出现"待审结果还在、任务视图却已 done"的另一种半边态。
+        // 结果表没有 workspace_id，必须经 queue_item 反查并按工作区过滤，避免同名任务跨工作区串味。
+        var pendingReviewTaskIds = (await db.Results
                 .AsNoTracking()
                 .Where(result => result.Outcome == "awaiting_review")
                 .Join(
                     db.QueueItems.AsNoTracking(),
                     result => result.QueueItemId,
                     item => item.Id,
-                    (result, item) => new { result.TaskId, item.TaskHash })
+                    (result, item) => new { item.WorkspaceId, result.TaskId })
+                .Where(entry => entry.WorkspaceId == workspace.Id)
+                .Select(entry => entry.TaskId)
+                .Distinct()
                 .ToListAsync(cancellationToken)
                 .ConfigureAwait(false))
-            .Select(entry => (entry.TaskId, entry.TaskHash))
-            .ToHashSet();
+            .ToHashSet(StringComparer.Ordinal);
 
         var pendingReviewIds = new HashSet<string>(StringComparer.Ordinal);
 
@@ -113,10 +115,9 @@ public sealed class TaskScanner
                 rowsById[document.Id] = row;
             }
 
-            // 覆盖式写入前先记住旧值：审批态与待审判断都依赖"库里的上一次内容"。
-            var previousHash = row.ContentHash;
+            // 覆盖式写入前先记住旧值：审批态与"是否实质变化"都依赖库里的上一次内容。
             var previousPayload = row.Payload;
-            var substantiveChange = !isNew && HasSubstantiveChange(previousPayload, document.RawJson);
+            var substantiveChange = !isNew && HasSubstantiveChange(previousPayload, document);
 
             // 覆盖式写入：与原 ON CONFLICT (workspace_id, id) DO UPDATE 的列集合一一对应。
             row.SourcePath = sourcePath;
@@ -132,10 +133,18 @@ public sealed class TaskScanner
 
             if (!isNew && string.Equals(row.ApprovalState, "approved", StringComparison.Ordinal))
             {
-                // 已审批任务的重做通道：只有实质字段变化才视为新需求，重置审批态并允许重新派发；
-                // 仅 status（或格式）变化保持已交付，避免"把文件改回 ready"绕过审批语义。
-                if (substantiveChange)
+                if (row.RerunPending)
                 {
+                    // 待审期间登记过再执行需求：审批已落地，作为新需求重新进入 ready（正常情况下
+                    // 审批决策已清掉标记，这里兜底处理历史数据）。
+                    row.RerunPending = false;
+                    row.ApprovalState = "none";
+                    row.Status = "ready";
+                }
+                else if (substantiveChange)
+                {
+                    // 已审批任务的重做通道：只有实质字段变化才视为新需求，重置审批态并允许重新派发；
+                    // 仅 status / 标题 / 优先级 / 来源或格式变化保持已交付，避免绕过审批语义。
                     row.ApprovalState = "none";
                     row.Status = document.Status;
                 }
@@ -147,13 +156,13 @@ public sealed class TaskScanner
                 continue;
             }
 
-            if (!isNew && pendingReviewPairs.Contains((document.Id, previousHash)))
+            if (!isNew && pendingReviewTaskIds.Contains(document.Id))
             {
-                // 待审期间状态以库为准。内容只是格式/status 变化时保持原内容哈希，
-                // 让入队闸门仍能按 hash 认出"这份内容已有待审结果"，不被重复派发。
-                if (!substantiveChange)
+                // 待审期间状态以库为准；实质变化只登记"决策落地后需再跑一轮"，
+                // 绝不与待审结果并行派发（并行会产生第二个待审结果，审批语义错位）。
+                if (substantiveChange)
                 {
-                    row.ContentHash = previousHash;
+                    row.RerunPending = true;
                 }
 
                 pendingReviewIds.Add(document.Id);
@@ -246,96 +255,37 @@ public sealed class TaskScanner
     }
 
     /// <summary>
-    /// 判断任务文件的实质字段是否变化：忽略 <c>status</c> 与 JSON 格式（缩进、键序、换行），
-    /// 只有 prompt / writeScope / role / 验收条件等需求字段变化才算"新需求"。
-    /// 任一侧无法解析时按"未变化"保守处理，避免把格式损坏误判成新任务而触发重派。
+    /// 判断任务文件是否发生了"实质变化"：只比较影响执行语义的字段集合，
+    /// 即 <c>prompt</c>、<c>writeScope</c>、<c>role</c>、验收条件（当前 schema 无独立字段，由 prompt 承载）、
+    /// <c>delivery</c>、<c>requiresApproval</c>、<c>dependsOn</c>。
+    /// <c>source</c>、<c>title</c>、<c>priority</c>、<c>status</c> 以及 JSON 缩进/键序不参与比较
+    /// （<c>task.schema.json</c> 已写明 source 不参与调度）。
+    /// <c>writeScope</c> 与 <c>dependsOn</c> 按集合比较，换序不算变化。
+    /// 任一侧无法解析时按"未变化"保守处理，避免把格式损坏误判成新需求而触发重派。
     /// </summary>
     /// <param name="storedPayload">库中保存的上一次任务原文。</param>
-    /// <param name="currentRawJson">本次扫描读到的新任务原文。</param>
-    private static bool HasSubstantiveChange(string? storedPayload, string currentRawJson)
+    /// <param name="current">本次扫描解析出的任务文档。</param>
+    private static bool HasSubstantiveChange(string? storedPayload, TaskDocument current)
     {
-        var previous = CanonicalizeWithoutStatus(storedPayload);
-        var current = CanonicalizeWithoutStatus(currentRawJson);
-        return previous is not null &&
-               current is not null &&
-               !string.Equals(previous, current, StringComparison.Ordinal);
+        if (string.IsNullOrWhiteSpace(storedPayload) ||
+            !TaskFileReader.TryParse(storedPayload, out var previous, out _) ||
+            previous is null)
+        {
+            return false;
+        }
+
+        return !string.Equals(previous.Prompt, current.Prompt, StringComparison.Ordinal)
+               || !string.Equals(previous.Role, current.Role, StringComparison.Ordinal)
+               || !string.Equals(previous.Delivery, current.Delivery, StringComparison.Ordinal)
+               || previous.RequiresApproval != current.RequiresApproval
+               || !SetEquals(previous.WriteScope, current.WriteScope)
+               || !SetEquals(previous.DependsOn, current.DependsOn);
     }
 
-    /// <summary>
-    /// 把任务 JSON 规范化成可比较的 SHA-256：去掉顶层 <c>status</c>，对象键按序数排序，
-    /// 数组保持原顺序。返回 null 表示不是合法的 JSON 对象。
-    /// </summary>
-    /// <param name="json">任务原文。</param>
-    private static string? CanonicalizeWithoutStatus(string? json)
-    {
-        if (string.IsNullOrWhiteSpace(json))
-        {
-            return null;
-        }
-
-        try
-        {
-            using var document = JsonDocument.Parse(json);
-            if (document.RootElement.ValueKind != JsonValueKind.Object)
-            {
-                return null;
-            }
-
-            using var buffer = new MemoryStream();
-            using (var writer = new Utf8JsonWriter(buffer))
-            {
-                writer.WriteStartObject();
-                foreach (var property in document.RootElement
-                             .EnumerateObject()
-                             .Where(property => !string.Equals(property.Name, "status", StringComparison.Ordinal))
-                             .OrderBy(property => property.Name, StringComparer.Ordinal))
-                {
-                    writer.WritePropertyName(property.Name);
-                    WriteCanonical(writer, property.Value);
-                }
-
-                writer.WriteEndObject();
-            }
-
-            return Convert.ToHexString(SHA256.HashData(buffer.ToArray()));
-        }
-        catch (JsonException)
-        {
-            return null;
-        }
-    }
-
-    /// <summary>递归写入规范化 JSON：对象键排序，数组与标量原样输出。</summary>
-    /// <param name="writer">目标写入器。</param>
-    /// <param name="element">JSON 节点。</param>
-    private static void WriteCanonical(Utf8JsonWriter writer, JsonElement element)
-    {
-        switch (element.ValueKind)
-        {
-            case JsonValueKind.Object:
-                writer.WriteStartObject();
-                foreach (var property in element.EnumerateObject().OrderBy(property => property.Name, StringComparer.Ordinal))
-                {
-                    writer.WritePropertyName(property.Name);
-                    WriteCanonical(writer, property.Value);
-                }
-
-                writer.WriteEndObject();
-                break;
-
-            case JsonValueKind.Array:
-                writer.WriteStartArray();
-                foreach (var item in element.EnumerateArray())
-                {
-                    WriteCanonical(writer, item);
-                }
-
-                writer.WriteEndArray();
-                break;
-
-            default:
-                element.WriteTo(writer);
-                break;
-        }
-    }
+    /// <summary>按集合语义比较两个字符串列表：排序后逐项比较，换序不算变化。</summary>
+    /// <param name="left">左侧集合。</param>
+    /// <param name="right">右侧集合。</param>
+    private static bool SetEquals(IReadOnlyList<string> left, IReadOnlyList<string> right) =>
+        left.OrderBy(value => value, StringComparer.Ordinal)
+            .SequenceEqual(right.OrderBy(value => value, StringComparer.Ordinal), StringComparer.Ordinal);
 }

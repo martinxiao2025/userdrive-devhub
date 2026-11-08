@@ -15,6 +15,7 @@ namespace DevHubd.Core.Scheduling;
 /// <param name="Enqueued">新增队列项数。</param>
 /// <param name="Deduped">按 dedupe_key 命中去重数。</param>
 /// <param name="SkippedActive">因已有活动队列项而跳过数。</param>
+/// <param name="SkippedBackoff">因同一内容最新队列项已 dead（重试预算耗尽）而退避数。</param>
 /// <param name="Reclaimed">回收的过期租约数。</param>
 public sealed record SchedulerTickResult(
     bool Skipped,
@@ -24,6 +25,7 @@ public sealed record SchedulerTickResult(
     int Enqueued,
     int Deduped,
     int SkippedActive,
+    int SkippedBackoff,
     int Reclaimed);
 
 /// <summary>
@@ -88,7 +90,7 @@ public sealed class SchedulerEngine
                 cancellationToken).ConfigureAwait(false);
 
             _logger.LogInformation("调度已暂停，跳过扫描。pauseReason={PauseReason}", state.PauseReason);
-            return new SchedulerTickResult(true, 0, 0, 0, 0, 0, 0, reclaimed);
+            return new SchedulerTickResult(true, 0, 0, 0, 0, 0, 0, 0, reclaimed);
         }
 
         var loaded = await _registry.LoadAsync(cancellationToken).ConfigureAwait(false);
@@ -104,6 +106,7 @@ public sealed class SchedulerEngine
         var enqueued = 0;
         var deduped = 0;
         var skippedActive = 0;
+        var skippedBackoff = 0;
 
         foreach (var workspace in loaded.Workspaces)
         {
@@ -158,6 +161,7 @@ public sealed class SchedulerEngine
             enqueued += enqueue.Enqueued;
             deduped += enqueue.Deduped;
             skippedActive += enqueue.SkippedActive;
+            skippedBackoff += enqueue.SkippedBackoff;
         }
 
         var completedAt = DateTimeOffset.UtcNow;
@@ -170,20 +174,23 @@ public sealed class SchedulerEngine
                 ["invalid"] = invalid,
                 ["enqueued"] = enqueued,
                 ["deduped"] = deduped,
+                ["skippedActive"] = skippedActive,
+                ["skippedBackoff"] = skippedBackoff,
                 ["reclaimed"] = reclaimed,
             },
             cancellationToken).ConfigureAwait(false);
 
         _logger.LogInformation(
-            "扫描完成：workspaces={Workspaces} scanned={Scanned} invalid={Invalid} enqueued={Enqueued} deduped={Deduped} skippedActive={SkippedActive} reclaimed={Reclaimed}",
+            "扫描完成：workspaces={Workspaces} scanned={Scanned} invalid={Invalid} enqueued={Enqueued} deduped={Deduped} skippedActive={SkippedActive} skippedBackoff={SkippedBackoff} reclaimed={Reclaimed}",
             workspaces,
             scanned,
             invalid,
             enqueued,
             deduped,
             skippedActive,
+            skippedBackoff,
             reclaimed);
 
-        return new SchedulerTickResult(false, workspaces, scanned, invalid, enqueued, deduped, skippedActive, reclaimed);
+        return new SchedulerTickResult(false, workspaces, scanned, invalid, enqueued, deduped, skippedActive, skippedBackoff, reclaimed);
     }
 }

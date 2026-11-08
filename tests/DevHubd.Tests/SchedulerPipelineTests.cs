@@ -159,7 +159,7 @@ public sealed class SchedulerPipelineTests : IDisposable
 
         // 模拟回合完成但结果待审：队列项终态、结果 awaiting_review、任务文件保持 ready。
         var queueItemId = (await ReadColumnAsync("SELECT id FROM queue_item;", ct)).Single();
-        await InsertAwaitingResultAsync(queueItemId, "res-1", ct);
+        await InsertAwaitingResultAsync(queueItemId, "res-1", cancellationToken: ct);
         await ExecuteAsync("UPDATE queue_item SET status = 'succeeded';", ct);
 
         await _engine.TickAsync(ct);
@@ -189,7 +189,7 @@ public sealed class SchedulerPipelineTests : IDisposable
 
         // 第一轮：回合完成并进入待审，随后驳回（走真实审批存储，写审计与通知）。
         var firstQueue = (await ReadColumnAsync("SELECT id FROM queue_item;", ct)).Single();
-        await InsertAwaitingResultAsync(firstQueue, "res-1", ct);
+        await InsertAwaitingResultAsync(firstQueue, "res-1", cancellationToken: ct);
         await ExecuteAsync($"UPDATE queue_item SET status = 'succeeded' WHERE id = '{firstQueue}';", ct);
         var firstDecision = await decisions.DecideAsync("res-1", approve: false, "第一轮驳回", null, ct);
         Assert.Equal(CoreResultDecisionStatus.Decided, firstDecision.Status);
@@ -203,7 +203,7 @@ public sealed class SchedulerPipelineTests : IDisposable
         var secondQueue = (await ReadColumnAsync(
             "SELECT id FROM queue_item WHERE status = 'pending';", ct)).Single();
         Assert.Equal(canonicalHash, await ComputeHashAsync(file, ct));
-        await InsertAwaitingResultAsync(secondQueue, "res-2", ct);
+        await InsertAwaitingResultAsync(secondQueue, "res-2", cancellationToken: ct);
         await ExecuteAsync($"UPDATE queue_item SET status = 'succeeded' WHERE id = '{secondQueue}';", ct);
         var secondDecision = await decisions.DecideAsync("res-2", approve: false, "第二轮驳回", null, ct);
         Assert.Equal(CoreResultDecisionStatus.Decided, secondDecision.Status);
@@ -259,6 +259,201 @@ public sealed class SchedulerPipelineTests : IDisposable
         Assert.Equal(
             new[] { "ready|none" },
             await ReadColumnAsync("SELECT status || '|' || approval_state FROM task_view WHERE id = 'T-001';", ct));
+    }
+
+    /// <summary>
+    /// 跨工作区隔离：两个工作区各有同名同内容任务，其中一个待审时，另一个仍能正常派发下一轮。
+    /// 闸门只看本工作区的事实（活跃队列项 / 待审结果），不做任何哈希比较。
+    /// </summary>
+    [Fact]
+    public async Task TickAsync_PendingReviewInOneWorkspace_DoesNotBlockOtherWorkspaceAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var alpha = CreateWorkspace("alpha");
+        var beta = CreateWorkspace("beta");
+        WriteWorkspaces(("alpha", alpha), ("beta", beta));
+        WriteTask(alpha, "T-001", "同名同内容", "ready", 10);
+        WriteTask(beta, "T-001", "同名同内容", "ready", 10);
+
+        await _engine.TickAsync(ct);
+        Assert.Equal(2, await CountQueueItemsAsync(ct));
+
+        var alphaQueue = (await ReadColumnAsync("SELECT id FROM queue_item WHERE workspace_id = 'alpha';", ct)).Single();
+        var betaQueue = (await ReadColumnAsync("SELECT id FROM queue_item WHERE workspace_id = 'beta';", ct)).Single();
+        await InsertAwaitingResultAsync(alphaQueue, "res-alpha", "T-001", "alpha", ct);
+        await ExecuteAsync(
+            $"UPDATE queue_item SET status = 'succeeded' WHERE id IN ('{alphaQueue}', '{betaQueue}');",
+            ct);
+
+        await _engine.TickAsync(ct);
+
+        Assert.Equal(1, await CountRowsAsync("SELECT COUNT(*) FROM queue_item WHERE workspace_id = 'alpha';", ct));
+        Assert.Equal(2, await CountRowsAsync("SELECT COUNT(*) FROM queue_item WHERE workspace_id = 'beta';", ct));
+    }
+
+    /// <summary>
+    /// 待审任务手动派发默认被拒（与定时派发同一道闸）；显式 <c>force</c> 才执行，
+    /// 并留下审计与 <c>queue_item.forced</c> 标记。
+    /// </summary>
+    [Fact]
+    public async Task DispatchNow_WhenResultAwaitingReview_RejectsUnlessForcedAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "待审任务", "ready", 10);
+
+        await _engine.TickAsync(ct);
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+
+        var queueItemId = (await ReadColumnAsync("SELECT id FROM queue_item;", ct)).Single();
+        await InsertAwaitingResultAsync(queueItemId, "res-1", cancellationToken: ct);
+        await ExecuteAsync("UPDATE queue_item SET status = 'succeeded';", ct);
+
+        var dispatcher = new DispatchService(_registry, _queue, _stateStore, new ProviderStateStore(_factory));
+
+        var rejected = await dispatcher.DispatchNowAsync(
+            "T-001", "alpha", "auto", dryRun: false, force: false, requestId: null, ct);
+        Assert.Equal("PendingReview", rejected.Status.ToString());
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+
+        var forced = await dispatcher.DispatchNowAsync(
+            "T-001", "alpha", "auto", dryRun: false, force: true, requestId: null, ct);
+        Assert.Equal(DispatchStatus.Enqueued, forced.Status);
+        Assert.Equal(2, await CountQueueItemsAsync(ct));
+        Assert.Equal(
+            1,
+            await CountRowsAsync("SELECT COUNT(*) FROM audit WHERE action = 'queue.dispatch_forced';", ct));
+        Assert.Equal(1, await CountRowsAsync("SELECT COUNT(*) FROM queue_item WHERE forced = 1;", ct));
+    }
+
+    /// <summary>
+    /// 待审期间只改格式（缩进、键序）、reorder <c>dependsOn</c>，或改 <c>source</c> / <c>title</c> / <c>priority</c>
+    /// 都不算实质变化：不触发重派，也不改变待审状态。
+    /// </summary>
+    [Fact]
+    public async Task TickAsync_PendingReview_IgnoresCosmeticAndMetadataChangesAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-002", "前置二", "done", 0);
+        WriteTask(root, "T-003", "前置三", "done", 0);
+        WriteTask(root, "T-001", "原始标题", "ready", 10, dependsOn: new[] { "T-002", "T-003" });
+
+        await _engine.TickAsync(ct);
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+
+        var queueItemId = (await ReadColumnAsync("SELECT id FROM queue_item;", ct)).Single();
+        await InsertAwaitingResultAsync(queueItemId, "res-1", cancellationToken: ct);
+        await ExecuteAsync("UPDATE queue_item SET status = 'succeeded';", ct);
+
+        // 纯格式变化：缩进与键序不同、dependsOn 换序，语义一致 → 不重派。
+        File.WriteAllText(
+            Path.Combine(root, ".devhub", "tasks", "T-001.json"),
+            """
+            {
+                "prompt": "执行该任务",
+                "status": "ready",
+                "priority": 10,
+                "title": "原始标题",
+                "id": "T-001",
+                "delivery": "review",
+                "writeScope": [],
+                "dependsOn": ["T-003", "T-002"]
+            }
+            """,
+            new UTF8Encoding(false));
+        await _engine.TickAsync(ct);
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+
+        // 非实质元数据：title / priority / source 变化 → 仍不重派。
+        WriteTask(root, "T-001", "新标题", "ready", 99, dependsOn: new[] { "T-003", "T-002" }, source: "cli");
+        await _engine.TickAsync(ct);
+
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+        Assert.Equal(1, await CountRowsAsync("SELECT COUNT(*) FROM result;", ct));
+        Assert.Equal(
+            new[] { "pending" },
+            await ReadColumnAsync("SELECT approval_state FROM task_view WHERE id = 'T-001';", ct));
+    }
+
+    /// <summary>
+    /// 待审期间改实质字段（<c>prompt</c> / <c>writeScope</c>）：只登记再执行需求，
+    /// 不并行派发、不产生第二个待审结果；决策落地后才派发下一轮。
+    /// </summary>
+    /// <param name="field">被修改的实质字段。</param>
+    [Theory]
+    [InlineData("prompt")]
+    [InlineData("writeScope")]
+    public async Task TickAsync_PendingReviewSubstantiveChange_DefersUntilDecisionAsync(string field)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "待审任务", "ready", 10, prompt: "原始需求");
+
+        await _engine.TickAsync(ct);
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+
+        var queueItemId = (await ReadColumnAsync("SELECT id FROM queue_item;", ct)).Single();
+        await InsertAwaitingResultAsync(queueItemId, "res-1", cancellationToken: ct);
+        await ExecuteAsync("UPDATE queue_item SET status = 'succeeded';", ct);
+
+        if (string.Equals(field, "prompt", StringComparison.Ordinal))
+        {
+            WriteTask(root, "T-001", "待审任务", "ready", 10, prompt: "新的需求");
+        }
+        else
+        {
+            WriteTask(root, "T-001", "待审任务", "ready", 10, prompt: "原始需求", writeScope: new[] { "src/" });
+        }
+
+        // 待审期间：不得并行派发，也不得产生第二个待审结果。
+        await _engine.TickAsync(ct);
+        await _engine.TickAsync(ct);
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+        Assert.Equal(1, await CountRowsAsync("SELECT COUNT(*) FROM result;", ct));
+
+        // 决策落地（通过）后才派发下一轮。
+        var decisions = new ResultDecisionStore(_factory);
+        var decision = await decisions.DecideAsync("res-1", approve: true, "需求已调整", null, ct);
+        Assert.Equal(CoreResultDecisionStatus.Decided, decision.Status);
+
+        await _engine.TickAsync(ct);
+
+        Assert.Equal(2, await CountQueueItemsAsync(ct));
+    }
+
+    /// <summary>
+    /// 永久失败的任务连续多个 tick 不产生无限新队列项（同一内容在最新项 dead 时退避）；
+    /// 内容实质变化属于新需求，仍能重新派发。
+    /// </summary>
+    [Fact]
+    public async Task TickAsync_PermanentlyFailedTask_DoesNotEnqueueEveryTickAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "永久失败", "ready", 10);
+
+        await _engine.TickAsync(ct);
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+
+        // 模拟重试预算耗尽：队列项 dead 且没有产出结果，文件仍是 ready。
+        await ExecuteAsync("UPDATE queue_item SET status = 'dead';", ct);
+
+        await _engine.TickAsync(ct);
+        await _engine.TickAsync(ct);
+        await _engine.TickAsync(ct);
+
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+
+        // 内容变化是新需求，退避不应把它永久挡住。
+        WriteTask(root, "T-001", "永久失败", "ready", 10, prompt: "调整后的需求");
+        await _engine.TickAsync(ct);
+
+        Assert.Equal(2, await CountQueueItemsAsync(ct));
     }
 
     /// <summary>两个工作区存在同名任务：task_view 与队列项都按 workspace 隔离。</summary>
@@ -384,7 +579,8 @@ public sealed class SchedulerPipelineTests : IDisposable
         await new TaskScanner(_factory).ScanAsync(new WorkspaceDefinition("alpha", root, true), ct);
 
         var task = await _queue.GetTaskAsync("alpha", "T-001", ct);
-        var enqueued = await _queue.EnqueueTaskAsync("alpha", task!, "vscode", dryRun: false, requestId: null, ct);
+        var enqueued = await _queue.EnqueueTaskAsync(
+            "alpha", task!, "vscode", dryRun: false, requestId: null, cancellationToken: ct);
         Assert.Equal("vscode", enqueued.Provider);
 
         var dispatcher = new DispatchService(_registry, _queue, _stateStore, new ProviderStateStore(_factory));
@@ -608,6 +804,8 @@ public sealed class SchedulerPipelineTests : IDisposable
     /// <param name="role">执行角色。</param>
     /// <param name="dependsOn">前置任务。</param>
     /// <param name="prompt">任务需求正文（用于验证"实质字段变化"）。</param>
+    /// <param name="writeScope">写白名单（用于验证"实质字段变化"）。</param>
+    /// <param name="source">来源渠道（非实质字段）。</param>
     private static void WriteTask(
         string workspaceRoot,
         string id,
@@ -616,7 +814,9 @@ public sealed class SchedulerPipelineTests : IDisposable
         int priority,
         string? role = null,
         string[]? dependsOn = null,
-        string prompt = "执行该任务")
+        string prompt = "执行该任务",
+        string[]? writeScope = null,
+        string? source = null)
     {
         var payload = new Dictionary<string, object?>
         {
@@ -625,7 +825,7 @@ public sealed class SchedulerPipelineTests : IDisposable
             ["status"] = status,
             ["priority"] = priority,
             ["delivery"] = "review",
-            ["writeScope"] = Array.Empty<string>(),
+            ["writeScope"] = writeScope ?? Array.Empty<string>(),
             ["prompt"] = prompt,
         };
 
@@ -637,6 +837,11 @@ public sealed class SchedulerPipelineTests : IDisposable
         if (dependsOn is not null)
         {
             payload["dependsOn"] = dependsOn;
+        }
+
+        if (source is not null)
+        {
+            payload["source"] = source;
         }
 
         File.WriteAllText(
@@ -664,19 +869,28 @@ public sealed class SchedulerPipelineTests : IDisposable
     /// <summary>插入一条待审批结果，模拟后台回合已完成但尚未决策。</summary>
     /// <param name="queueItemId">队列项 id。</param>
     /// <param name="resultId">结果 id。</param>
+    /// <param name="taskId">任务 id。</param>
+    /// <param name="workspaceId">工作区 id。</param>
     /// <param name="cancellationToken">取消令牌。</param>
-    private async Task InsertAwaitingResultAsync(string queueItemId, string resultId, CancellationToken cancellationToken)
+    private async Task InsertAwaitingResultAsync(
+        string queueItemId,
+        string resultId,
+        string taskId = "T-001",
+        string workspaceId = "alpha",
+        CancellationToken cancellationToken = default)
     {
         using var connection = await _factory.OpenAsync(cancellationToken);
         using var command = connection.CreateCommand();
         command.CommandText =
             """
             INSERT INTO result (id, task_id, queue_item_id, provider, outcome, summary, artifacts, created_at, read_at)
-            VALUES ($id, 'T-001', $queue, 'openai', 'awaiting_review', '待审', '[]', '2026-01-01T00:00:00Z', NULL);
-            UPDATE task_view SET approval_state = 'pending' WHERE id = 'T-001';
+            VALUES ($id, $task, $queue, 'openai', 'awaiting_review', '待审', '[]', '2026-01-01T00:00:00Z', NULL);
+            UPDATE task_view SET approval_state = 'pending' WHERE workspace_id = $workspace AND id = $task;
             """;
         command.Parameters.AddWithValue("$id", resultId);
+        command.Parameters.AddWithValue("$task", taskId);
         command.Parameters.AddWithValue("$queue", queueItemId);
+        command.Parameters.AddWithValue("$workspace", workspaceId);
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 

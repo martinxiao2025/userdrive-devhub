@@ -42,6 +42,9 @@ public sealed class TaskViewEntity
     /// <summary>审批状态：none / pending / approved / rejected。</summary>
     public string ApprovalState { get; set; } = "none";
 
+    /// <summary>待审期间发生实质内容变化后登记的"决策落地后需再跑一轮"标记（v6）。</summary>
+    public bool RerunPending { get; set; }
+
     /// <summary>最近一次被扫描到的时间（ISO-8601）。</summary>
     public string SeenAt { get; set; } = string.Empty;
 

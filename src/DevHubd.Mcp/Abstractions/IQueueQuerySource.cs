@@ -59,6 +59,9 @@ public enum DispatchStatus
     /// <summary>该任务已有未结束的队列项。</summary>
     ActiveExists,
 
+    /// <summary>同一工作区 + 任务已有待审结果：默认拒绝派发，必须显式 <c>force</c> 覆盖。</summary>
+    PendingReview,
+
     /// <summary>dryRun 下判定为"可以入队"。</summary>
     WouldEnqueue,
 
@@ -100,7 +103,7 @@ public interface IDispatchService
     /// <param name="workspaceId">可选工作区 id；省略时自动解析。</param>
     /// <param name="provider">auto / openai / vscode。</param>
     /// <param name="dryRun">只判定不写入。</param>
-    /// <param name="force">忽略 manual 暂停强行入队。</param>
+    /// <param name="force">忽略 manual 暂停强行入队，并显式覆盖"已有活跃队列项或待审结果"的入队闸门（写审计与标记）。</param>
     /// <param name="requestId">可选幂等键：同一键重复调用返回首次创建的队列项。</param>
     /// <param name="cancellationToken">取消令牌。</param>
     Task<DispatchOutcome> DispatchNowAsync(

@@ -6,8 +6,8 @@
 `tests/DevHubd.Tests/ToolSurfaceSnapshotTests.cs` 对工具名、参数名、枚举词表与关键字段做快照，
 任何改动都会先让测试失败，必须同步更新本文件。
 
-- 契约版本：**schema v5**（数据目录 `devhub.db` 的 `user_version`）
-- 更新时间：2026-11-08
+- 契约版本：**schema v6**（数据目录 `devhub.db` 的 `user_version`）
+- 更新时间：2026-11-09
 
 ---
 
@@ -137,14 +137,16 @@
 | `workspaceId` | string? | null | 任务 id 跨工作区重名时必须提供 |
 | `provider` | string | `auto` | `auto` / `openai` / `vscode` |
 | `dryRun` | bool | false | 只校验不派发 |
-| `force` | bool | false | 调度处于 manual 暂停时强行入队（quota/auth 等硬暂停不可覆盖） |
+| `force` | bool | false | 跳过 manual 暂停，并显式覆盖“已有活跃队列项 / 待审结果”的入队闸门（写审计与 `queue_item.forced=1`；quota/auth 等硬暂停不可覆盖） |
 | `requestId` | string? | null | 幂等键（1–100 字符）；同键重复调用返回首次创建的队列项 |
 
 返回 `{ taskId, workspaceId, status, queueItemId, provider, dryRun }`。
-`force` 只覆盖 manual 暂停，不改变“已在队列中”的去重语义；需要去重请使用 `requestId`。
+手动入口与定时派发走同一道闸：同一 `workspaceId` + `taskId` 已有活跃队列项或待审结果时，
+不带 `force` 一律拒绝（待审返回 `RESULT_AWAITING_REVIEW`），不会因内容哈希不同而放行。
+需要幂等复用首次派发时使用 `requestId`。
 
-错误码：`UNKNOWN_TASK`、`AMBIGUOUS_TASK`、`TASK_NOT_READY`、`SCHEDULER_PAUSED`、
-`PROVIDER_UNAVAILABLE`、`NO_MODEL_PROVIDER`、`INVALID_PROVIDER`。
+错误码：`UNKNOWN_TASK`、`AMBIGUOUS_TASK`、`TASK_NOT_READY`、`RESULT_AWAITING_REVIEW`、
+`SCHEDULER_PAUSED`、`PROVIDER_UNAVAILABLE`、`NO_MODEL_PROVIDER`、`INVALID_PROVIDER`。
 
 ### 3.5 `scheduler_control`
 
@@ -360,27 +362,34 @@ COUNT(attempt WHERE queue_item_id = ?
 
 ## 6. 变更记录
 
-### 入队闸门与已交付任务重做 — 2026-11-09
+### 入队闸门改按工作区事实判定（schema v6）— 2026-11-09
 
-- **入队闸门改按结果状态判定**：`EnqueueReadyTasksAsync` 先查 `result` 与 `queue_item` 的
-  `(task_id, task_hash)`：同一任务当前内容哈希若已存在 `awaiting_review` 或 `delivered` 结果，
-  直接按去重跳过。队列项进入终态不再意味着“可以再跑一遍”，修复了待审任务每个 tick 被重复派发
-  （实测 90 秒内执行 4 次、产生 4 条结果与 4 条通知）。
-- **去重键**：`workspace:task:<contentHash>:r<已驳回次数>`。`r<n>` 的 n 取审计
-  `result.rejected` 的持久计数（被驳回的结果 outcome 会变成 `failed`，与传输失败的 `failed`
-  无法区分，故不能直接数 `result.outcome`），再与既有键中的最大后缀取 `max` 后 `+1`，
-  保证队列清理后计数不回退、不撞旧键。上一版 `workspace:task:g<generation>` 作废。
-- **已交付任务的重做通道**：扫描时比较任务文件 JSON 的规范化内容（去掉顶层 `status`、排序对象键），
-  实质字段（prompt、writeScope、role、验收条件等）变化才把 `approval_state` 重置为 `none`
-  并按文件状态重新入队；仅 `status` 改回 `ready`、或仅缩进/换行变化不触发重派。
-- **反向不一致选择“库为准”**：审批决策后 `status` / `approval_state` 以数据库为准——存在
-  `awaiting_review` 结果时，扫描不拿文件里的 `done` 覆盖库内状态。代价：决策未完成期间
-  用户手改文件 `status` 不会立即生效，需等审批/驳回落地；好处是不需要第二条补偿写路径，
-  也不会出现“文件已 done、扫描把视图也改成 done”的半边态。文件先写、库提交失败时，
-  重试审批即可自愈，且不会因格式化导致内容哈希变化而重复派发（无实质变化时保留原内容哈希）。
-- 测试：`TickAsync_PendingReviewAcrossThreeTicks_EnqueuesOnceAsync`、
-  `TickAsync_AfterTwoRejections_RedispatchesWithUnchangedFileBytesAsync`、
-  `TickAsync_ApprovedTask_RedispatchesOnlyOnSubstantiveChangeAsync`。
+- **闸门判据**：同一 `workspace_id` + `task_id` 同一时刻只允许存在一个活跃队列项
+  （`pending` / `claimed` / `running`）或一个待审结果（`result.outcome='awaiting_review'`）。
+  满足任一即不派发，**不做任何内容哈希比较**。`result` 表没有 `workspace_id`，实现经
+  `queue_item` 反查并按工作区过滤，修复同名同内容任务跨工作区串味。
+- **内容哈希退居第二用途**：`queue_item.task_hash` 只用于回答“交付之后内容是否实质变化、
+  要不要再来一轮”，以及与 dead 退避比较，不再决定能否入队。
+- **手动入口同一道闸**：`dispatch_now` 与带 `requestId` 的手动派发都走该闸；待审时默认返回
+  `RESULT_AWAITING_REVIEW`，显式 `force=true` 才覆盖，并在同一事务写
+  `audit.action='queue.dispatch_forced'` 与 `queue_item.forced=1`。
+- **实质字段收敛**：`prompt`、`writeScope`、`role`、验收条件（当前 schema 无独立字段，由
+  `prompt` 承载）、`delivery`、`requiresApproval`、`dependsOn`；`writeScope` 与 `dependsOn`
+  按集合比较（换序不算变化）。`source`、`title`、`priority`、`status` 以及 JSON 缩进/键序
+  不参与比较（`task.schema.json` 已写明 `source` 不参与调度）。
+- **待审期间的实质变化**：只写 `task_view.rerun_pending=1` 登记再执行需求，不与待审结果
+  并行派发、不产生第二个待审结果；审批决策落地时清除标记（通过 → `ready` 且
+  `approval_state='none'`，驳回 → `ready`），由下一轮扫描派发新内容。
+- **失败退避**：任务最新队列项为 `dead` 且 `task_hash` 与当前内容一致时退避，不再每 tick
+  新建队列项并重置 attempt 预算；内容实质变化或 `force` 可重新派发。
+- **schema v6**：新增 `queue_item.forced`、`task_view.rerun_pending`。
+- 去重键沿用 `workspace:task:<contentHash>:r<n>`（`r<n>` 取审计 `result.rejected` 计数与既有
+  最大后缀的 `max+1`，队列清理后不回退）。
+- 测试：`TickAsync_PendingReviewInOneWorkspace_DoesNotBlockOtherWorkspaceAsync`、
+  `DispatchNow_WhenResultAwaitingReview_RejectsUnlessForcedAsync`、
+  `TickAsync_PendingReview_IgnoresCosmeticAndMetadataChangesAsync`、
+  `TickAsync_PendingReviewSubstantiveChange_DefersUntilDecisionAsync`、
+  `TickAsync_PermanentlyFailedTask_DoesNotEnqueueEveryTickAsync`。
 
 ### 交付态与重派修正 — 2026-11-08（不可回退、去重代次、角色预算、提问过滤）
 

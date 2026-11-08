@@ -15,9 +15,10 @@ public static class Migrator
 {
     /// <summary>
     /// 当前 schema 版本。V1 = 9 张表；V2 = attempt.usage_estimated；V3 = attempt.usage_available / rounds_exhausted；
-    /// V4 = 旧行 usage_available 回填；V5 = 角色快照、任务角色/依赖/审批列、队列挂起列与问题单表。
+    /// V4 = 旧行 usage_available 回填；V5 = 角色快照、任务角色/依赖/审批列、队列挂起列与问题单表；
+    /// V6 = queue_item.forced（force 派发标记）与 task_view.rerun_pending（待审期间的再执行需求）。
     /// </summary>
-    public const int CurrentVersion = 5;
+    public const int CurrentVersion = 6;
 
     /// <summary>V1 的全部 DDL 与初始数据。</summary>
     private const string SchemaV1 = """
@@ -260,6 +261,22 @@ public static class Migrator
         CREATE INDEX idx_input_task ON input_request(workspace_id, task_id, status);
         """;
 
+    /// <summary>
+    /// V6：入队闸门与重做通道的持久化标记。<b>只加列</b>。
+    /// <para>
+    /// <c>queue_item.forced</c>：1 表示该队列项由显式 <c>force</c> 绕过"同任务已有活跃项或待审结果"闸门创建，
+    /// 审计里同时有 <c>queue.dispatch_forced</c> 记录，便于追责与统计。
+    /// </para>
+    /// <para>
+    /// <c>task_view.rerun_pending</c>：1 表示任务在待审期间发生了实质内容变化，
+    /// 已登记"决策落地后还需再跑一轮"的需求；待审期间不会并行派发。
+    /// </para>
+    /// </summary>
+    private const string SchemaV6 = """
+        ALTER TABLE queue_item ADD COLUMN forced INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE task_view ADD COLUMN rerun_pending INTEGER NOT NULL DEFAULT 0;
+        """;
+
     /// <summary>P0 期望存在的 9 张表（用于启动自检与测试断言）。</summary>
     public static readonly IReadOnlyList<string> ExpectedTables = new[]
     {
@@ -326,6 +343,12 @@ public static class Migrator
         {
             await ExecuteScriptAsync(connection, transaction, SchemaV5, cancellationToken).ConfigureAwait(false);
             version = 5;
+        }
+
+        if (version < 6)
+        {
+            await ExecuteScriptAsync(connection, transaction, SchemaV6, cancellationToken).ConfigureAwait(false);
+            version = 6;
         }
 
         using (var stamp = connection.CreateCommand())

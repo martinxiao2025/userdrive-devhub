@@ -49,7 +49,11 @@ public sealed record QueueItemDetail(QueueItem Item, string TaskTitle, IReadOnly
 public sealed record QueuePage(IReadOnlyList<QueueItem> Items, string? NextCursor);
 
 /// <summary>批量入队结果。</summary>
-public sealed record EnqueueResult(int Enqueued, int Deduped, int SkippedActive);
+/// <param name="Enqueued">新增队列项数。</param>
+/// <param name="Deduped">命中去重或已有待审结果而跳过数。</param>
+/// <param name="SkippedActive">因已有活动队列项而跳过数。</param>
+/// <param name="SkippedBackoff">因同一内容最新队列项已 dead（重试预算耗尽）而退避数。</param>
+public sealed record EnqueueResult(int Enqueued, int Deduped, int SkippedActive, int SkippedBackoff);
 
 /// <summary>单任务手动入队结果。</summary>
 /// <param name="Enqueued">true 表示本次确实写入了队列项。</param>

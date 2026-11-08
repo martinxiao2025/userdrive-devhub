@@ -45,6 +45,9 @@ public sealed class QueueItemEntity
     /// <summary>挂起引用：问题单 id 或审批目标 id。</summary>
     public string? HoldRef { get; set; }
 
+    /// <summary>是否由显式 <c>force</c> 绕过入队闸门创建（v6）。</summary>
+    public bool Forced { get; set; }
+
     /// <summary>最早可认领时间（ISO-8601 字符串）。</summary>
     public string AvailableAt { get; set; } = string.Empty;
 

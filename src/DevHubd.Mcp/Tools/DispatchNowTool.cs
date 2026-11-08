@@ -29,17 +29,17 @@ public sealed class DispatchNowTool
     /// <param name="workspaceId">可选工作区 id。</param>
     /// <param name="provider">auto / openai / vscode。</param>
     /// <param name="dryRun">是否只判定不写入。</param>
-    /// <param name="force">manual 暂停时是否强制入队（仅人工暂停可覆盖）。</param>
+    /// <param name="force">跳过 manual 暂停，并显式覆盖"已有活跃队列项或待审结果"的入队闸门（写审计与 queue_item 标记）。</param>
     /// <param name="requestId">可选幂等键（1–100 字符）；同键重复调用返回首次创建的队列项。</param>
     /// <param name="cancellationToken">取消令牌。</param>
     [McpServerTool(Name = "dispatch_now", ReadOnly = false, Idempotent = true, OpenWorld = false)]
-    [Description("立即把指定任务加入调度队列。默认 dryRun=false 会写入队列；dryRun=true 只返回判定结果。显式指定 provider 时会先校验其可用性。提供 requestId 时同一键重复调用幂等返回首次的队列项。")]
+    [Description("立即把指定任务加入调度队列。默认 dryRun=false 会写入队列；dryRun=true 只返回判定结果。显式指定 provider 时会先校验其可用性。提供 requestId 时同一键重复调用幂等返回首次的队列项。同一工作区 + 任务已有待审结果时默认拒绝，确需覆盖须显式 force=true。")]
     public async Task<CallToolResult> DispatchAsync(
         [Description("任务 id（.devhub/tasks 中的 id）。")] string taskId,
         [Description("可选：工作区 id；同名任务存在于多个工作区时必须指定。")] string? workspaceId = null,
         [Description("首选 provider：" + ToolVocabulary.Providers + "（auto 为默认，按可用性选择）。")] string provider = "auto",
         [Description("true 时只判定不写入。")] bool dryRun = false,
-        [Description("true 时忽略 manual 暂停强行入队；quota/auth 等硬暂停不可覆盖。")] bool force = false,
+        [Description("true 时跳过 manual 暂停，并覆盖「已有活跃队列项 / 待审结果」的入队闸门（会写审计）；quota/auth 等硬暂停不可覆盖。")] bool force = false,
         [Description("可选幂等键（1–100 字符）：同一键重复调用返回首次创建的队列项。")] string? requestId = null,
         CancellationToken cancellationToken = default)
     {
@@ -103,6 +103,15 @@ public sealed class DispatchNowTool
                     "任务状态不是 ready，不能派发。",
                     retryable: false,
                     next: "把任务文件的 status 改为 ready 后重试。",
+                    details: new { taskId, workspaceId = outcome.WorkspaceId },
+                    cancellationToken);
+
+            case DispatchStatus.PendingReview:
+                return await FailureAsync(
+                    "RESULT_AWAITING_REVIEW",
+                    "任务已有待审结果，不能并行派发。",
+                    retryable: true,
+                    next: "先用 result_approve / result_reject 决策，或显式传 force=true 覆盖。",
                     details: new { taskId, workspaceId = outcome.WorkspaceId },
                     cancellationToken);
 

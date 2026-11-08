@@ -93,21 +93,24 @@ public sealed class QueueService
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        // 入队闸门以"结果状态"判定，而不是队列行计数：同一任务当前内容哈希若已有
-        // awaiting_review / delivered 的结果，就不派发。否则队列项一旦进入终态，
-        // 每一轮 tick 都会把同一份内容再跑一次（实测 90 秒内重复执行 4 次）。
-        var blockedPairs = (await db.Results
+        // 闸门只认事实：同一 workspace + task 同一时刻存在活跃队列项或待审结果就不派发。
+        // 这里刻意不比较内容哈希——格式化会改哈希、同名任务会跨工作区串味，
+        // 而"是否有待审结果"本身已经完整表达了"这份内容还没被决策"。
+        // 结果表没有 workspace_id，必须经 queue_item 反查，并按工作区过滤。
+        var pendingReviewTaskIds = (await db.Results
                 .AsNoTracking()
-                .Where(result => result.Outcome == "awaiting_review" || result.Outcome == "delivered")
+                .Where(result => result.Outcome == "awaiting_review")
                 .Join(
                     db.QueueItems.AsNoTracking(),
                     result => result.QueueItemId,
                     item => item.Id,
-                    (result, item) => new { result.TaskId, item.TaskHash })
+                    (result, item) => new { item.WorkspaceId, result.TaskId })
+                .Where(entry => entry.WorkspaceId == workspaceId)
+                .Select(entry => entry.TaskId)
+                .Distinct()
                 .ToListAsync(cancellationToken)
                 .ConfigureAwait(false))
-            .Select(entry => (entry.TaskId, entry.TaskHash))
-            .ToHashSet();
+            .ToHashSet(StringComparer.Ordinal);
 
         // 驳回次数取审计（result.rejected）里的持久计数：被驳回的结果 outcome 会变成 failed，
         // 与传输失败产生的 failed 结果无法区分，因此不能直接数 result.outcome。
@@ -120,6 +123,20 @@ public sealed class QueueService
             .Select(item => new { item.TaskId, item.DedupeKey })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
+
+        // 每个任务最新队列项的终态：用于识别"同一内容已经彻底失败"的任务，避免每 tick 新建队列项
+        // 并重置 attempt 预算。同一内容（task_hash 相同）的最新项是 dead 时进入退避，
+        // 只有内容变化（新需求）或人工 force 才重新派发。
+        var latestItems = (await db.QueueItems
+                .AsNoTracking()
+                .Where(item => item.WorkspaceId == workspaceId)
+                .OrderBy(item => item.CreatedAt)
+                .ThenBy(item => item.Id)
+                .Select(item => new { item.TaskId, item.Status, item.TaskHash })
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false))
+            .GroupBy(item => item.TaskId, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.Last(), StringComparer.Ordinal);
 
         // 一次性取回本工作区所有"未结束"的 task_id：任务在 task_view 中天然唯一，
         // 因此快照判断与逐条 EXISTS 等价，但把 N 次查询收敛成 1 次。
@@ -135,6 +152,7 @@ public sealed class QueueService
         var enqueued = 0;
         var deduped = 0;
         var skippedActive = 0;
+        var skippedBackoff = 0;
 
         foreach (var task in tasks)
         {
@@ -144,10 +162,20 @@ public sealed class QueueService
                 continue;
             }
 
-            // 该内容已有待审或已交付结果：不派发，计入去重（否则终态队列行会诱发重复执行）。
-            if (blockedPairs.Contains((task.Id, task.ContentHash)))
+            // 同一 workspace + task 已有待审结果：不派发（待审期间的实质变化由扫描器登记 rerun_pending，
+            // 决策落地后才进入下一轮），也绝不与待审结果并行。
+            if (pendingReviewTaskIds.Contains(task.Id))
             {
                 deduped++;
+                continue;
+            }
+
+            // 同一内容已经彻底失败（最新队列项 dead）：退避，不再每 tick 新建队列项重置 attempt 预算。
+            if (latestItems.TryGetValue(task.Id, out var latest) &&
+                string.Equals(latest.Status, "dead", StringComparison.Ordinal) &&
+                string.Equals(latest.TaskHash, task.ContentHash, StringComparison.Ordinal))
+            {
+                skippedBackoff++;
                 continue;
             }
 
@@ -190,7 +218,7 @@ public sealed class QueueService
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        return new EnqueueResult(enqueued, deduped, skippedActive);
+        return new EnqueueResult(enqueued, deduped, skippedActive, skippedBackoff);
     }
 
     /// <summary>手动把单个任务入队（<c>dispatch_now</c> 使用，不涉及模型调用）。</summary>
@@ -199,6 +227,7 @@ public sealed class QueueService
     /// <param name="provider">首选 provider。</param>
     /// <param name="dryRun">只判断是否可入队，不写库。</param>
     /// <param name="requestId">可选幂等键；提供时以其作为去重键，同一键重复派发返回首次队列项。</param>
+    /// <param name="force">显式覆盖"已有活跃队列项或待审结果"闸门；为 true 时写入审计与 <c>queue_item.forced</c>。</param>
     /// <param name="cancellationToken">取消令牌。</param>
     public async Task<ManualEnqueueResult> EnqueueTaskAsync(
         string workspaceId,
@@ -206,6 +235,7 @@ public sealed class QueueService
         string provider,
         bool dryRun,
         string? requestId,
+        bool force = false,
         CancellationToken cancellationToken = default)
     {
         var now = Now();
@@ -267,6 +297,24 @@ public sealed class QueueService
             return new ManualEnqueueResult(false, true, existing.Id, "deduped", existing.PreferredProvider);
         }
 
+        // 与自动派发同一道闸：同一 workspace + task 已有待审结果时默认拒绝，
+        // 避免绕过审批语义并行跑出第二个待审结果。确需覆盖必须显式 force。
+        var hasPendingReview = await db.Results
+            .AsNoTracking()
+            .Where(result => result.Outcome == "awaiting_review")
+            .Join(
+                db.QueueItems.AsNoTracking(),
+                result => result.QueueItemId,
+                item => item.Id,
+                (result, item) => new { item.WorkspaceId, result.TaskId })
+            .AnyAsync(entry => entry.WorkspaceId == workspaceId && entry.TaskId == task.Id, cancellationToken)
+            .ConfigureAwait(false);
+
+        if (hasPendingReview && !force)
+        {
+            return new ManualEnqueueResult(false, true, null, "pending_review", null);
+        }
+
         var active = await db.QueueItems
             .AsNoTracking()
             .Where(item =>
@@ -277,7 +325,7 @@ public sealed class QueueService
             .FirstOrDefaultAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        if (active is not null)
+        if (active is not null && !force)
         {
             return new ManualEnqueueResult(false, true, active.Id, "active_exists", active.PreferredProvider);
         }
@@ -311,7 +359,26 @@ public sealed class QueueService
             AvailableAt = now,
             CreatedAt = now,
             UpdatedAt = now,
+            Forced = force,
         });
+
+        if (force)
+        {
+            // force 是显式的人为覆盖，必须留痕：审计记录覆盖原因，队列项本身也带 forced 标记。
+            db.Audits.Add(new AuditEntity
+            {
+                At = now,
+                Actor = "mcp",
+                Action = "queue.dispatch_forced",
+                Subject = id,
+                Provider = provider,
+                Detail = hasPendingReview
+                    ? $"workspace={workspaceId};task={task.Id};override=pending_review"
+                    : active is not null
+                        ? $"workspace={workspaceId};task={task.Id};override=active_exists"
+                        : $"workspace={workspaceId};task={task.Id};override=none",
+            });
+        }
         try
         {
             await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);

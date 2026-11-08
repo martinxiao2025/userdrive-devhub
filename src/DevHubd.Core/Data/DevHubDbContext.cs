@@ -172,6 +172,7 @@ public sealed class DevHubDbContext : DbContext
         entity.Property(item => item.RoleId).HasColumnName("role_id");
         entity.Property(item => item.DependsOn).HasColumnName("depends_on");
         entity.Property(item => item.ApprovalState).HasColumnName("approval_state");
+        entity.Property(item => item.RerunPending).HasColumnName("rerun_pending").HasConversion<int>();
         entity.Property(item => item.SeenAt).HasColumnName("seen_at");
         entity.Property(item => item.UpdatedAt).HasColumnName("updated_at");
 
@@ -204,6 +205,7 @@ public sealed class DevHubDbContext : DbContext
         entity.Property(item => item.RoleId).HasColumnName("role_id");
         entity.Property(item => item.HoldKind).HasColumnName("hold_kind");
         entity.Property(item => item.HoldRef).HasColumnName("hold_ref");
+        entity.Property(item => item.Forced).HasColumnName("forced").HasConversion<int>();
         entity.Property(item => item.AvailableAt).HasColumnName("available_at");
         entity.Property(item => item.LeaseOwner).HasColumnName("lease_owner");
         entity.Property(item => item.LeaseExpiresAt).HasColumnName("lease_expires_at");
