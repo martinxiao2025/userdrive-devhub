@@ -276,7 +276,8 @@ public sealed class QueueService
 
     /// <summary>
     /// 原子认领并返回 attempt id，供执行器回写 attempt 终态。
-    /// 认领条件包含 <c>attempt &lt; max_attempts</c>，避免用尽预算的项被反复认领。
+    /// 认领条件包含"已消耗重试预算的回合数 &lt; max_attempts"，避免用尽预算的项被反复认领；
+    /// 预算口径为 <c>error_code</c> 为空或非 <c>NEEDS_INPUT</c> 的 attempt 数。
     /// </summary>
     /// <remarks>
     /// 这里刻意保留原生 SQL，不能改写成普通 LINQ：
@@ -324,7 +325,13 @@ public sealed class QueueService
                     SELECT id FROM queue_item
                     WHERE status = 'pending'
                       AND available_at <= $now
-                      AND attempt < max_attempts
+                      -- 重试预算按"非 NEEDS_INPUT 回合数"判定：提问挂起不消耗预算，
+                      -- 其余每个真实回合（含进行中、失败、成功）各计 1 次。
+                      AND (
+                            SELECT COUNT(*) FROM attempt a
+                            WHERE a.queue_item_id = queue_item.id
+                              AND (a.error_code IS NULL OR a.error_code <> 'NEEDS_INPUT')
+                          ) < max_attempts
                       AND hold_kind IS NULL
                     ORDER BY priority DESC, created_at ASC, id ASC
                     LIMIT 1
@@ -356,7 +363,18 @@ public sealed class QueueService
                 Provider = item.PreferredProvider,
                 StartedAt = now,
             });
-            await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+
+            try
+            {
+                await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (DbUpdateException exception)
+            {
+                // 单项写入失败必须可被上层按项隔离：带上队列项标识抛出，
+                // 由调度泵把该行推迟后继续处理同批其它项，而不是让整个 tick 失败。
+                await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+                throw new QueueItemClaimException(item.Id, item.TaskId, exception);
+            }
         }
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);

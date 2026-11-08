@@ -164,13 +164,13 @@ public sealed class ExecutionStore
 
     /// <summary>
     /// 把队列项放回 pending（可重试或资源类错误退避）。
-    /// <paramref name="decrementAttempt"/> 为 true 时同时回退 attempt，表达"资源类失败不消耗重试预算"。
+    /// <c>attempt</c> 单调递增、不再回退：重试预算由
+    /// <see cref="CountConsumingAttemptsAsync"/> 按"非 NEEDS_INPUT 回合数"口径单独判定。
     /// </summary>
     /// <param name="queueItemId">队列项 id。</param>
     /// <param name="availableAt">下次可认领时间。</param>
     /// <param name="errorCode">错误码。</param>
     /// <param name="lastError">错误说明。</param>
-    /// <param name="decrementAttempt">是否回退 attempt。</param>
     /// <param name="now">时间戳。</param>
     /// <param name="cancellationToken">取消令牌。</param>
     public async Task RescheduleAsync(
@@ -178,34 +178,12 @@ public sealed class ExecutionStore
         string availableAt,
         string errorCode,
         string lastError,
-        bool decrementAttempt,
         string now,
         CancellationToken cancellationToken = default)
     {
         await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
-        var target = db.QueueItems.Where(item => item.Id == queueItemId);
-
-        if (decrementAttempt)
-        {
-            // CASE WHEN attempt > 0 THEN attempt - 1 ELSE attempt END 交给 SQL 求值，
-            // 避免"先读后写"带来的并发窗口。
-            await target
-                .ExecuteUpdateAsync(
-                    setters => setters
-                        .SetProperty(item => item.Status, "pending")
-                        .SetProperty(item => item.LeaseOwner, (string?)null)
-                        .SetProperty(item => item.LeaseExpiresAt, (string?)null)
-                        .SetProperty(item => item.AvailableAt, availableAt)
-                        .SetProperty(item => item.LastErrorCode, errorCode)
-                        .SetProperty(item => item.LastError, lastError)
-                        .SetProperty(item => item.Attempt, item => item.Attempt > 0 ? item.Attempt - 1 : item.Attempt)
-                        .SetProperty(item => item.UpdatedAt, now),
-                    cancellationToken)
-                .ConfigureAwait(false);
-            return;
-        }
-
-        await target
+        await db.QueueItems
+            .Where(item => item.Id == queueItemId)
             .ExecuteUpdateAsync(
                 setters => setters
                     .SetProperty(item => item.Status, "pending")
@@ -220,9 +198,30 @@ public sealed class ExecutionStore
     }
 
     /// <summary>
-    /// 任务因缺少输入而挂起：队列项回到 <c>pending</c> 并写入 <c>hold_kind='input'</c>，
-    /// 同时回退 attempt（提问不消耗重试预算）。挂起项不占用并发槽、不参与自动重试，
-    /// 认领谓词的 <c>hold_kind IS NULL</c> 排除它，直到回答清除 hold。
+    /// 统计该队列项已消耗重试预算的回合数：<c>error_code</c> 为空或不是 <c>NEEDS_INPUT</c> 的 attempt。
+    /// 提问挂起不消耗预算，其余每真实回合计 1 次；认领闸门与失败重试上限共用这一口径。
+    /// </summary>
+    /// <param name="queueItemId">队列项 id。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    public async Task<int> CountConsumingAttemptsAsync(
+        string queueItemId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        return await db.Attempts
+            .AsNoTracking()
+            .CountAsync(
+                attempt => attempt.QueueItemId == queueItemId &&
+                           (attempt.ErrorCode == null || attempt.ErrorCode != DevHubErrorCodes.NeedsInput),
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 任务因缺少输入而挂起：队列项回到 <c>pending</c> 并写入 <c>hold_kind='input'</c>。
+    /// 挂起项不占用并发槽、不参与自动重试，认领谓词的 <c>hold_kind IS NULL</c> 排除它，
+    /// 直到回答清除 hold。<c>attempt</c> 不回退：每个真实回合都有独立 attempt 行，
+    /// 提问回合由 <see cref="CountConsumingAttemptsAsync"/> 排除在重试预算之外。
     /// </summary>
     /// <param name="queueItemId">队列项 id。</param>
     /// <param name="inputRequestId">问题单 id。</param>
@@ -245,7 +244,6 @@ public sealed class ExecutionStore
                     .SetProperty(item => item.LeaseOwner, (string?)null)
                     .SetProperty(item => item.LeaseExpiresAt, (string?)null)
                     .SetProperty(item => item.AvailableAt, now)
-                    .SetProperty(item => item.Attempt, item => item.Attempt > 0 ? item.Attempt - 1 : item.Attempt)
                     .SetProperty(item => item.LastErrorCode, (string?)null)
                     .SetProperty(item => item.LastError, (string?)null)
                     .SetProperty(item => item.UpdatedAt, now),

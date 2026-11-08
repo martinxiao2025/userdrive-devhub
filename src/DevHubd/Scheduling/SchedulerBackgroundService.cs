@@ -79,7 +79,23 @@ public sealed class SchedulerBackgroundService : BackgroundService
                 var interval = Clamp(state.IntervalSeconds > 0 ? state.IntervalSeconds : _options.IntervalSeconds);
 
                 var result = await _engine.TickAsync(stoppingToken).ConfigureAwait(false);
-                var started = await _coordinator.PumpAsync(stoppingToken).ConfigureAwait(false);
+
+                // 单项失败已在协调器内按项隔离；这里兜住泵级异常，
+                // 保证一次 tick 的扫描/统计不被中断，也不触发整轮 5 秒退避。
+                var started = 0;
+                try
+                {
+                    started = await _coordinator.PumpAsync(stoppingToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception exception)
+                {
+                    _logger.LogError(exception, "执行泵异常，本轮 tick 已结束，下次 tick 继续。");
+                }
+
                 _logger.LogDebug(
                     "调度 tick 完成：skipped={Skipped} scanned={Scanned} enqueued={Enqueued} reclaimed={Reclaimed} started={Started}",
                     result.Skipped,

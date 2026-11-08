@@ -349,9 +349,9 @@ public sealed class P2ExecutionTests : IDisposable
         Assert.Equal(ProviderStates.Ready, vsCode!.State);
         Assert.Equal(BreakerStates.Closed, vsCode.Breaker);
 
-        // 资源类失败回退 attempt，队列项仍在 pending，等 provider 恢复。
+        // 资源类失败不再回退 attempt：attempt 单调递增，重试预算按"非 NEEDS_INPUT 回合数"判定。
         Assert.Equal("pending", await ScalarStringAsync("SELECT status FROM queue_item;", ct));
-        Assert.Equal(0L, await ScalarLongAsync("SELECT attempt FROM queue_item;", ct));
+        Assert.Equal(1L, await ScalarLongAsync("SELECT attempt FROM queue_item;", ct));
     }
 
     /// <summary>
@@ -485,16 +485,18 @@ public sealed class P2ExecutionTests : IDisposable
         Assert.NotNull(ddl);
         await ExecuteAsync("DROP TABLE provider_state;", ct);
 
-        await Assert.ThrowsAsync<SqliteException>(() => coordinator.PumpAsync(ct));
+        // 单项故障隔离：派发阶段失败不再向上抛，tick 正常返回 0。
+        Assert.Equal(0, await coordinator.PumpAsync(ct));
 
         // 恢复表后再次 Pump：若槽位泄漏，这里会因 MaxParallel=1 而返回 0。
+        // 上一项仍处于 claimed（租约未到期），本轮认领的是另一个任务。
         await ExecuteAsync(ddl!, ct);
         Assert.Equal(1, await coordinator.PumpAsync(ct));
         await WaitUntilAsync(async () => await CountAsync("SELECT COUNT(*) FROM result;", ct) == 1, ct);
     }
 
     [Fact]
-    public async Task Pump_WhenModelAsksInput_HoldsItemWithoutConsumingAttemptAsync()
+    public async Task Pump_WhenModelAsksInput_HoldsItemWithMonotonicAttemptAsync()
     {
         var ct = TestContext.Current.CancellationToken;
         var root = CreateWorkspace("alpha");
@@ -522,12 +524,15 @@ public sealed class P2ExecutionTests : IDisposable
                 ct) == "pending",
             ct);
 
-        // 挂起：pending + hold_kind=input，attempt 回退（提问不消耗重试预算）。
+        // 挂起：pending + hold_kind=input；attempt 保持 1（单调递增，不再回退）。
         Assert.Equal(
-            "pending|input|0",
+            "pending|input|1",
             await ScalarStringAsync(
                 "SELECT status || '|' || hold_kind || '|' || attempt FROM queue_item WHERE task_id = 'T-001';",
                 ct));
+        // 但该回合不计入重试预算：消耗预算的回合数为 0。
+        var queueItemId = await ScalarStringAsync("SELECT id FROM queue_item WHERE task_id = 'T-001';", ct);
+        Assert.Equal(0, await _store.CountConsumingAttemptsAsync(queueItemId!, ct));
         Assert.Equal(
             "open",
             await ScalarStringAsync("SELECT status FROM input_request WHERE task_id = 'T-001';", ct));
@@ -543,6 +548,159 @@ public sealed class P2ExecutionTests : IDisposable
 
         // 挂起项不参与认领：再 Pump 也不会重复执行（重启后同样成立，因为 hold 在持久化层）。
         Assert.Equal(0, await coordinator.PumpAsync(ct));
+        Assert.Equal(1, fake.Calls);
+    }
+
+    /// <summary>
+    /// 回答 → 重新认领 → 执行 → 产生结果 的完整回路：
+    /// 提问回合保留 <c>attempt_no=1</c>（abandoned/NEEDS_INPUT）与其 token；
+    /// 回答清 hold 后，同一队列项以 <c>attempt_no=2</c> 重新执行并产出 awaiting_review 结果。
+    /// </summary>
+    [Fact]
+    public async Task Pump_AfterAnswer_ResumesWithNewAttemptAndProducesResultAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "需要输入", "ready", 10);
+        await InsertAskableRoleAsync(ct);
+        await PrepareQueueAsync(ct);
+
+        var calls = 0;
+        var fake = new FakeModelClient(
+            "openai",
+            async (request, dispatcher, token) =>
+            {
+                if (Interlocked.Increment(ref calls) == 1)
+                {
+                    using var payload = JsonDocument.Parse(
+                        """{"question":"写入哪个目录？","context":"任务未声明 writeScope","options":[{"id":"src","label":"src","recommended":true},{"id":"docs","label":"docs"}],"missingInputs":["writeScope"]}""");
+                    var result = await dispatcher.ExecuteAsync(request.TurnId, "ask_input", payload.RootElement, token);
+                    Assert.True(result.Success, result.ErrorMessage);
+                    return TurnResult.Done("缺少写入目录，已提问。", 1, new TokenUsage(150, 20, false), Array.Empty<string>());
+                }
+
+                return TurnResult.Done("已按回答写入 src 目录。", 0, new TokenUsage(70, 30, false), Array.Empty<string>());
+            });
+
+        var coordinator = CreateCoordinator(fake, new ExecutionOptions { MaxParallel = 1 });
+
+        // 第一回合：模型提问 → 队列项挂起，尚无结果。
+        Assert.Equal(1, await coordinator.PumpAsync(ct));
+        await WaitUntilAsync(
+            async () => await CountAsync("SELECT COUNT(*) FROM queue_item WHERE hold_kind = 'input';", ct) == 1,
+            ct);
+        await WaitUntilAsync(() => Task.FromResult(coordinator.ActiveCount == 0), ct);
+
+        Assert.Equal(0, await CountAsync("SELECT COUNT(*) FROM result;", ct));
+        Assert.Equal(1, fake.Calls);
+
+        var queueItemId = await ScalarStringAsync("SELECT id FROM queue_item WHERE task_id = 'T-001';", ct);
+        var requestId = await ScalarStringAsync("SELECT id FROM input_request WHERE task_id = 'T-001';", ct);
+        Assert.NotNull(queueItemId);
+        Assert.NotNull(requestId);
+        Assert.Equal(0, await _store.CountConsumingAttemptsAsync(queueItemId!, ct));
+
+        // 会话侧回答：清 hold，队列项回到可认领状态。
+        var answered = await new InputRequestStore(_factory).AnswerAsync(
+            requestId!,
+            "src",
+            "src",
+            "tester",
+            "idem-resume",
+            ct);
+        Assert.Equal(InputAnswerStatus.Answered, answered.Status);
+        Assert.Equal(queueItemId, answered.ResumedQueueItemId);
+        Assert.Equal("pending", await ScalarStringAsync("SELECT status FROM queue_item WHERE task_id = 'T-001';", ct));
+        Assert.Equal(
+            1,
+            await CountAsync("SELECT COUNT(*) FROM queue_item WHERE task_id = 'T-001' AND hold_kind IS NULL;", ct));
+
+        // 第二回合：重新认领（attempt_no=2）并按回答继续执行，产出结果。
+        Assert.Equal(1, await coordinator.PumpAsync(ct));
+        await WaitUntilAsync(async () => await CountAsync("SELECT COUNT(*) FROM result;", ct) == 1, ct);
+
+        Assert.Equal(2, fake.Calls);
+        Assert.Equal("succeeded", await ScalarStringAsync("SELECT status FROM queue_item WHERE task_id = 'T-001';", ct));
+        Assert.Equal("awaiting_review", await ScalarStringAsync("SELECT outcome FROM result;", ct));
+
+        // attempt 只增不减：两次真实回合各占一行，编号 1、2。
+        Assert.Equal(
+            "1,2",
+            await ScalarStringAsync(
+                "SELECT group_concat(attempt_no, ',') FROM (SELECT attempt_no FROM attempt ORDER BY attempt_no);",
+                ct));
+        Assert.Equal(
+            "abandoned|NEEDS_INPUT",
+            await ScalarStringAsync(
+                "SELECT outcome || '|' || error_code FROM attempt WHERE attempt_no = 1;",
+                ct));
+        Assert.Equal("succeeded", await ScalarStringAsync("SELECT outcome FROM attempt WHERE attempt_no = 2;", ct));
+        Assert.Equal(1, await CountAsync("SELECT COUNT(*) FROM attempt WHERE attempt_no = 2 AND error_code IS NULL;", ct));
+
+        // token 用量按回合保留并可按队列项聚合，提问回合的消耗不丢。
+        Assert.Equal(220L, await ScalarLongAsync("SELECT SUM(input_tokens) FROM attempt;", ct));
+        Assert.Equal(50L, await ScalarLongAsync("SELECT SUM(output_tokens) FROM attempt;", ct));
+
+        // 预算口径：非 NEEDS_INPUT 回合数 = 1（仅第二回合）。
+        Assert.Equal(1, await _store.CountConsumingAttemptsAsync(queueItemId!, ct));
+
+        var detail = await _queue.GetAsync(queueItemId!, ct);
+        Assert.Equal(2, detail!.Attempts.Count);
+    }
+
+    /// <summary>
+    /// 单项认领失败必须按项隔离：预插同一 <c>(queue_item_id, attempt_no)</c> 制造唯一冲突后，
+    /// 该队列项被推迟并记录 <c>CLAIM_FAILED</c>，同一 tick 内其它队列项照常执行并产出结果。
+    /// </summary>
+    [Fact]
+    public async Task Pump_WhenClaimFailsForOneItem_IsolatesAndContinuesOthersAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "毒化队列项", "ready", 20);
+        WriteTask(root, "T-002", "正常队列项", "ready", 10);
+        await PrepareQueueAsync(ct);
+
+        var poisonedId = await ScalarStringAsync("SELECT id FROM queue_item WHERE task_id = 'T-001';", ct);
+        Assert.NotNull(poisonedId);
+
+        // 认领会把 attempt 0 → 1 并插入 attempt_no=1；预插同号行触发 UNIQUE 冲突。
+        await ExecuteAsync(
+            $"INSERT INTO attempt (id, queue_item_id, attempt_no, provider, started_at) VALUES ('poison', '{poisonedId}', 1, 'openai', '2026-01-01T00:00:00Z');",
+            ct);
+
+        var fake = new FakeModelClient(
+            "openai",
+            (request, _, _) => Task.FromResult(
+                TurnResult.Done($"完成 {request.TaskId}", 0, new TokenUsage(5, 5, false), Array.Empty<string>())));
+
+        var coordinator = CreateCoordinator(fake, new ExecutionOptions { MaxParallel = 2 });
+
+        // 不抛异常、返回 1（只有 T-002 启动）：坏行不阻塞同批。
+        Assert.Equal(1, await coordinator.PumpAsync(ct));
+        await WaitUntilAsync(async () => await CountAsync("SELECT COUNT(*) FROM result;", ct) == 1, ct);
+
+        // 毒化项：认领事务已回滚，attempt 保持 0，回到 pending 并记录 CLAIM_FAILED。
+        Assert.Equal(
+            "pending|CLAIM_FAILED|0",
+            await ScalarStringAsync(
+                "SELECT status || '|' || last_error_code || '|' || attempt FROM queue_item WHERE task_id = 'T-001';",
+                ct));
+        Assert.Equal(
+            0,
+            await CountAsync("SELECT COUNT(*) FROM attempt WHERE queue_item_id = (SELECT id FROM queue_item WHERE task_id = 'T-001') AND id <> 'poison';", ct));
+
+        // 同批的 T-002 正常执行并产出结果。
+        Assert.Equal(
+            "succeeded",
+            await ScalarStringAsync("SELECT status FROM queue_item WHERE task_id = 'T-002';", ct));
+        Assert.Equal(
+            "awaiting_review",
+            await ScalarStringAsync(
+                "SELECT outcome FROM result WHERE task_id = 'T-002';",
+                ct));
         Assert.Equal(1, fake.Calls);
     }
 

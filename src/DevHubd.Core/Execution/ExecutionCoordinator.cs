@@ -79,9 +79,32 @@ public sealed class ExecutionCoordinator
             var slotHandedOff = false;
             try
             {
-                var claimed = await _queue
-                    .ClaimDetailedAsync(_ownerId, TimeSpan.FromSeconds(_options.LeaseSeconds), cancellationToken)
-                    .ConfigureAwait(false);
+                ClaimedQueueItem? claimed;
+                try
+                {
+                    claimed = await _queue
+                        .ClaimDetailedAsync(_ownerId, TimeSpan.FromSeconds(_options.LeaseSeconds), cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (QueueItemClaimException exception)
+                {
+                    // 按项隔离：把失败的队列项推迟 30 秒，继续认领同批其它项；
+                    // 单个坏行不再中断整个 tick，也不会堵死低优先级任务。
+                    await _store.RescheduleAsync(
+                        exception.QueueItemId,
+                        DateTimeOffset.UtcNow.AddSeconds(30).ToString("O"),
+                        DevHubErrorCodes.ClaimFailed,
+                        Truncate(exception.Message),
+                        Now(),
+                        cancellationToken).ConfigureAwait(false);
+
+                    _logger.LogError(
+                        exception.InnerException ?? exception,
+                        "队列项认领失败，已推迟 30 秒：queueItemId={QueueItemId} taskId={TaskId}",
+                        exception.QueueItemId,
+                        exception.TaskId);
+                    continue;
+                }
 
                 if (claimed is null)
                 {
@@ -106,6 +129,16 @@ public sealed class ExecutionCoordinator
                 _active[claimed.Item.Id] = task;
                 slotHandedOff = true;
                 started++;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                // 认领成功但派发阶段失败：结束本轮，不抛出；已认领项由租约到期后的 reclaim 兜底重派。
+                _logger.LogError(exception, "派发队列项失败，本轮已隔离该项。");
+                break;
             }
             finally
             {
@@ -413,14 +446,14 @@ public sealed class ExecutionCoordinator
                     .RecordFailureAsync(outcome.Provider, error.Kind, error.Message, cancellationToken)
                     .ConfigureAwait(false);
 
-                // 资源类失败不消耗重试预算；配额冷却 15 分钟，其余 60 秒后由探测/下一次认领恢复。
+                // 资源类失败不再回退 attempt；是否继续重试由"非 NEEDS_INPUT 回合数"预算决定，
+                // 配额冷却 15 分钟，其余 60 秒后由探测/下一次认领恢复。
                 var delay = error.Kind == ModelErrorKinds.Quota ? TimeSpan.FromMinutes(15) : TimeSpan.FromSeconds(60);
                 await _store.RescheduleAsync(
                     item.Id,
                     DateTimeOffset.UtcNow.Add(delay).ToString("O"),
                     error.Code,
                     Truncate(error.Message),
-                    decrementAttempt: true,
                     now,
                     cancellationToken).ConfigureAwait(false);
 
@@ -476,7 +509,6 @@ public sealed class ExecutionCoordinator
                     now,
                     error.Code,
                     Truncate(error.Message),
-                    decrementAttempt: true,
                     now,
                     cancellationToken).ConfigureAwait(false);
                 break;
@@ -566,7 +598,13 @@ public sealed class ExecutionCoordinator
     {
         var item = claimed.Item;
 
-        if (item.Attempt < maxAttempts)
+        // 重试预算口径：已消耗预算的回合数（error_code 为空或非 NEEDS_INPUT 的 attempt）。
+        // 提问挂起的回合不计数，因此"问一次再失败"不会被误判为已用尽重试。
+        var consumedAttempts = await _store
+            .CountConsumingAttemptsAsync(item.Id, cancellationToken)
+            .ConfigureAwait(false);
+
+        if (consumedAttempts < maxAttempts)
         {
             var delay = backoff ?? TimeSpan.FromSeconds(
                 _transientBackoffSeconds[Math.Min(item.Attempt - 1, _transientBackoffSeconds.Length - 1)]);
@@ -576,7 +614,6 @@ public sealed class ExecutionCoordinator
                 DateTimeOffset.UtcNow.Add(delay).ToString("O"),
                 error.Code,
                 Truncate(error.Message),
-                decrementAttempt: false,
                 now,
                 cancellationToken).ConfigureAwait(false);
             return;
@@ -691,7 +728,6 @@ public sealed class ExecutionCoordinator
             DateTimeOffset.UtcNow.AddSeconds(60).ToString("O"),
             "PROVIDER_BLOCKED",
             message,
-            decrementAttempt: true,
             now,
             cancellationToken).ConfigureAwait(false);
     }

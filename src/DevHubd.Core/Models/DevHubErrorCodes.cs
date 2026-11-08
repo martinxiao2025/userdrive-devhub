@@ -103,4 +103,7 @@ public static class DevHubErrorCodes
 
     /// <summary>进程重启导致上一个进程的回合中断（attempt 兜底为 abandoned）。</summary>
     public const string ProcessRestart = "PROCESS_RESTART";
+
+    /// <summary>队列项认领失败（attempt 写入冲突等），该项已推迟、不计入重试预算。</summary>
+    public const string ClaimFailed = "CLAIM_FAILED";
 }

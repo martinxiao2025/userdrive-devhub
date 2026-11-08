@@ -51,6 +51,7 @@
 | 时间 | **UTC + `Z`**，固定 7 位小数：`2026-11-08T04:09:03.1234567Z` |
 | 分页 | `limit` 默认 20（`result_list` 为 10）、上限 100；`nextCursor` 为不透明字符串，`null` 表示到底 |
 | 只读 | `scheduler_status` / `queue_list` / `queue_get` / `result_list` 无副作用 |
+| id 形态 | 结果 / 队列项 / 问题单的 `id` **一律使用 `result_list` / `queue_list` / `input_request_list` 输出的紧凑形式**（32 位十六进制，无连字符）。带连字符的 GUID、`Queue-`/`Result-` 等前缀形式**不受支持**，传入返回 `UNKNOWN_RESULT` / `UNKNOWN_INPUT_REQUEST` 或空结果 |
 
 ---
 
@@ -278,13 +279,35 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 | 连续 3 次工具错误 | `failed` | `errorCode` 为工具自身稳定码（如 `FILE_NOT_FOUND`），`errorKind=tool_error` |
 | 回合超时/停机取消 | `cancelled` | attempt `outcome=cancelled` |
 | provider 未返回 usage | 任意 | `usageAvailable=false`，token 三列为 `null` |
+| 队列项认领写入冲突 | 原状态保持 | 该项推迟 30 秒并写 `lastErrorCode=CLAIM_FAILED`，同一 tick 其它项照常执行 |
 
 `roundsExhausted` 只表示“预算用完”，不改变状态；自动化流程应把 `roundsExhausted=true`
 视同需要人工复核，不得当成“任务已完成”。
 
+**重试预算口径**：预算只看 `attempt` 表中**非 `NEEDS_INPUT` 回合数**：
+`COUNT(attempt WHERE queue_item_id=? AND (error_code IS NULL OR error_code <> 'NEEDS_INPUT')) < max_attempts`
+才允许认领。`queue_item.attempt` 单调递增、挂起时不回退，因此 `attempt` 字段是“真实回合序号”
+而不是“已消耗预算数”；`queue_get.attempts[]` 会按 `attemptNo` 保留每次真实回合（含提问回合的 token）。
+
 ---
 
 ## 6. 变更记录
+
+### B 变体修复 — 2026-11-08（attempt 单调、预算改按回合数、tick 单项隔离）
+
+- **attempt 只增不减**：删除挂起时对 `queue_item.attempt` 的回退。每次真实认领都会递增并插入
+  独立的 `attempt.attempt_no`，提问回合（`outcome=abandoned`、`error_kind=needs_input`）的 token
+  与工具调用次数一并保留，`queue_get.attempts[]` 可看到完整回合序列（如 `1,2`）。
+  修复了「回答后重新认领插入重复 `attempt_no` 触发 `UNIQUE(queue_item_id, attempt_no)`」的阻塞缺陷。
+- **重试预算改为按非 `NEEDS_INPUT` 回合数判定**：认领 SQL 的预算谓词与
+  `ExecutionStore.CountConsumingAttemptsAsync` 共用同一口径（见 §5），不再依赖回退计数器。
+  由此资源类失败（`AUTH_FAILED`/`QUOTA_EXHAUSTED`/`NO_MODEL`/`BRIDGE_DOWN`）**现在也消耗预算**，
+  与旧文档「资源类失败不消耗预算」不同；如需继续豁免，属后续单独决策。
+- **单个队列项失败不中断 tick**：认领写入冲突抛 `QueueItemClaimException` 后回滚事务，该项
+  `reschedule(now+30s, CLAIM_FAILED)` 并继续同批其它项；泵级异常由调度后台服务兜住，本轮 tick
+  正常结束、不触发 5 秒整轮退避。新增错误码 `CLAIM_FAILED`。
+- **id 契约收紧**：result / queue / input_request 的 `id` 只接受列表工具输出的紧凑形式，
+  带连字符形式不支持（见 §1.3）。
 
 ### U12 — 2026-11-08（无状态整改：档位以库为准、派发幂等、探测异步、重启兜底）
 
@@ -317,7 +340,7 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 
 - 模型侧工具面新增 `ask_input`：仅当角色 `canRequestInput=true` 时暴露；每回合最多提问一次，第二次调用返回既有 `requestId` 提示而不重复落库。
 - 提问写入 `input_request`：`dedupe_key = workspace/task/task_hash/question_hash`，同一任务只保留一条 `open`；重复提问复用既有 id。
-- 提问回合记 `attempt.outcome='abandoned'`、`error_kind='needs_input'`，token 与工具调用次数照实保留；`queue_item` 回到 `pending` 并写 `hold_kind='input'`/`hold_ref`，attempt 回退（不消耗重试预算）。
+- 提问回合记 `attempt.outcome='abandoned'`、`error_kind='needs_input'`，token 与工具调用次数照实保留；`queue_item` 回到 `pending` 并写 `hold_kind='input'`/`hold_ref`。**（本条当时的「attempt 回退」实现已被上方 B 变体修复取代：attempt 只增不减，预算改按非 `NEEDS_INPUT` 回合数判定。）**
 - 认领谓词追加 `hold_kind IS NULL`：挂起项不占并发槽、不参与自动重试，重启后保持挂起。
 - 每次 tick 在入队前取消"任务内容已变更"的旧 `open` 问题单，并终止其挂起队列项（`last_error_code=TASK_CHANGED`），避免旧答案答到新任务。
 - 挂起时写 `notice.kind='failure'`（标题以「需要输入」开头）提示会话侧取回；`devhub://limits` 的工具白名单包含 `ask_input`。
