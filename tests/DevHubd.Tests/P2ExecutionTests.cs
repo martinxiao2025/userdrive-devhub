@@ -349,9 +349,32 @@ public sealed class P2ExecutionTests : IDisposable
         Assert.Equal(ProviderStates.Ready, vsCode!.State);
         Assert.Equal(BreakerStates.Closed, vsCode.Breaker);
 
-        // 资源类失败不再回退 attempt：attempt 单调递增，重试预算按"非 NEEDS_INPUT 回合数"判定。
+        // 资源类失败不消耗重试预算：连续 4 个 auth 回合仍可继续认领（max_attempts=3 也不会被闸门挡死）。
+        var queueItemId = await ScalarStringAsync("SELECT id FROM queue_item;", ct);
+        Assert.NotNull(queueItemId);
+        Assert.Equal("auth", await ScalarStringAsync("SELECT error_kind FROM attempt ORDER BY attempt_no DESC LIMIT 1;", ct));
+        Assert.Equal(0, await _store.CountConsumingAttemptsAsync(queueItemId!, ct));
+
+        for (var round = 2; round <= 4; round++)
+        {
+            await ExecuteAsync("UPDATE queue_item SET available_at = '2000-01-01T00:00:00Z';", ct);
+
+            // 熔断已打开时本轮只认领即释放（started=0），但 attempt 仍递增，预算豁免照样成立。
+            await coordinator.PumpAsync(ct);
+            var expected = (long)round;
+            await WaitUntilAsync(
+                async () => await ScalarLongAsync("SELECT attempt FROM queue_item;", ct) == expected
+                    && string.Equals(
+                        await ScalarStringAsync("SELECT status FROM queue_item;", ct),
+                        "pending",
+                        StringComparison.Ordinal),
+                ct);
+        }
+
+        // 资源类失败不再回退 attempt：attempt 单调递增，重试预算按非 NEEDS_INPUT 且非资源类回合数判定。
         Assert.Equal("pending", await ScalarStringAsync("SELECT status FROM queue_item;", ct));
-        Assert.Equal(1L, await ScalarLongAsync("SELECT attempt FROM queue_item;", ct));
+        Assert.Equal(4L, await ScalarLongAsync("SELECT attempt FROM queue_item;", ct));
+        Assert.Equal(0, await _store.CountConsumingAttemptsAsync(queueItemId!, ct));
     }
 
     /// <summary>
@@ -567,10 +590,12 @@ public sealed class P2ExecutionTests : IDisposable
         await PrepareQueueAsync(ct);
 
         var calls = 0;
+        var prompts = new List<string>();
         var fake = new FakeModelClient(
             "openai",
             async (request, dispatcher, token) =>
             {
+                prompts.Add(request.UserPrompt);
                 if (Interlocked.Increment(ref calls) == 1)
                 {
                     using var payload = JsonDocument.Parse(
@@ -580,6 +605,10 @@ public sealed class P2ExecutionTests : IDisposable
                     return TurnResult.Done("缺少写入目录，已提问。", 1, new TokenUsage(150, 20, false), Array.Empty<string>());
                 }
 
+                // 恢复回合必须看得到人工回答，才决定继续执行。
+                Assert.Contains("## 此前的人工回答", request.UserPrompt, StringComparison.Ordinal);
+                Assert.Contains("写入哪个目录？", request.UserPrompt, StringComparison.Ordinal);
+                Assert.Contains("用户回答：src", request.UserPrompt, StringComparison.Ordinal);
                 return TurnResult.Done("已按回答写入 src 目录。", 0, new TokenUsage(70, 30, false), Array.Empty<string>());
             });
 
@@ -594,7 +623,7 @@ public sealed class P2ExecutionTests : IDisposable
 
         Assert.Equal(0, await CountAsync("SELECT COUNT(*) FROM result;", ct));
         Assert.Equal(1, fake.Calls);
-
+        Assert.DoesNotContain("## 此前的人工回答", prompts[0], StringComparison.Ordinal);
         var queueItemId = await ScalarStringAsync("SELECT id FROM queue_item WHERE task_id = 'T-001';", ct);
         var requestId = await ScalarStringAsync("SELECT id FROM input_request WHERE task_id = 'T-001';", ct);
         Assert.NotNull(queueItemId);

@@ -279,19 +279,68 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 | 连续 3 次工具错误 | `failed` | `errorCode` 为工具自身稳定码（如 `FILE_NOT_FOUND`），`errorKind=tool_error` |
 | 回合超时/停机取消 | `cancelled` | attempt `outcome=cancelled` |
 | provider 未返回 usage | 任意 | `usageAvailable=false`，token 三列为 `null` |
+| provider / 桥资源不可用（auth / quota / no_model / bridge_down） | 原状态保持 | 推迟后重试，不消耗重试预算；`error_kind` 为上述四类之一 |
 | 队列项认领写入冲突 | 原状态保持 | 该项推迟 30 秒并写 `lastErrorCode=CLAIM_FAILED`，同一 tick 其它项照常执行 |
 
 `roundsExhausted` 只表示“预算用完”，不改变状态；自动化流程应把 `roundsExhausted=true`
 视同需要人工复核，不得当成“任务已完成”。
 
-**重试预算口径**：预算只看 `attempt` 表中**非 `NEEDS_INPUT` 回合数**：
-`COUNT(attempt WHERE queue_item_id=? AND (error_code IS NULL OR error_code <> 'NEEDS_INPUT')) < max_attempts`
-才允许认领。`queue_item.attempt` 单调递增、挂起时不回退，因此 `attempt` 字段是“真实回合序号”
-而不是“已消耗预算数”；`queue_get.attempts[]` 会按 `attemptNo` 保留每次真实回合（含提问回合的 token）。
+**读写根**：同一回合内 `read_file` / `list_dir` 与 `write_file` 使用**同一个根**：
+`delivered`（auto）档位为工作区根，`dispatch_only` 档位为该队列项的隔离工作目录。
+模型因此能读到自己在上一回合写入的文件；相对路径同时用于读和写，不再出现“写进了隔离目录、却从工作区读”的错位。
+
+**重试预算口径**：预算只看 `attempt` 表中**非 `NEEDS_INPUT` 且非资源类失败**的回合数：
+
+```
+COUNT(attempt WHERE queue_item_id = ?
+                 AND (error_code IS NULL OR error_code <> 'NEEDS_INPUT')
+                 AND (error_kind IS NULL OR error_kind NOT IN ('auth','quota','no_model','bridge_down')))
+  < max_attempts
+```
+
+才允许认领。`AUTH_FAILED` / `QUOTA_EXHAUSTED` / `NO_MODEL` / `BRIDGE_DOWN` 由 provider / 桥自身不可用导致，
+与任务无关，因此和提问挂起一样不消耗预算；`PROVIDER_BLOCKED`（`error_kind=quota`）同样豁免。
+`queue_item.attempt` 单调递增、挂起时不回退，因此 `attempt` 字段是“真实回合序号”而不是“已消耗预算数”；
+`queue_get.attempts[]` 会按 `attemptNo` 保留每次真实回合（含提问回合、资源类失败回合的 token）。
+
+**恢复回合的答案注入**：认领恢复时，`TurnRunner` 读取同一 `queue_item` 下所有 `status='answered'` 的问题单，
+按提问时间升序追加到任务指令之后：
+
+```
+## 此前的人工回答
+
+系统已把你在之前回合提出的问题与用户回答附在下面（按提问时间排序）。请直接采用这些回答继续执行，不要就已回答的问题再次调用 ask_input。
+
+### 回答 1（提问于 2026-11-08T11:40:15.000Z）
+问题：写入哪个目录？
+选项：src（推荐）；docs
+用户回答：src（选中选项：src）
+回答时间：2026-11-08T11:40:37.129Z（e2e-operator）
+```
+
+截断策略：单条问题保留前 500 字符、单条回答保留前 1000 字符，超出追加 `…（截断）`；
+整个回答段上限 8000 字符，超限时从最早的回答开始丢弃，并在段首标注「更早的 N 条回答因长度限制已省略」。
+已取消 / 已过期的问题单不注入。
 
 ---
 
 ## 6. 变更记录
+
+### B 变体补充 — 2026-11-08（答案注入恢复回合、资源类豁免预算、读写同根）
+
+- **答案注入**：`TurnRunner` 在每次回合开始读取该队列项已回答的问题单
+  （`InputRequestStore.ListAnsweredForQueueItemAsync`），按提问时间升序以「## 此前的人工回答」
+  段落追加到任务指令后；问题 500 字符、回答 1000 字符单条截断，整段 8000 字符上限、超出丢弃最早回答。
+  实现位置：`TurnRunner.BuildPromptWithAnswers` / `FormatAnsweredInput` / `TruncateAnswerText`。
+  设计文档 §3.5 已同步。
+- **资源类失败豁免重试预算**：`ModelErrorKinds.BudgetExempt`（auth / quota / no_model / bridge_down）
+  同时用于认领 SQL 与 `ExecutionStore.CountConsumingAttemptsAsync`，与旧文档口径一致。
+  上一版变更记录中「资源类失败现在也消耗预算」的描述作废，以本条为准。
+- **读写根统一**：`TurnWorkspace` 收敛为单一 `Root`，`read_file` / `list_dir` / `write_file`
+  使用同一根；`dispatch_only` 下模型可读到自己在隔离目录里上一回合写入的文件。
+- 测试：`Pump_AfterAnswer_ResumesWithNewAttemptAndProducesResultAsync` 断言恢复回合 prompt 含答案；
+  `ToolDispatcher_ReviewMode_WritesOnlyUnderWorkDirectoryAsync` 覆盖“写后能读/列”；
+  资源失败用例连续 4 个 auth 回合仍可认领（`max_attempts=3` 不被闸门挡死）。
 
 ### B 变体修复 — 2026-11-08（attempt 单调、预算改按回合数、tick 单项隔离）
 
@@ -301,8 +350,7 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
   修复了「回答后重新认领插入重复 `attempt_no` 触发 `UNIQUE(queue_item_id, attempt_no)`」的阻塞缺陷。
 - **重试预算改为按非 `NEEDS_INPUT` 回合数判定**：认领 SQL 的预算谓词与
   `ExecutionStore.CountConsumingAttemptsAsync` 共用同一口径（见 §5），不再依赖回退计数器。
-  由此资源类失败（`AUTH_FAILED`/`QUOTA_EXHAUSTED`/`NO_MODEL`/`BRIDGE_DOWN`）**现在也消耗预算**，
-  与旧文档「资源类失败不消耗预算」不同；如需继续豁免，属后续单独决策。
+  资源类失败是否豁免见上方「B 变体补充」（现已按 `error_kind` 豁免）。
 - **单个队列项失败不中断 tick**：认领写入冲突抛 `QueueItemClaimException` 后回滚事务，该项
   `reschedule(now+30s, CLAIM_FAILED)` 并继续同批其它项；泵级异常由调度后台服务兜住，本轮 tick
   正常结束、不触发 5 秒整轮退避。新增错误码 `CLAIM_FAILED`。

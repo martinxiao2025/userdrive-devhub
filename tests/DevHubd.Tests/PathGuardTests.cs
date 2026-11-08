@@ -91,7 +91,7 @@ public sealed class PathGuardTests : IDisposable
         Assert.Equal("SCOPE_DENIED", result.ErrorCode);
     }
 
-    /// <summary>隔离目录模式（不强制作用域）下，越界写入仍被拒绝。</summary>
+    /// <summary>隔离目录模式（不强制作用域）下，越界写入仍被拒绝，且读工具能看到本回合写入。</summary>
     [Fact]
     public async Task ToolDispatcher_ReviewMode_WritesOnlyUnderWorkDirectoryAsync()
     {
@@ -100,15 +100,26 @@ public sealed class PathGuardTests : IDisposable
         Directory.CreateDirectory(workDirectory);
 
         var dispatcher = new ToolDispatcher(
-            new TurnWorkspace(_root, workDirectory, WriteScope: null, EnforceScope: false),
+            new TurnWorkspace(workDirectory, WriteScope: null, EnforceScope: false),
             _budget,
             NullLogger<ToolDispatcher>.Instance);
 
-        using var inside = JsonDocument.Parse("""{"path":"report.md","content":"ok"}""");
+        using var inside = JsonDocument.Parse("""{"path":"out/report.md","content":"ok"}""");
         var written = await dispatcher.ExecuteAsync("turn-1", "write_file", inside.RootElement, ct);
         Assert.True(written.Success, written.ErrorMessage);
-        Assert.True(File.Exists(Path.Combine(workDirectory, "report.md")));
-        Assert.False(File.Exists(Path.Combine(_root, "report.md")));
+        Assert.True(File.Exists(Path.Combine(workDirectory, "out", "report.md")));
+        Assert.False(File.Exists(Path.Combine(_root, "out", "report.md")));
+
+        // 读写同根：list_dir / read_file 必须能看到同一回合写入的文件。
+        using var list = JsonDocument.Parse("""{"path":"out"}""");
+        var listed = await dispatcher.ExecuteAsync("turn-1", "list_dir", list.RootElement, ct);
+        Assert.True(listed.Success, listed.ErrorMessage);
+        Assert.Contains("report.md", listed.Output, StringComparison.Ordinal);
+
+        using var read = JsonDocument.Parse("""{"path":"out/report.md"}""");
+        var readBack = await dispatcher.ExecuteAsync("turn-1", "read_file", read.RootElement, ct);
+        Assert.True(readBack.Success, readBack.ErrorMessage);
+        Assert.Equal("ok", readBack.Output);
 
         using var outside = JsonDocument.Parse("""{"path":"../escape.md","content":"bad"}""");
         var rejected = await dispatcher.ExecuteAsync("turn-1", "write_file", outside.RootElement, ct);
@@ -122,7 +133,7 @@ public sealed class PathGuardTests : IDisposable
     {
         var ct = TestContext.Current.CancellationToken;
         var dispatcher = new ToolDispatcher(
-            new TurnWorkspace(_root, _root, new[] { "src" }, EnforceScope: true),
+            new TurnWorkspace(_root, new[] { "src" }, EnforceScope: true),
             _budget,
             NullLogger<ToolDispatcher>.Instance);
 

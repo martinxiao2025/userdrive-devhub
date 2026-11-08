@@ -198,8 +198,9 @@ public sealed class ExecutionStore
     }
 
     /// <summary>
-    /// 统计该队列项已消耗重试预算的回合数：<c>error_code</c> 为空或不是 <c>NEEDS_INPUT</c> 的 attempt。
-    /// 提问挂起不消耗预算，其余每真实回合计 1 次；认领闸门与失败重试上限共用这一口径。
+    /// 统计该队列项已消耗重试预算的回合数：排除 <c>NEEDS_INPUT</c> 回合，
+    /// 以及 <see cref="ModelErrorKinds.BudgetExempt"/>（auth / quota / no_model / bridge_down）资源类失败。
+    /// 提问挂起与 provider 自身不可用都不该由任务买单；认领闸门与失败重试上限共用这一口径。
     /// </summary>
     /// <param name="queueItemId">队列项 id。</param>
     /// <param name="cancellationToken">取消令牌。</param>
@@ -207,12 +208,14 @@ public sealed class ExecutionStore
         string queueItemId,
         CancellationToken cancellationToken = default)
     {
+        var exemptKinds = ModelErrorKinds.BudgetExempt;
         await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         return await db.Attempts
             .AsNoTracking()
             .CountAsync(
                 attempt => attempt.QueueItemId == queueItemId &&
-                           (attempt.ErrorCode == null || attempt.ErrorCode != DevHubErrorCodes.NeedsInput),
+                           (attempt.ErrorCode == null || attempt.ErrorCode != DevHubErrorCodes.NeedsInput) &&
+                           (attempt.ErrorKind == null || !exemptKinds.Contains(attempt.ErrorKind)),
                 cancellationToken)
             .ConfigureAwait(false);
     }

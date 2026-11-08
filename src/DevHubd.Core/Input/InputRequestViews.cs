@@ -140,3 +140,22 @@ public sealed record InputCancelOutcome(
     string QueueItemId,
     string? CancelledAt,
     string? Reason);
+
+/// <summary>已回答的问题单（恢复回合注入提示词用，按提问时间升序）。</summary>
+/// <param name="Id">问题单 id。</param>
+/// <param name="Question">问题文本。</param>
+/// <param name="Options">提问时给出的选项。</param>
+/// <param name="Answer">用户回答文本。</param>
+/// <param name="AnswerOptionId">选中的选项 id；未选为 null。</param>
+/// <param name="CreatedAt">提问时间（ISO-8601）。</param>
+/// <param name="AnsweredAt">回答时间（ISO-8601）。</param>
+/// <param name="AnsweredBy">回答者标识。</param>
+public sealed record AnsweredInput(
+    string Id,
+    string Question,
+    IReadOnlyList<InputOption> Options,
+    string? Answer,
+    string? AnswerOptionId,
+    string CreatedAt,
+    string? AnsweredAt,
+    string? AnsweredBy);

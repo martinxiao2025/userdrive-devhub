@@ -326,11 +326,13 @@ public sealed class QueueService
                     WHERE status = 'pending'
                       AND available_at <= $now
                       -- 重试预算按"非 NEEDS_INPUT 回合数"判定：提问挂起不消耗预算，
-                      -- 其余每个真实回合（含进行中、失败、成功）各计 1 次。
+                      -- 资源类失败（auth / quota / no_model / bridge_down）由 provider 自身不可用导致，
+                      -- 同样不计入预算；其余每个真实回合（含进行中、失败、成功）各计 1 次。
                       AND (
                             SELECT COUNT(*) FROM attempt a
                             WHERE a.queue_item_id = queue_item.id
                               AND (a.error_code IS NULL OR a.error_code <> 'NEEDS_INPUT')
+                              AND (a.error_kind IS NULL OR a.error_kind NOT IN ('auth', 'quota', 'no_model', 'bridge_down'))
                           ) < max_attempts
                       AND hold_kind IS NULL
                     ORDER BY priority DESC, created_at ASC, id ASC

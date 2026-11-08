@@ -51,6 +51,18 @@ public static class ModelErrorKinds
 
     /// <summary>回合因缺少输入而暂停：记 abandoned，不消耗重试预算，等人回答后恢复。</summary>
     public const string NeedsInput = "needs_input";
+
+    /// <summary>
+    /// 资源类失败：provider / 桥自身不可用，与任务本身无关，不计入重试预算。
+    /// 认领预算谓词与 <c>ExecutionStore.CountConsumingAttemptsAsync</c> 共用这一集合。
+    /// </summary>
+    public static readonly string[] BudgetExempt =
+    {
+        Auth,
+        Quota,
+        NoModel,
+        BridgeDown,
+    };
 }
 
 /// <summary>一次模型回合的错误描述。</summary>

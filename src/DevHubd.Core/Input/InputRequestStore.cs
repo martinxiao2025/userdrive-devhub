@@ -564,6 +564,38 @@ public sealed class InputRequestStore
     }
 
     /// <summary>
+    /// 读取同一队列项已回答的问题单，按提问时间升序返回，供恢复回合把答案注入提示词。
+    /// 只取 <c>answered</c>；已取消 / 已过期的问题不进入提示词。
+    /// </summary>
+    /// <param name="queueItemId">队列项 id。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    public async Task<IReadOnlyList<AnsweredInput>> ListAnsweredForQueueItemAsync(
+        string queueItemId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var rows = await db.InputRequests
+            .AsNoTracking()
+            .Where(item => item.QueueItemId == queueItemId && item.Status == "answered")
+            .OrderBy(item => item.CreatedAt)
+            .ThenBy(item => item.Id)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        return rows
+            .Select(item => new AnsweredInput(
+                item.Id,
+                item.Question,
+                ParseOptions(item.Options),
+                item.Answer,
+                item.AnswerOptionId,
+                item.CreatedAt,
+                item.AnsweredAt,
+                item.AnsweredBy))
+            .ToArray();
+    }
+
+    /// <summary>
     /// 过期扫描：把 <c>expires_at</c> 已过的 open 问题单置 <c>expired</c>，
     /// 挂起队列项置 <c>failed</c>（<c>INPUT_TIMEOUT</c>）并写一条通知。
     /// </summary>

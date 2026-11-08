@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using DevHubd.Core.Input;
 using DevHubd.Core.Models;
@@ -39,11 +40,20 @@ public sealed class TurnRunner
         """
         你是 devhubd 的定时任务执行器。请严格按任务指令完成工作，并遵守以下约束：
         1. 只能使用提供的工具；工具入参路径必须是相对路径。
-        2. 读取范围限定在工作区内；写入范围由系统强制校验，越界会被拒绝。
+        2. 读取与写入使用同一根，读写范围由系统强制校验，越界会被拒绝。
         3. 当前交付档位为 {0}：{1}
         4. 不要尝试提交、推送、合并或运行命令。
         5. 完成后用简洁中文总结你做了什么；如果没有写入任何文件，请明确说明。
         """;
+
+    /// <summary>回答段总长度上限（字符）。超出时优先丢弃更早的回答。</summary>
+    private const int MaxAnswerPromptChars = 8000;
+
+    /// <summary>单条回答的问题文本截断上限（字符）。</summary>
+    private const int MaxAnswerQuestionChars = 500;
+
+    /// <summary>单条回答的回答文本截断上限（字符）。</summary>
+    private const int MaxAnswerTextChars = 1000;
 
     private static readonly string[] _sensitivePromptSegments = { ".env", "secrets" };
 
@@ -128,11 +138,12 @@ public sealed class TurnRunner
         var schedulerState = await _stateStore.ReadAsync(cancellationToken).ConfigureAwait(false);
         var deliveryOutcome = ResolveDeliveryOutcome(task, schedulerState.Mode);
         var workDirectory = deliveryOutcome == "delivered" ? null : CreateWorkDirectory(item.Id);
-        var writeRoot = workDirectory ?? workspace.Root;
 
+        // 读写同根：dispatch_only 下模型在隔离目录内读写，auto 档位下读写工作区根。
+        // 同根保证模型能读到自己在上一回合写入的内容（跨回合续写、检查产物都依赖这一点）。
+        var executionRoot = workDirectory ?? workspace.Root;
         var workspaceContext = new TurnWorkspace(
-            workspace.Root,
-            writeRoot,
+            executionRoot,
             task.WriteScope,
             EnforceScope: deliveryOutcome == "delivered");
 
@@ -148,6 +159,22 @@ public sealed class TurnRunner
             canRequestInput,
             canRequestInput ? (prompt, token) => AskInputAsync(item, roleId, prompt, token) : null);
 
+        // 恢复回合：把同一队列项已回答的问题单结构化追加到原任务指令之后，
+        // 让模型看得到人工答案，不再就已回答的问题重复 ask_input。
+        var answeredInputs = await _inputRequests
+            .ListAnsweredForQueueItemAsync(item.Id, cancellationToken)
+            .ConfigureAwait(false);
+        var prompt = BuildPromptWithAnswers(task.Prompt, answeredInputs);
+        if (answeredInputs.Count > 0)
+        {
+            _logger.LogInformation(
+                "恢复回合注入已回答问题：queueItemId={QueueItemId} attempt={Attempt} answers={AnswerCount} promptChars={PromptChars}",
+                item.Id,
+                item.Attempt,
+                answeredInputs.Count,
+                prompt.Length);
+        }
+
         var request = new TurnRequest(
             turnId,
             turnId,
@@ -155,8 +182,8 @@ public sealed class TurnRunner
             item.Id,
             item.WorkspaceId,
             item.TaskId,
-            BuildSystemPrompt(deliveryOutcome, task, workspace),
-            task.Prompt,
+            BuildSystemPrompt(deliveryOutcome, task, workspace, executionRoot),
+            prompt,
             dispatcher.Describe(),
             budget,
             Model: null,
@@ -348,7 +375,12 @@ public sealed class TurnRunner
     /// <param name="deliveryOutcome">交付档位。</param>
     /// <param name="task">任务文档。</param>
     /// <param name="workspace">工作区。</param>
-    private static string BuildSystemPrompt(string deliveryOutcome, TaskDocument task, WorkspaceDefinition workspace)
+    /// <param name="executionRoot">本回合读写同根的根目录。</param>
+    private static string BuildSystemPrompt(
+        string deliveryOutcome,
+        TaskDocument task,
+        WorkspaceDefinition workspace,
+        string executionRoot)
     {
         var delivery = deliveryOutcome == "delivered"
             ? "auto（可在 writeScope 内直接写工作区，但仍不提交、不推送、不合并）"
@@ -356,10 +388,105 @@ public sealed class TurnRunner
 
         var scope = task.WriteScope.Count == 0 ? "（未声明，视为只读）" : string.Join(", ", task.WriteScope);
         var sensitive = string.Join(", ", _sensitivePromptSegments);
+        var rootNote = deliveryOutcome == "delivered"
+            ? $"读写根为工作区 {executionRoot}"
+            : $"读写根为隔离工作目录 {executionRoot}";
 
         return string.Format(
             SystemPromptTemplate,
             delivery,
-            $"工作区根为 {workspace.Root}，任务 writeScope 为 {scope}，敏感路径（{sensitive}、.git、*.pem、*.key）一律拒绝。");
+            $"{rootNote}（读与写使用同一根），任务 writeScope 为 {scope}，敏感路径（{sensitive}、.git、*.pem、*.key）一律拒绝。");
+    }
+
+    /// <summary>
+    /// 把已回答的问题单追加到任务指令之后。多个问题按提问时间升序；超出总长度预算时
+    /// 优先保留最近的问题，并显式标注被省略的条数。
+    /// </summary>
+    /// <param name="prompt">原任务指令。</param>
+    /// <param name="answers">已回答的问题单（已按提问时间升序）。</param>
+    private static string BuildPromptWithAnswers(string prompt, IReadOnlyList<AnsweredInput> answers)
+    {
+        if (answers.Count == 0)
+        {
+            return prompt;
+        }
+
+        // 由新到旧纳入，保证预算紧张时保留最近、最相关的回答。
+        var kept = new List<string>();
+        var used = 0;
+        var dropped = 0;
+        for (var index = answers.Count - 1; index >= 0; index--)
+        {
+            var section = FormatAnsweredInput(answers[index], index + 1);
+            if (kept.Count > 0 && used + section.Length > MaxAnswerPromptChars)
+            {
+                dropped = index + 1;
+                break;
+            }
+
+            kept.Add(section);
+            used += section.Length;
+        }
+
+        kept.Reverse();
+
+        var builder = new StringBuilder(prompt);
+        builder.AppendLine().AppendLine();
+        builder.AppendLine("## 此前的人工回答");
+        builder.AppendLine();
+        builder.AppendLine("系统已把你在之前回合提出的问题与用户回答附在下面（按提问时间排序）。请直接采用这些回答继续执行，不要就已回答的问题再次调用 ask_input。");
+        builder.AppendLine();
+        if (dropped > 0)
+        {
+            builder.AppendLine($"（更早的 {dropped} 条回答因长度限制已省略。）");
+            builder.AppendLine();
+        }
+
+        foreach (var section in kept)
+        {
+            builder.AppendLine(section);
+        }
+
+        return builder.ToString();
+    }
+
+    /// <summary>格式化单条已回答问题：问题、选项、回答、回答时间，各字段按上限截断。</summary>
+    /// <param name="answer">已回答问题。</param>
+    /// <param name="ordinal">在提示词中的序号（按提问时间）。</param>
+    private static string FormatAnsweredInput(AnsweredInput answer, int ordinal)
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine($"### 回答 {ordinal}（提问于 {answer.CreatedAt}）");
+        builder.AppendLine($"问题：{TruncateAnswerText(answer.Question, MaxAnswerQuestionChars)}");
+
+        if (answer.Options.Count > 0)
+        {
+            var labels = answer.Options.Select(option =>
+                option.Recommended ? $"{option.Label}（推荐）" : option.Label);
+            builder.AppendLine($"选项：{string.Join("；", labels)}");
+        }
+
+        var text = string.IsNullOrWhiteSpace(answer.Answer) ? "（未填写文本）" : answer.Answer;
+        var chosen = string.IsNullOrWhiteSpace(answer.AnswerOptionId)
+            ? string.Empty
+            : $"（选中选项：{answer.AnswerOptionId}）";
+        builder.AppendLine($"用户回答：{TruncateAnswerText(text, MaxAnswerTextChars)}{chosen}");
+
+        var answeredBy = string.IsNullOrWhiteSpace(answer.AnsweredBy) ? string.Empty : $"（{answer.AnsweredBy}）";
+        builder.AppendLine($"回答时间：{answer.AnsweredAt ?? "（未知）"}{answeredBy}");
+        return builder.ToString();
+    }
+
+    /// <summary>超长文本截断：保留前 <paramref name="maxLength"/> 字符并追加截断标记。</summary>
+    /// <param name="value">原文。</param>
+    /// <param name="maxLength">上限字符数。</param>
+    private static string TruncateAnswerText(string? value, int maxLength)
+    {
+        if (string.IsNullOrEmpty(value) || value.Length <= maxLength)
+        {
+            return value ?? string.Empty;
+        }
+
+        return string.Concat(value.AsSpan(0, maxLength), "…（截断）");
     }
 }

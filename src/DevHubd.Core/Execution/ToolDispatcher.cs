@@ -7,15 +7,13 @@ using Microsoft.Extensions.Logging;
 namespace DevHubd.Core.Execution;
 
 /// <summary>
-/// 一个回合的写入上下文。
+/// 一个回合的读写上下文：读写必须同根，保证模型能读到自己在上一回合写入的内容。
 /// </summary>
-/// <param name="ReadRoot">读根：始终是工作区根（dispatch_only 下模型仍可只读工作区）。</param>
-/// <param name="WriteRoot">写根：auto 档位为工作区根，dispatch_only 档位为隔离目录。</param>
+/// <param name="Root">读写根：auto 档位为工作区根，dispatch_only 档位为隔离工作目录。</param>
 /// <param name="WriteScope">任务声明的写作用域；null 表示不限制（隔离目录场景）。</param>
 /// <param name="EnforceScope">是否强制 writeScope 校验。</param>
 public sealed record TurnWorkspace(
-    string ReadRoot,
-    string WriteRoot,
+    string Root,
     IReadOnlyList<string>? WriteScope,
     bool EnforceScope);
 
@@ -299,7 +297,7 @@ public sealed class ToolDispatcher : IToolDispatcher
             return ToolExecutionResult.Fail(DevHubErrorCodes.InvalidArgument, "缺少 path 参数。");
         }
 
-        var check = PathGuard.ResolveRead(_workspace.ReadRoot, relativePath);
+        var check = PathGuard.ResolveRead(_workspace.Root, relativePath);
         if (!check.Success)
         {
             return ToolExecutionResult.Fail(check.ErrorCode!, check.ErrorMessage!);
@@ -336,7 +334,7 @@ public sealed class ToolDispatcher : IToolDispatcher
         var relativePath = TryGetString(input, "path", out var value) ? value : ".";
         var depth = TryGetInt32(input, "depth", out var requested) ? Math.Clamp(requested, 1, 4) : 1;
 
-        var check = PathGuard.ResolveRead(_workspace.ReadRoot, relativePath);
+        var check = PathGuard.ResolveRead(_workspace.Root, relativePath);
         if (!check.Success)
         {
             return ToolExecutionResult.Fail(check.ErrorCode!, check.ErrorMessage!);
@@ -406,7 +404,7 @@ public sealed class ToolDispatcher : IToolDispatcher
         var relativePath = TryGetString(input, "path", out var path) ? path : ".";
         var limit = TryGetInt32(input, "limit", out var requested) ? Math.Clamp(requested, 1, MaxSearchResults) : MaxSearchResults;
 
-        var check = PathGuard.ResolveRead(_workspace.ReadRoot, relativePath);
+        var check = PathGuard.ResolveRead(_workspace.Root, relativePath);
         if (!check.Success)
         {
             return ToolExecutionResult.Fail(check.ErrorCode!, check.ErrorMessage!);
@@ -439,7 +437,7 @@ public sealed class ToolDispatcher : IToolDispatcher
                 break;
             }
 
-            var relative = Path.GetRelativePath(_workspace.ReadRoot, file);
+            var relative = Path.GetRelativePath(_workspace.Root, file);
             if (PathGuard.IsSensitive(relative))
             {
                 continue;
@@ -498,7 +496,7 @@ public sealed class ToolDispatcher : IToolDispatcher
         }
 
         var check = PathGuard.ResolveWrite(
-            _workspace.WriteRoot,
+            _workspace.Root,
             relativePath,
             _workspace.WriteScope,
             _workspace.EnforceScope);
@@ -543,7 +541,7 @@ public sealed class ToolDispatcher : IToolDispatcher
         }
 
         var check = PathGuard.ResolveWrite(
-            _workspace.WriteRoot,
+            _workspace.Root,
             relativePath,
             _workspace.WriteScope,
             _workspace.EnforceScope);
