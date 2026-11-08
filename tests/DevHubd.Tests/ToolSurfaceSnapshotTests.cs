@@ -24,6 +24,11 @@ public sealed class ToolSurfaceSnapshotTests
         ["scheduler_control"] = new[] { "action", "reason", "mode", "provider" },
         ["result_list"] = new[] { "unreadOnly", "limit", "cursor" },
         ["result_ack"] = new[] { "ids", "all" },
+        ["task_upsert"] = new[]
+        {
+            "id", "title", "prompt", "workspaceId", "priority", "role", "delivery",
+            "writeScope", "dependsOn", "requiresApproval", "source",
+        },
     };
 
     /// <summary>只读资源的 URI 模板快照（§11.2）。</summary>

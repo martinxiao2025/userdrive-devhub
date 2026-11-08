@@ -74,5 +74,6 @@ public sealed record TaskListItem(
     string Title,
     string Status,
     int Priority,
+    string RoleId,
     string SeenAt);
 

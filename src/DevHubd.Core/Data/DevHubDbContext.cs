@@ -124,6 +124,9 @@ public sealed class DevHubDbContext : DbContext
         entity.Property(item => item.Priority).HasColumnName("priority");
         entity.Property(item => item.WriteScope).HasColumnName("write_scope");
         entity.Property(item => item.Payload).HasColumnName("payload");
+        entity.Property(item => item.RoleId).HasColumnName("role_id");
+        entity.Property(item => item.DependsOn).HasColumnName("depends_on");
+        entity.Property(item => item.ApprovalState).HasColumnName("approval_state");
         entity.Property(item => item.SeenAt).HasColumnName("seen_at");
         entity.Property(item => item.UpdatedAt).HasColumnName("updated_at");
 

@@ -21,6 +21,7 @@ using DevHubd.Mcp.Abstractions;
 using DevHubd.Queue;
 using DevHubd.Results;
 using DevHubd.Scheduling;
+using DevHubd.Tasks;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
@@ -279,6 +280,7 @@ internal static class Program
         builder.Services.AddSingleton<IToolDigestSource, ToolDigestSource>();
         builder.Services.AddSingleton<ILimitsSource, LimitsSource>();
         builder.Services.AddSingleton<IDispatchService, DispatchService>();
+        builder.Services.AddSingleton<ITaskWriteService, TaskWriteService>();
         builder.Services.AddSingleton<ISchedulerControl, SchedulerControlService>();
         builder.Services.AddHostedService<SchedulerBackgroundService>();
 

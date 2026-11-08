@@ -33,6 +33,15 @@ public sealed class TaskViewEntity
     /// <summary>任务原文（JSON 文本）。</summary>
     public string Payload { get; set; } = string.Empty;
 
+    /// <summary>执行角色 id（v5；缺省 implementer）。</summary>
+    public string RoleId { get; set; } = "implementer";
+
+    /// <summary>前置任务 id（JSON 数组文本；null 表示无依赖）。</summary>
+    public string? DependsOn { get; set; }
+
+    /// <summary>审批状态：none / pending / approved / rejected。</summary>
+    public string ApprovalState { get; set; } = "none";
+
     /// <summary>最近一次被扫描到的时间（ISO-8601）。</summary>
     public string SeenAt { get; set; } = string.Empty;
 

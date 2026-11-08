@@ -100,6 +100,8 @@ public sealed class TaskScanner
             row.Priority = document.Priority;
             row.WriteScope = JsonSerializer.Serialize(document.WriteScope);
             row.Payload = document.RawJson;
+            row.RoleId = document.Role;
+            row.DependsOn = document.DependsOn.Count == 0 ? null : JsonSerializer.Serialize(document.DependsOn);
             row.SeenAt = now;
             row.UpdatedAt = now;
         }
@@ -117,6 +119,54 @@ public sealed class TaskScanner
             row.Status = "missing";
             row.UpdatedAt = now;
             markedMissing++;
+        }
+
+        // 依赖闸门：文件声明 ready 但前置任务尚未 done 时，任务视图按“有效状态”置为 blocked。
+        // 每次扫描都从文件状态重新推导，所以前置任务完成后下一轮会自动回到 ready，无需回写用户文件。
+        foreach (var (_, document) in accepted)
+        {
+            if (document.DependsOn.Count == 0 ||
+                !string.Equals(document.Status, "ready", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var ready = document.DependsOn.All(dependency =>
+                rowsById.TryGetValue(dependency, out var dependencyRow) &&
+                string.Equals(dependencyRow.Status, "done", StringComparison.Ordinal));
+
+            if (!ready)
+            {
+                var row = rowsById[document.Id];
+                row.Status = "blocked";
+                row.UpdatedAt = now;
+            }
+        }
+
+        // 角色闸门：任务声明的角色必须是 role_view 中已声明的角色；否则置 blocked，绝不静默降级。
+        // role_view 为空（部署未携带插件包）时按 v4 legacy 模式放行，避免整体停摆。
+        var declaredRoles = await db.RoleViews
+            .AsNoTracking()
+            .Select(role => role.Id)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        if (declaredRoles.Count > 0)
+        {
+            var knownRoles = declaredRoles.ToHashSet(StringComparer.Ordinal);
+            foreach (var (_, document) in accepted)
+            {
+                if (!string.Equals(document.Status, "ready", StringComparison.Ordinal) ||
+                    knownRoles.Contains(document.Role))
+                {
+                    continue;
+                }
+
+                var row = rowsById[document.Id];
+                row.Status = "blocked";
+                row.UpdatedAt = now;
+                problems.Add($"{document.Id}: 角色未在 role_view 中声明：{document.Role}");
+            }
         }
 
         await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);

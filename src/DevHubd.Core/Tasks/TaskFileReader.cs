@@ -14,6 +14,10 @@ namespace DevHubd.Core.Tasks;
 /// <param name="Delivery">review / auto（全局 dispatch_only 时 auto 不生效）。</param>
 /// <param name="WriteScope">相对工作区根的写白名单；空表示只读。</param>
 /// <param name="Prompt">给模型的指令。</param>
+/// <param name="Role">执行角色 id，缺省 <c>implementer</c>。</param>
+/// <param name="DependsOn">前置任务 id 列表；任一未 <c>done</c> 时任务视图置为 <c>blocked</c>。</param>
+/// <param name="RequiresApproval">产出是否必须人工审批后才算交付。</param>
+/// <param name="Source">来源渠道（可选，仅用于追溯，不参与调度）。</param>
 /// <param name="ContentHash">文件字节的 SHA-256（小写十六进制），用于 dedupe_key。</param>
 /// <param name="RawJson">原始 JSON 文本，落 task_view.payload。</param>
 public sealed record TaskDocument(
@@ -24,6 +28,10 @@ public sealed record TaskDocument(
     string Delivery,
     IReadOnlyList<string> WriteScope,
     string Prompt,
+    string Role,
+    IReadOnlyList<string> DependsOn,
+    bool RequiresApproval,
+    string? Source,
     string ContentHash,
     string RawJson);
 
@@ -34,9 +42,14 @@ public sealed record TaskDocument(
 public static class TaskFileReader
 {
     private static readonly Regex _idPattern = new("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", RegexOptions.Compiled);
+    private static readonly Regex _rolePattern = new("^[a-z][a-z0-9-]{0,31}$", RegexOptions.Compiled);
     private static readonly string[] _allowedStatuses = { "ready", "blocked", "done", "cancelled" };
     private static readonly string[] _allowedDeliveries = { "review", "auto" };
-    private static readonly string[] _allowedProperties = { "id", "title", "status", "priority", "delivery", "writeScope", "prompt" };
+    private static readonly string[] _allowedProperties =
+    {
+        "id", "title", "status", "priority", "delivery", "writeScope", "prompt",
+        "role", "dependsOn", "requiresApproval", "source",
+    };
 
     /// <summary>读取并校验一个任务文件。</summary>
     /// <param name="path">任务文件绝对路径。</param>
@@ -170,6 +183,86 @@ public static class TaskFileReader
                 return false;
             }
 
+            var role = "implementer";
+            if (root.TryGetProperty("role", out var roleElement))
+            {
+                role = roleElement.GetString() ?? string.Empty;
+                if (!_rolePattern.IsMatch(role))
+                {
+                    error = "role 不匹配 ^[a-z][a-z0-9-]{0,31}$";
+                    return false;
+                }
+            }
+
+            var dependsOn = new List<string>();
+            if (root.TryGetProperty("dependsOn", out var dependsElement))
+            {
+                if (dependsElement.ValueKind != JsonValueKind.Array)
+                {
+                    error = "dependsOn 必须是任务 id 数组";
+                    return false;
+                }
+
+                foreach (var item in dependsElement.EnumerateArray())
+                {
+                    if (item.ValueKind != JsonValueKind.String)
+                    {
+                        error = "dependsOn 必须是任务 id 数组";
+                        return false;
+                    }
+
+                    var dependency = item.GetString()!;
+                    if (!_idPattern.IsMatch(dependency))
+                    {
+                        error = $"dependsOn 含非法任务 id：{dependency}";
+                        return false;
+                    }
+
+                    if (string.Equals(dependency, id, StringComparison.Ordinal))
+                    {
+                        error = "dependsOn 不能依赖自身";
+                        return false;
+                    }
+
+                    if (dependsOn.Contains(dependency, StringComparer.Ordinal))
+                    {
+                        error = $"dependsOn 含重复任务 id：{dependency}";
+                        return false;
+                    }
+
+                    dependsOn.Add(dependency);
+                }
+            }
+
+            var requiresApproval = false;
+            if (root.TryGetProperty("requiresApproval", out var approvalElement))
+            {
+                if (approvalElement.ValueKind != JsonValueKind.True && approvalElement.ValueKind != JsonValueKind.False)
+                {
+                    error = "requiresApproval 必须是布尔";
+                    return false;
+                }
+
+                requiresApproval = approvalElement.GetBoolean();
+            }
+
+            string? source = null;
+            if (root.TryGetProperty("source", out var sourceElement))
+            {
+                if (sourceElement.ValueKind != JsonValueKind.String)
+                {
+                    error = "source 必须是字符串";
+                    return false;
+                }
+
+                source = sourceElement.GetString();
+                if (source is { Length: > 200 })
+                {
+                    error = "source 长度不能超过 200";
+                    return false;
+                }
+            }
+
             document = new TaskDocument(
                 id,
                 title,
@@ -178,6 +271,10 @@ public static class TaskFileReader
                 delivery,
                 writeScope,
                 prompt,
+                role,
+                dependsOn,
+                requiresApproval,
+                source,
                 Convert.ToHexStringLower(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(raw))),
                 raw);
             return true;

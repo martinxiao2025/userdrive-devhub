@@ -86,7 +86,7 @@ public sealed class QueueService
             .Where(task => task.WorkspaceId == workspaceId && task.Status == "ready")
             .OrderByDescending(task => task.Priority)
             .ThenBy(task => task.Id)
-            .Select(task => new { task.Id, task.Title, task.Status, task.ContentHash, task.Priority })
+            .Select(task => new { task.Id, task.Title, task.Status, task.ContentHash, task.Priority, task.RoleId })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
@@ -124,6 +124,7 @@ public sealed class QueueService
                 db,
                 workspaceId,
                 new TaskRow(task.Id, task.Title, task.Status, task.ContentHash, task.Priority),
+                task.RoleId,
                 scheduledProvider,
                 dedupeKey,
                 now,
@@ -199,6 +200,13 @@ public sealed class QueueService
             return new ManualEnqueueResult(true, false, null, "would_enqueue", provider);
         }
 
+        var roleId = await db.TaskViews
+            .AsNoTracking()
+            .Where(view => view.WorkspaceId == workspaceId && view.Id == task.Id)
+            .Select(view => view.RoleId)
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false) ?? "implementer";
+
         var id = Guid.NewGuid().ToString("N");
         db.QueueItems.Add(new QueueItemEntity
         {
@@ -212,6 +220,7 @@ public sealed class QueueService
             Attempt = 0,
             MaxAttempts = 3,
             PreferredProvider = provider,
+            RoleId = roleId,
             AvailableAt = now,
             CreatedAt = now,
             UpdatedAt = now,
@@ -544,13 +553,21 @@ public sealed class QueueService
                 task.Title,
                 task.Status,
                 task.Priority,
+                task.RoleId,
                 task.SeenAt,
             })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
         return rows
-            .Select(row => new TaskListItem(row.WorkspaceId, row.Id, row.Title, row.Status, row.Priority, row.SeenAt))
+            .Select(row => new TaskListItem(
+                row.WorkspaceId,
+                row.Id,
+                row.Title,
+                row.Status,
+                row.Priority,
+                row.RoleId,
+                row.SeenAt))
             .ToList();
     }
 
@@ -611,6 +628,7 @@ public sealed class QueueService
         DevHubDbContext db,
         string workspaceId,
         TaskRow task,
+        string roleId,
         string provider,
         string dedupeKey,
         string now,
@@ -620,9 +638,9 @@ public sealed class QueueService
             """
             INSERT INTO queue_item
               (id, workspace_id, task_id, task_hash, dedupe_key, status, priority, attempt, max_attempts,
-               preferred_provider, available_at, created_at, updated_at)
+               preferred_provider, role_id, available_at, created_at, updated_at)
             VALUES
-              ({0}, {1}, {2}, {3}, {4}, 'pending', {5}, 0, 3, {6}, {7}, {7}, {7})
+              ({0}, {1}, {2}, {3}, {4}, 'pending', {5}, 0, 3, {6}, {7}, {8}, {8}, {8})
             ON CONFLICT (dedupe_key) DO NOTHING;
             """,
             new object[]
@@ -634,6 +652,7 @@ public sealed class QueueService
                 dedupeKey,
                 task.Priority,
                 provider,
+                roleId,
                 now,
             },
             cancellationToken).ConfigureAwait(false);

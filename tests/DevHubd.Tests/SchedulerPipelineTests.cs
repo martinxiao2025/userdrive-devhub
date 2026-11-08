@@ -312,6 +312,77 @@ public sealed class SchedulerPipelineTests : IDisposable
             await ReadColumnAsync("SELECT preferred_provider FROM queue_item;", ct));
     }
 
+    /// <summary>前置任务未 done 时，后置任务在 task_view 中为 blocked 且不入队；前置 done 后自动解除。</summary>
+    [Fact]
+    public async Task TickAsync_DependsOnUnfinished_BlocksUntilDependencyDoneAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "前置", "ready", 10);
+        WriteTask(root, "T-002", "后置", "ready", 10, dependsOn: new[] { "T-001" });
+
+        await _engine.TickAsync(ct);
+
+        Assert.Equal("blocked", (await _queue.GetTaskAsync("alpha", "T-002", ct))!.Status);
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+        Assert.Equal(
+            new[] { "T-001" },
+            await ReadColumnAsync("SELECT task_id FROM queue_item;", ct));
+
+        // 前置任务标记 done 后，下一轮扫描从文件状态重新推导：后置恢复 ready 并入队。
+        WriteTask(root, "T-001", "前置", "done", 10);
+        await _engine.TickAsync(ct);
+
+        Assert.Equal("ready", (await _queue.GetTaskAsync("alpha", "T-002", ct))!.Status);
+        Assert.Equal(2, await CountQueueItemsAsync(ct));
+    }
+
+    /// <summary>任务声明的角色写入 task_view，并在入队时复制到 queue_item.role_id。</summary>
+    [Fact]
+    public async Task TickAsync_TaskRole_IsCopiedToTaskViewAndQueueItemAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "评审任务", "ready", 10, role: "reviewer");
+
+        await _engine.TickAsync(ct);
+
+        Assert.Equal(
+            new[] { "reviewer" },
+            await ReadColumnAsync("SELECT role_id FROM task_view;", ct));
+        Assert.Equal(
+            new[] { "reviewer" },
+            await ReadColumnAsync("SELECT role_id FROM queue_item;", ct));
+    }
+
+    /// <summary>角色未在 role_view 声明时任务被 blocked，绝不静默降级为 implementer。</summary>
+    [Fact]
+    public async Task TickAsync_UnknownRole_BlocksTaskAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        await ExecuteAsync(
+            """
+            INSERT INTO role_view
+              (id, name, description, source_path, content_hash, skills, tools, delivery,
+               requires_approval, can_request_input, max_parallel, max_attempts, max_rounds,
+               max_tool_calls, max_duration_seconds, max_input_tokens, payload, loaded_at, updated_at)
+            VALUES
+              ('implementer', '实现', 'desc', 'p', 'h', '[]', '[]', 'dispatch_only',
+               0, 0, 1, 3, 10, 20, 300, NULL, '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+            """,
+            ct);
+        WriteTask(root, "T-001", "未知角色", "ready", 10, role: "ghost");
+
+        await _engine.TickAsync(ct);
+
+        Assert.Equal("blocked", (await _queue.GetTaskAsync("alpha", "T-001", ct))!.Status);
+        Assert.Equal(0, await CountQueueItemsAsync(ct));
+    }
+
     /// <summary>用指定执行配置创建调度引擎（共享同一数据库与工作区清单）。</summary>
     /// <param name="options">执行配置。</param>
     private SchedulerEngine CreateEngine(ExecutionOptions options) => new(
@@ -353,18 +424,35 @@ public sealed class SchedulerPipelineTests : IDisposable
     /// <param name="title">标题。</param>
     /// <param name="status">状态。</param>
     /// <param name="priority">优先级。</param>
-    private static void WriteTask(string workspaceRoot, string id, string title, string status, int priority)
+    private static void WriteTask(
+        string workspaceRoot,
+        string id,
+        string title,
+        string status,
+        int priority,
+        string? role = null,
+        string[]? dependsOn = null)
     {
-        var payload = new
+        var payload = new Dictionary<string, object?>
         {
-            id,
-            title,
-            status,
-            priority,
-            delivery = "review",
-            writeScope = Array.Empty<string>(),
-            prompt = "执行该任务",
+            ["id"] = id,
+            ["title"] = title,
+            ["status"] = status,
+            ["priority"] = priority,
+            ["delivery"] = "review",
+            ["writeScope"] = Array.Empty<string>(),
+            ["prompt"] = "执行该任务",
         };
+
+        if (role is not null)
+        {
+            payload["role"] = role;
+        }
+
+        if (dependsOn is not null)
+        {
+            payload["dependsOn"] = dependsOn;
+        }
 
         File.WriteAllText(
             Path.Combine(workspaceRoot, ".devhub", "tasks", $"{id}.json"),

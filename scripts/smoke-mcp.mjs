@@ -120,6 +120,7 @@ const EXPECTED_TOOLS = [
   'result_list',
   'scheduler_control',
   'scheduler_status',
+  'task_upsert',
 ];
 
 /** 期望的只读资源 URI（P3 资源面）。 */

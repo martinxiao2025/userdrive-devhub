@@ -35,6 +35,7 @@ public sealed record TaskListItemResult(
     string Title,
     string Status,
     int Priority,
+    string RoleId,
     string SeenAt);
 
 /// <summary>手动派发结果状态。</summary>

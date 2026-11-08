@@ -26,4 +26,7 @@ public static class ToolVocabulary
 
     /// <summary>任务物化视图状态。</summary>
     public const string TaskStatuses = "ready/blocked/done/cancelled/missing";
+
+    /// <summary>任务文件里的交付档位（与全局档位词表不同名，见 §task.schema.json）。</summary>
+    public const string TaskDeliveries = "review/auto";
 }

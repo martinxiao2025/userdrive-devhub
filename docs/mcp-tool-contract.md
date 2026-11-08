@@ -192,7 +192,7 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 | `devhub://results/unread` | 未读结果列表 |
 | `devhub://scheduler/queue` | 队列快照 |
 | `devhub://scheduler/status` | 与 `scheduler_status` 同一快照 |
-| `devhub://tasks` | 任务物化视图（含 `seenAt`） |
+| `devhub://tasks` | 任务物化视图（含 `roleId` 与 `seenAt`；`blocked` 表示依赖未满足或角色未声明） |
 
 资源与同名工具使用同一序列化配置，时间同为 UTC + Z。
 
@@ -215,6 +215,14 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 
 ## 6. 变更记录
 
+### U8 — 2026-11-08（任务模型扩展与 `task_upsert`）
+
+- 任务文件新增可选 `role`（默认 `implementer`）、`dependsOn`、`requiresApproval`、`source`；封闭字段同步到 `schemas/task.schema.json`。
+- `task_view` 物化 `role_id`/`depends_on`：依赖未全部 `done` 或角色未在 `role_view` 声明时置 `blocked`，不静默降级。
+- 入队时把任务角色复制到 `queue_item.role_id`；`devhub://tasks` 条目新增 `roleId`。
+- 新工具 `task_upsert` 上线（参数与错误见 §3.3 末尾），新增错误码 `AMBIGUOUS_WORKSPACE`。
+- `role_view` 为空（未部署插件包）时按 v4 legacy 行为放行：不做角色闸门，队列角色记为 `implementer`。
+
 ### v5 — 2026-11-08（U7：角色快照与回流结构，纯增量）
 
 - `task_view` 新增 `role_id`（`NOT NULL DEFAULT 'implementer'`）、`depends_on`、`approval_state`（`none/pending/approved/rejected`，默认 `none`）。
@@ -226,8 +234,8 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 
 ### 待实施 — 2026-11-08（契约先行，未上线）
 
-> 以下**工具**当前实现不存在：调用会返回 `UNKNOWN_TOOL`。schema v5 与 `scheduler_status.roles`
-> 已在 U7 上线（见下一条变更记录），其余能力按 U8–U12 分单元实施。
+> 以下**工具**当前实现不存在：调用会返回 `UNKNOWN_TOOL`。schema v5、`scheduler_status.roles`
+> 与 `task_upsert` 已分别在 U7 / U8 上线（见下方变更记录），其余能力按 U9–U12 分单元实施。
 > 方案见 `.trae/documents/架构增量方案-角色调度与不确定项回流.md`。上线时必须同步 `ToolVocabulary`、工具快照测试与本文件。
 
 **`input_request_list`（只读）**
@@ -267,12 +275,13 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 参数：`id`、`reason?`。返回：`{ id, status:"cancelled", queueItemId, cancelledAt }`。
 错误：`UNKNOWN_INPUT_REQUEST`、`INPUT_REQUEST_CLOSED`。
 
-**`task_upsert`**
+**`task_upsert`（U8 已实现，从「待实施」移出）**
 
-参数：`workspaceId`、`id`、`title`、`prompt`、`priority?`、`role?`、`delivery?`、`writeScope?`、`dependsOn?`、`requiresApproval?`、`source?`。
-语义：原子写入 `<root>/.devhub/tasks/<id>.json`（临时文件 + rename），由现有扫描器拾取；不直接改数据库。
+参数：`id`、`title`、`prompt`、`workspaceId?`、`priority?`、`role?`、`delivery?`、`writeScope?`、`dependsOn?`、`requiresApproval?`、`source?`。
+语义：先按 <code>schemas/task.schema.json</code> 与角色快照校验，再原子写入 `<root>/.devhub/tasks/<id>.json`（临时文件 + rename），由现有扫描器拾取；不直接改数据库。
 返回：`{ taskId, path, contentHash, queued }`。
-错误：`UNKNOWN_WORKSPACE`、`INVALID_TASK`、`INVALID_ROLE`、`TASK_CONFLICT`。
+错误：`UNKNOWN_WORKSPACE`、`AMBIGUOUS_WORKSPACE`、`INVALID_TASK`、`INVALID_ROLE`、`TASK_CONFLICT`。
+约束：任务存在未结束队列项（`pending/claimed/running`）时拒绝改写；未知角色不降级，直接失败。
 
 **`result_approve` / `result_reject`**
 
@@ -281,7 +290,7 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 
 **新增错误码（只增不改）**
 
-`NEEDS_INPUT`、`INPUT_TIMEOUT`、`INPUT_NOT_ALLOWED`、`UNKNOWN_INPUT_REQUEST`、`INPUT_REQUEST_CLOSED`、`INVALID_ANSWER`、`ANSWER_CONFLICT`、`INVALID_ROLE`、`TASK_CONFLICT`、`TASK_CHANGED`、`DEPENDENCY_UNMET`、`UNKNOWN_RESULT`、`RESULT_NOT_PENDING`。
+`NEEDS_INPUT`、`INPUT_TIMEOUT`、`INPUT_NOT_ALLOWED`、`UNKNOWN_INPUT_REQUEST`、`INPUT_REQUEST_CLOSED`、`INVALID_ANSWER`、`ANSWER_CONFLICT`、`INVALID_ROLE`、`TASK_CONFLICT`、`TASK_CHANGED`、`DEPENDENCY_UNMET`、`UNKNOWN_RESULT`、`RESULT_NOT_PENDING`、`AMBIGUOUS_WORKSPACE`。
 
 **schema v5（U7 已执行，见上一条变更记录）**
 
