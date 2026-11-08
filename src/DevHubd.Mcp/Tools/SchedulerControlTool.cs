@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Text.Json;
+using DevHubd.Core.Models;
 using DevHubd.Mcp.Abstractions;
 using DevHubd.Mcp.Contracts;
 using DevHubd.Mcp.Errors;
@@ -84,7 +85,7 @@ public sealed class SchedulerControlTool
         {
             return await ToolResults.FailureAsync(
                 McpErrors.Envelope(
-                    "INVALID_ARGUMENT",
+                    DevHubErrorCodes.InvalidArgument,
                     ex.Message,
                     retryable: true,
                     next: "检查 mode / provider 取值后重试。",

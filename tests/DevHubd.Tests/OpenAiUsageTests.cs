@@ -100,6 +100,7 @@ public sealed class OpenAiUsageTests
             new TestHttpClientFactory(http),
             new OpenAiModelOptions { BaseUrl = "https://example.invalid/v1", Model = "test-model" },
             new StaticApiKeyProvider("test-key"),
+            NullLoggerFactory.Instance,
             NullLogger<OpenAiCompatibleModelClient>.Instance);
 
         var request = new TurnRequest(

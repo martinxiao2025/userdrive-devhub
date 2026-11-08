@@ -219,6 +219,7 @@ internal static class Program
             serviceProvider.GetRequiredService<IHttpClientFactory>(),
             serviceProvider.GetRequiredService<OpenAiModelOptions>(),
             serviceProvider.GetRequiredService<IApiKeyProvider>(),
+            serviceProvider.GetRequiredService<ILoggerFactory>(),
             serviceProvider.GetRequiredService<ILogger<OpenAiCompatibleModelClient>>()));
         builder.Services.AddSingleton<TurnDispatcherRegistry>();
         builder.Services.AddSingleton<IModelClient>(serviceProvider => new VsCodeLmBridgeClient(
@@ -226,6 +227,7 @@ internal static class Program
             serviceProvider.GetRequiredService<DevHubPaths>(),
             serviceProvider.GetRequiredService<InternalApiOptions>(),
             serviceProvider.GetRequiredService<TurnDispatcherRegistry>(),
+            serviceProvider.GetRequiredService<ILoggerFactory>(),
             serviceProvider.GetRequiredService<ILogger<VsCodeLmBridgeClient>>()));
         builder.Services.AddSingleton<ModelClientRegistry>();
         builder.Services.AddSingleton(serviceProvider => new ProviderStateStore(

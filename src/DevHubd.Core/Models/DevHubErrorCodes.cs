@@ -1,0 +1,71 @@
+namespace DevHubd.Core.Models;
+
+/// <summary>
+/// 错误码词表：模型通道（provider / 传输 / 工具）与 MCP 错误信封共用同一组稳定字符串。
+/// 只新增、不改写既有取值，避免已落库的错误码与外部调用方契约漂移。
+/// </summary>
+public static class DevHubErrorCodes
+{
+    // ---------- 模型通道：配置与鉴权 ----------
+
+    /// <summary>未配置 API key。</summary>
+    public const string MissingApiKey = "MISSING_API_KEY";
+
+    /// <summary>provider 鉴权被拒绝。</summary>
+    public const string AuthFailed = "AUTH_FAILED";
+
+    /// <summary>provider 未注册。</summary>
+    public const string ProviderNotRegistered = "PROVIDER_NOT_REGISTERED";
+
+    /// <summary>扩展桥不可用。</summary>
+    public const string BridgeDown = "BRIDGE_DOWN";
+
+    /// <summary>扩展桥返回了无法解析的响应。</summary>
+    public const string BridgeBadResponse = "BRIDGE_BAD_RESPONSE";
+
+    // ---------- 模型通道：资源与瞬时错误 ----------
+
+    /// <summary>请求被限流。</summary>
+    public const string RateLimited = "RATE_LIMITED";
+
+    /// <summary>该 provider 配额已耗尽。</summary>
+    public const string QuotaExhausted = "QUOTA_EXHAUSTED";
+
+    /// <summary>模型不存在或无权访问。</summary>
+    public const string NoModel = "NO_MODEL";
+
+    /// <summary>上游返回 5xx 或 408。</summary>
+    public const string UpstreamError = "UPSTREAM_ERROR";
+
+    /// <summary>端点不可达或连接失败。</summary>
+    public const string NetworkError = "NETWORK_ERROR";
+
+    /// <summary>请求超时。</summary>
+    public const string RequestTimeout = "REQUEST_TIMEOUT";
+
+    /// <summary>请求被 provider 拒绝（业务参数问题）。</summary>
+    public const string RequestRejected = "REQUEST_REJECTED";
+
+    /// <summary>响应无法解析或缺少必要字段。</summary>
+    public const string MalformedResponse = "MALFORMED_RESPONSE";
+
+    /// <summary>回合异常结束。</summary>
+    public const string TurnException = "TURN_EXCEPTION";
+
+    // ---------- 工具与公共语义 ----------
+
+    /// <summary>工具参数非法。</summary>
+    public const string InvalidArgument = "INVALID_ARGUMENT";
+
+    /// <summary>未知工具。</summary>
+    public const string UnknownTool = "UNKNOWN_TOOL";
+
+    /// <summary>预算（轮次 / 写入 / 时长）超限。</summary>
+    public const string BudgetExceeded = "BUDGET_EXCEEDED";
+
+    /// <summary>工具执行被取消（非停机取消）。</summary>
+    public const string ToolCancelled = "TOOL_CANCELLED";
+
+    /// <summary>未归类的内部错误。</summary>
+    public const string Internal = "INTERNAL";
+}

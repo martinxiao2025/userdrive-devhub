@@ -232,6 +232,7 @@ public sealed class UserConfigTests : IDisposable
                 new TestHttpClientFactory(http),
                 new OpenAiModelOptions { ApiKeyEnvironmentVariable = name },
                 new EnvironmentApiKeyProvider(name),
+                NullLoggerFactory.Instance,
                 NullLogger<OpenAiCompatibleModelClient>.Instance);
 
             var health = await client.ProbeAsync(ct);

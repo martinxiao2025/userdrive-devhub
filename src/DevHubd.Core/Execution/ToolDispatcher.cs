@@ -103,7 +103,7 @@ public sealed class ToolDispatcher : IToolDispatcher
             "search" => await SearchAsync(input, cancellationToken).ConfigureAwait(false),
             "write_file" => await WriteFileAsync(input, cancellationToken).ConfigureAwait(false),
             "apply_patch" => await ApplyPatchAsync(input, cancellationToken).ConfigureAwait(false),
-            _ => ToolExecutionResult.Fail("UNKNOWN_TOOL", $"工具不在白名单内：{toolName}"),
+            _ => ToolExecutionResult.Fail(DevHubErrorCodes.UnknownTool, $"工具不在白名单内：{toolName}"),
         };
     }
 
@@ -114,7 +114,7 @@ public sealed class ToolDispatcher : IToolDispatcher
     {
         if (!TryGetString(input, "path", out var relativePath))
         {
-            return ToolExecutionResult.Fail("INVALID_ARGUMENT", "缺少 path 参数。");
+            return ToolExecutionResult.Fail(DevHubErrorCodes.InvalidArgument, "缺少 path 参数。");
         }
 
         var check = PathGuard.ResolveRead(_workspace.ReadRoot, relativePath);
@@ -218,7 +218,7 @@ public sealed class ToolDispatcher : IToolDispatcher
     {
         if (!TryGetString(input, "query", out var query) || query.Length == 0)
         {
-            return ToolExecutionResult.Fail("INVALID_ARGUMENT", "缺少 query 参数。");
+            return ToolExecutionResult.Fail(DevHubErrorCodes.InvalidArgument, "缺少 query 参数。");
         }
 
         var relativePath = TryGetString(input, "path", out var path) ? path : ".";
@@ -305,7 +305,7 @@ public sealed class ToolDispatcher : IToolDispatcher
         if (!TryGetString(input, "path", out var relativePath) ||
             !TryGetString(input, "content", out var content))
         {
-            return ToolExecutionResult.Fail("INVALID_ARGUMENT", "缺少 path 或 content 参数。");
+            return ToolExecutionResult.Fail(DevHubErrorCodes.InvalidArgument, "缺少 path 或 content 参数。");
         }
 
         var bytes = _utf8NoBom.GetBytes(content);
@@ -352,12 +352,12 @@ public sealed class ToolDispatcher : IToolDispatcher
             !TryGetString(input, "find", out var find) ||
             !TryGetString(input, "replace", out var replace))
         {
-            return ToolExecutionResult.Fail("INVALID_ARGUMENT", "缺少 path、find 或 replace 参数。");
+            return ToolExecutionResult.Fail(DevHubErrorCodes.InvalidArgument, "缺少 path、find 或 replace 参数。");
         }
 
         if (find.Length == 0)
         {
-            return ToolExecutionResult.Fail("INVALID_ARGUMENT", "find 不能为空。");
+            return ToolExecutionResult.Fail(DevHubErrorCodes.InvalidArgument, "find 不能为空。");
         }
 
         var check = PathGuard.ResolveWrite(
@@ -418,14 +418,14 @@ public sealed class ToolDispatcher : IToolDispatcher
         if (byteCount > _budget.MaxPatchBytes)
         {
             return ToolExecutionResult.Fail(
-                "BUDGET_EXCEEDED",
+                DevHubErrorCodes.BudgetExceeded,
                 $"单次写入 {byteCount} 字节超过上限 {_budget.MaxPatchBytes}。");
         }
 
         if (_writes >= _budget.MaxWrites)
         {
             return ToolExecutionResult.Fail(
-                "BUDGET_EXCEEDED",
+                DevHubErrorCodes.BudgetExceeded,
                 $"写入次数已达上限 {_budget.MaxWrites}。");
         }
 
@@ -434,7 +434,7 @@ public sealed class ToolDispatcher : IToolDispatcher
             _changedFiles.Count >= _budget.MaxFilesChanged)
         {
             return ToolExecutionResult.Fail(
-                "BUDGET_EXCEEDED",
+                DevHubErrorCodes.BudgetExceeded,
                 $"改动文件数已达上限 {_budget.MaxFilesChanged}。");
         }
 

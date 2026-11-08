@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Text.Json;
+using DevHubd.Core.Models;
 using DevHubd.Mcp.Abstractions;
 using DevHubd.Mcp.Errors;
 using ModelContextProtocol.Protocol;
@@ -38,7 +39,7 @@ public sealed class ResultAckTool
         {
             return await ToolResults.FailureAsync(
                 McpErrors.Envelope(
-                    "INVALID_ARGUMENT",
+                    DevHubErrorCodes.InvalidArgument,
                     "必须提供 ids 或 all=true。",
                     retryable: true,
                     next: "传 ids=[...] 标记指定结果，或 all=true 标记全部未读。",

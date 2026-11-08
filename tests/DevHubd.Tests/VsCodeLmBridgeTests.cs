@@ -142,10 +142,11 @@ public sealed class VsCodeLmBridgeTests : IAsyncLifetime
 
     /// <summary>
     /// 取消回合时桥对 DELETE 无响应：取消请求必须有独立超时，
-    /// 否则共享 HttpClient（无超时）会让 RunTurnAsync 永久挂起。
+    /// 否则共享 HttpClient（无超时）会让 RunTurnAsync 永久挂起；
+    /// 取消令牌已取消时按契约原样抛出 <see cref="OperationCanceledException"/>。
     /// </summary>
     [Fact]
-    public async Task RunTurn_CancelWithStalledBridge_ReturnsCancelledWithinTimeoutAsync()
+    public async Task RunTurn_CancelWithStalledBridge_PropagatesCancellationWithinTimeoutAsync()
     {
         var ct = TestContext.Current.CancellationToken;
         WriteDiscovery(pid: 1, port: 1);
@@ -156,6 +157,7 @@ public sealed class VsCodeLmBridgeTests : IAsyncLifetime
             _paths,
             new InternalApiOptions("http://127.0.0.1:3091", "internal-token"),
             new TurnDispatcherRegistry(),
+            NullLoggerFactory.Instance,
             NullLogger<VsCodeLmBridgeClient>.Instance);
 
         using var cancel = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -163,10 +165,8 @@ public sealed class VsCodeLmBridgeTests : IAsyncLifetime
         await Task.Delay(100, ct);
         await cancel.CancelAsync();
 
-        var result = await turn.WaitAsync(TimeSpan.FromSeconds(10), ct);
-
-        Assert.Equal(TurnState.Cancelled, result.State);
-        Assert.Equal(ModelErrorKinds.UserCancelled, result.Error!.Kind);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => turn.WaitAsync(TimeSpan.FromSeconds(10), ct));
     }
 
     /// <summary>写出发现文件（camelCase，与扩展约定一致）。</summary>
@@ -193,6 +193,7 @@ public sealed class VsCodeLmBridgeTests : IAsyncLifetime
         _paths,
         new InternalApiOptions("http://127.0.0.1:3091", "internal-token"),
         new TurnDispatcherRegistry(),
+        NullLoggerFactory.Instance,
         NullLogger<VsCodeLmBridgeClient>.Instance);
 
     /// <summary>构造一个最小回合请求。</summary>
