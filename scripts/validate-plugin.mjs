@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Agent Plugins 1.0.0 离线校验：只校验 plugin/ 一个目标，避免"开发能过、发布不过"。
- * 校验项：封闭字段、$schema 版本、name 规则、技能不递归、mcp.json 结构、UTF-8 无 BOM、版本号一致。
+ * 校验项：封闭字段、$schema 版本、name 规则、技能不递归、角色字段完整性与引用、mcp.json 结构、UTF-8 无 BOM、版本号一致。
  */
 import { existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -24,6 +24,28 @@ const SERVER_KEYS = {
   sse: new Set(['type', 'url', 'headers']),
 };
 const NAME_PATTERN = /^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/;
+
+/** 角色文件允许的键（封闭字段，缺字段或多余键都失败）。 */
+const ROLE_KEYS = new Set([
+  'id', 'name', 'description', 'skills', 'tools', 'delivery',
+  'requiresApproval', 'canRequestInput', 'concurrency', 'budget',
+]);
+const ROLE_CONCURRENCY_KEYS = new Set(['maxParallel', 'maxAttempts']);
+const ROLE_BUDGET_KEYS = new Set(['maxRounds', 'maxToolCalls', 'maxDurationSeconds', 'maxInputTokens']);
+const ROLE_ID_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
+const TOOL_NAME_PATTERN = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/;
+
+/**
+ * 已知 MCP 工具表：新增工具必须先更新本表与 docs/mcp-tool-contract.md，否则角色引用会失败。
+ * 前 7 个为已实现工具；后 5 个为方案已给契约但尚未上线的工具。
+ */
+const KNOWN_TOOLS = new Set([
+  'scheduler_status', 'queue_list', 'queue_get', 'dispatch_now', 'scheduler_control',
+  'result_list', 'result_ack',
+  'input_request_list', 'input_request_get', 'input_request_answer', 'input_request_cancel',
+  'task_upsert', 'result_approve', 'result_reject',
+]);
+
 
 const errors = [];
 const passes = [];
@@ -291,6 +313,214 @@ function validateSkills() {
   pass(`skills/ 校验通过（${entries.length} 个技能）`);
 }
 
+/** 判断是否为普通 JSON 对象（非数组、非 null）。 */
+function isPlainObject(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * 读取非空字符串数组，可选校验命名规则。
+ * @param {unknown} value 待校验值
+ * @param {string} label 报错前缀
+ * @param {RegExp} [pattern] 可选取值规则
+ * @returns {string[]|null} 合法元素数组；结构本身非法时返回 null
+ */
+function readStringArray(value, label, pattern) {
+  if (!Array.isArray(value) || value.length === 0) {
+    fail(`${label} 必须是非空数组`);
+    return null;
+  }
+  const items = [];
+  for (const item of value) {
+    if (typeof item !== 'string' || item.length === 0) {
+      fail(`${label} 含非字符串元素`);
+      continue;
+    }
+    if (pattern && !pattern.test(item)) fail(`${label} 含非法取值：${item}`);
+    items.push(item);
+  }
+  return items;
+}
+
+/**
+ * 校验单个角色文件：封闭字段、必填项、类型与取值范围。
+ * @param {string} fileName 文件名（含 .json）
+ * @param {Record<string, unknown>} role 角色内容
+ * @param {Set<string>} skillNames 已存在的技能目录名
+ * @returns {string|null} 合法角色 id
+ */
+function validateRoleFile(fileName, role, skillNames) {
+  const label = `roles/${fileName}`;
+  if (!isPlainObject(role)) {
+    fail(`${label} 必须是 JSON 对象`);
+    return null;
+  }
+
+  for (const key of Object.keys(role)) {
+    if (!ROLE_KEYS.has(key)) fail(`${label} 含封闭字段外的键：${key}`);
+  }
+  for (const key of ROLE_KEYS) {
+    if (!(key in role)) fail(`${label} 缺少必填字段：${key}`);
+  }
+
+  const expectedId = fileName.replace(/\.json$/i, '');
+  if (typeof role.id !== 'string' || !ROLE_ID_PATTERN.test(role.id)) {
+    fail(`${label} id 不合规：${role.id}`);
+  } else if (role.id !== expectedId) {
+    fail(`${label} id(${role.id}) 与文件名(${expectedId}) 不一致`);
+  }
+  if (typeof role.name !== 'string' || role.name.trim().length === 0) {
+    fail(`${label} name 必须是非空字符串`);
+  }
+  if (typeof role.description !== 'string' || role.description.trim().length === 0) {
+    fail(`${label} description 必须是非空字符串`);
+  }
+
+  const skills = readStringArray(role.skills, `${label}.skills`);
+  if (skills) {
+    for (const skill of skills) {
+      if (!skillNames.has(skill)) fail(`${label}.skills 引用不存在的技能：${skill}`);
+    }
+  }
+
+  const tools = readStringArray(role.tools, `${label}.tools`, TOOL_NAME_PATTERN);
+  if (tools) {
+    for (const tool of tools) {
+      if (!KNOWN_TOOLS.has(tool)) fail(`${label}.tools 含未知工具：${tool}（需先更新本脚本与契约文档）`);
+    }
+  }
+
+  if (role.delivery !== 'auto' && role.delivery !== 'dispatch_only') {
+    fail(`${label}.delivery 必须是 auto 或 dispatch_only，实际：${role.delivery}`);
+  }
+  if (typeof role.requiresApproval !== 'boolean') fail(`${label}.requiresApproval 必须是布尔`);
+  if (typeof role.canRequestInput !== 'boolean') fail(`${label}.canRequestInput 必须是布尔`);
+
+  if (!isPlainObject(role.concurrency)) {
+    fail(`${label}.concurrency 必须是对象`);
+  } else {
+    for (const key of Object.keys(role.concurrency)) {
+      if (!ROLE_CONCURRENCY_KEYS.has(key)) fail(`${label}.concurrency 含非法键：${key}`);
+    }
+    const { maxParallel, maxAttempts } = role.concurrency;
+    if (!Number.isInteger(maxParallel) || maxParallel < 1 || maxParallel > 16) {
+      fail(`${label}.concurrency.maxParallel 必须是 1–16 的整数`);
+    }
+    if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) {
+      fail(`${label}.concurrency.maxAttempts 必须是 1–10 的整数`);
+    }
+  }
+
+  if (!isPlainObject(role.budget)) {
+    fail(`${label}.budget 必须是对象`);
+  } else {
+    for (const key of Object.keys(role.budget)) {
+      if (!ROLE_BUDGET_KEYS.has(key)) fail(`${label}.budget 含非法键：${key}`);
+    }
+    const { maxRounds, maxToolCalls, maxDurationSeconds, maxInputTokens } = role.budget;
+    if (!Number.isInteger(maxRounds) || maxRounds < 1 || maxRounds > 50) {
+      fail(`${label}.budget.maxRounds 必须是 1–50 的整数`);
+    }
+    if (!Number.isInteger(maxToolCalls) || maxToolCalls < 1 || maxToolCalls > 200) {
+      fail(`${label}.budget.maxToolCalls 必须是 1–200 的整数`);
+    }
+    if (!Number.isInteger(maxDurationSeconds) || maxDurationSeconds < 30 || maxDurationSeconds > 3600) {
+      fail(`${label}.budget.maxDurationSeconds 必须是 30–3600 的整数`);
+    }
+    if (maxInputTokens !== undefined && (!Number.isInteger(maxInputTokens) || maxInputTokens < 1)) {
+      fail(`${label}.budget.maxInputTokens 必须是正整数`);
+    }
+  }
+
+  return typeof role.id === 'string' ? role.id : null;
+}
+
+/**
+ * 校验角色目录与 plugin.json 的 extensions.devhub 声明：
+ * 声明必须覆盖实际文件，技能入口必须与实际技能目录一致。
+ * @param {Record<string, unknown>|null} manifest plugin.json 内容
+ */
+function validateRoles(manifest) {
+  const errorsBefore = errors.length;
+  const extension = manifest?.extensions?.devhub;
+  if (!isPlainObject(extension)) {
+    fail('plugin.json 缺少 extensions.devhub（角色与技能入口）');
+    return;
+  }
+  for (const key of Object.keys(extension)) {
+    if (!['roles', 'skills'].includes(key)) fail(`plugin.json extensions.devhub 含非法键：${key}`);
+  }
+
+  const declaredRoles = readStringArray(extension.roles, 'plugin.json extensions.devhub.roles');
+  const declaredSkills = readStringArray(extension.skills, 'plugin.json extensions.devhub.skills');
+
+  const skillsDir = join(pluginDir, 'skills');
+  const skillNames = new Set();
+  if (existsSync(skillsDir)) {
+    const actualSkillPaths = new Set();
+    for (const entry of readdirSync(skillsDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      skillNames.add(entry.name);
+      actualSkillPaths.add(`skills/${entry.name}`);
+    }
+    if (declaredSkills) {
+      for (const skill of declaredSkills) {
+        if (!actualSkillPaths.has(skill)) fail(`plugin.json 声明的技能入口不存在：${skill}`);
+      }
+      for (const skill of actualSkillPaths) {
+        if (!declaredSkills.includes(skill)) fail(`技能目录未在 plugin.json 声明：${skill}`);
+      }
+    }
+  }
+
+  const rolesDir = join(pluginDir, 'roles');
+  if (!existsSync(rolesDir)) {
+    fail('缺少 plugin/roles 目录');
+    return;
+  }
+
+  const entries = readdirSync(rolesDir, { withFileTypes: true });
+  if (entries.length === 0) {
+    fail('plugin/roles 为空');
+    return;
+  }
+
+  const declaredSet = new Set(declaredRoles ?? []);
+  const roleIds = new Set();
+  for (const entry of entries) {
+    const entryPath = join(rolesDir, entry.name);
+    if (lstatSync(entryPath).isSymbolicLink()) {
+      fail(`角色文件不得是符号链接：${entry.name}`);
+      continue;
+    }
+    if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.json')) {
+      fail(`roles/ 下只允许 .json 角色文件，发现：${entry.name}`);
+      continue;
+    }
+    const relativePath = `roles/${entry.name}`;
+    if (declaredRoles && !declaredSet.has(relativePath)) {
+      fail(`角色文件未在 plugin.json 声明：${relativePath}`);
+    }
+
+    const role = readJson(entryPath);
+    if (!role) continue;
+    const id = validateRoleFile(entry.name, role, skillNames);
+    if (!id) continue;
+    if (roleIds.has(id)) fail(`角色 id 重复：${id}`);
+    roleIds.add(id);
+  }
+
+  if (declaredRoles) {
+    for (const declared of declaredRoles) {
+      if (!existsSync(join(pluginDir, declared))) fail(`plugin.json 声明的角色文件不存在：${declared}`);
+    }
+  }
+
+  if (errors.length === errorsBefore) {
+    pass(`roles/ 校验通过（${entries.length} 个角色，${roleIds.size} 个合法 id）`);
+  }
+}
+
 /** 包内不得出现解决方案、源码、二进制与构建脚本。 */
 function validatePackageContents() {
   const forbidden = ['bin', 'obj', 'node_modules'];
@@ -300,7 +530,7 @@ function validatePackageContents() {
   if (existsSync(join(pluginDir, 'DevHubd.sln'))) fail('plugin/ 不得包含解决方案文件');
 
   for (const entry of readdirSync(pluginDir, { withFileTypes: true })) {
-    const allowedRoots = new Set(['plugin.json', 'mcp.json', 'skills']);
+    const allowedRoots = new Set(['plugin.json', 'mcp.json', 'skills', 'roles']);
     if (!allowedRoots.has(entry.name)) {
       fail(`plugin/ 顶层出现非组件内容：${entry.name}`);
     }
@@ -309,9 +539,10 @@ function validatePackageContents() {
 }
 
 console.log(`校验目标：${pluginDir}`);
-validatePluginManifest();
+const manifest = validatePluginManifest();
 validateMcpManifest();
 validateSkills();
+validateRoles(manifest);
 validatePackageContents();
 
 for (const message of passes) console.log(`  PASS ${message}`);

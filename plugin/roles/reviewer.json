@@ -1,0 +1,29 @@
+{
+  "id": "reviewer",
+  "name": "评审",
+  "description": "审阅实现类角色的产出与证据，给出通过或驳回结论；只读，不修改文件，不发起提问。",
+  "skills": [
+    "devhub-scheduler",
+    "devhub-task-handoff"
+  ],
+  "tools": [
+    "queue_get",
+    "result_list",
+    "input_request_list",
+    "input_request_get",
+    "result_approve",
+    "result_reject"
+  ],
+  "delivery": "dispatch_only",
+  "requiresApproval": true,
+  "canRequestInput": false,
+  "concurrency": {
+    "maxParallel": 1,
+    "maxAttempts": 1
+  },
+  "budget": {
+    "maxRounds": 6,
+    "maxToolCalls": 20,
+    "maxDurationSeconds": 600
+  }
+}

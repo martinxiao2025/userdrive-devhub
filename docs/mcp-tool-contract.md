@@ -214,6 +214,69 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 
 ## 6. 变更记录
 
+### 待实施 — 2026-11-08（契约先行，未上线）
+
+> 以下工具与 schema v5 仅登记契约，**当前实现不存在**：调用会返回 `UNKNOWN_TOOL`，数据库仍为 v4。
+> 方案见 `.trae/documents/架构增量方案-角色调度与不确定项回流.md`。上线时必须同步 `ToolVocabulary`、工具快照测试与本文件。
+
+**`input_request_list`（只读）**
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `workspaceId` | string? | null | 按工作区过滤 |
+| `taskId` | string? | null | 按任务过滤 |
+| `status` | string | `open` | `open/answered/expired/cancelled/all` |
+| `limit` | int | 20 | 1–100 |
+| `cursor` | string? | null | 上一页 `nextCursor` |
+
+返回 `items[]`：`id/workspaceId/taskId/queueItemId/roleId/status/question/missingInputs/optionCount/createdAt/expiresAt/answeredAt` 与 `nextCursor`。
+错误：`INVALID_STATUS`、`INVALID_LIMIT`、`INVALID_CURSOR`。
+
+**`input_request_get`（只读）**
+
+参数：`id`（必填）。返回：`id/status/workspaceId/taskId/queueItemId/roleId/question/context/options[]/missingInputs/allowFreeText/createdAt/expiresAt/answeredAt/answer/related[]`。
+错误：`UNKNOWN_INPUT_REQUEST`。
+
+**`input_request_answer`**
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `id` | string | 是 | 问题单 id |
+| `answer` | string | 是 | 1–4000 字符 |
+| `optionId` | string? | 否 | 必须属于该请求的 `options` |
+| `answeredBy` | string? | 否 | 缺省 `mcp` |
+| `idempotencyKey` | string? | 否 | 幂等键 |
+
+返回：`{ id, status:"answered", resumedQueueItemId, nextScanAt, acceptedAt }`。
+错误：`UNKNOWN_INPUT_REQUEST`、`INPUT_REQUEST_CLOSED`、`INVALID_ANSWER`、`ANSWER_CONFLICT`。
+幂等：相同答案重复提交返回首次结果；不同答案返回 `ANSWER_CONFLICT`，不覆盖。
+
+**`input_request_cancel`**
+
+参数：`id`、`reason?`。返回：`{ id, status:"cancelled", queueItemId, cancelledAt }`。
+错误：`UNKNOWN_INPUT_REQUEST`、`INPUT_REQUEST_CLOSED`。
+
+**`task_upsert`**
+
+参数：`workspaceId`、`id`、`title`、`prompt`、`priority?`、`role?`、`delivery?`、`writeScope?`、`dependsOn?`、`requiresApproval?`、`source?`。
+语义：原子写入 `<root>/.devhub/tasks/<id>.json`（临时文件 + rename），由现有扫描器拾取；不直接改数据库。
+返回：`{ taskId, path, contentHash, queued }`。
+错误：`UNKNOWN_WORKSPACE`、`INVALID_TASK`、`INVALID_ROLE`、`TASK_CONFLICT`。
+
+**`result_approve` / `result_reject`**
+
+参数：`resultId`、`comment?`。返回：`{ resultId, outcome:"delivered"|"failed", taskId, decidedAt }`。
+错误：`UNKNOWN_RESULT`、`RESULT_NOT_PENDING`。
+
+**新增错误码（只增不改）**
+
+`NEEDS_INPUT`、`INPUT_TIMEOUT`、`INPUT_NOT_ALLOWED`、`UNKNOWN_INPUT_REQUEST`、`INPUT_REQUEST_CLOSED`、`INVALID_ANSWER`、`ANSWER_CONFLICT`、`INVALID_ROLE`、`TASK_CONFLICT`、`TASK_CHANGED`、`DEPENDENCY_UNMET`、`UNKNOWN_RESULT`、`RESULT_NOT_PENDING`。
+
+**schema v5（未执行）**
+
+只做 `ALTER TABLE ADD COLUMN` 与新增表（`input_request`、`role_view`），**不修改任何既有 `CHECK`、不重建表**。
+`queue_item` 新增 `role_id/hold_kind/hold_ref`；`task_view` 新增 `role_id/depends_on/approval_state`。
+
 ### v4 — 2026-11-08（数据修正，无字段变化）
 
 **回填旧行 `usage_available`**

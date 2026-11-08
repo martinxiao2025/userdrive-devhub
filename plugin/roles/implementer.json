@@ -1,0 +1,28 @@
+{
+  "id": "implementer",
+  "name": "实现",
+  "description": "执行实现类任务：读任务上下文、按写入范围改动文件、产出可复核的结果与制品；遇到缺失输入时发起提问而不是猜测。",
+  "skills": [
+    "devhub-scheduler",
+    "devhub-task-handoff"
+  ],
+  "tools": [
+    "scheduler_status",
+    "queue_list",
+    "queue_get",
+    "result_list",
+    "result_ack"
+  ],
+  "delivery": "dispatch_only",
+  "requiresApproval": true,
+  "canRequestInput": true,
+  "concurrency": {
+    "maxParallel": 2,
+    "maxAttempts": 3
+  },
+  "budget": {
+    "maxRounds": 12,
+    "maxToolCalls": 60,
+    "maxDurationSeconds": 1800
+  }
+}

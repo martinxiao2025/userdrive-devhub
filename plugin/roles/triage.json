@@ -1,0 +1,29 @@
+{
+  "id": "triage",
+  "name": "问题分诊",
+  "description": "把录入的问题整理成可执行任务：识别来源与分类、判断优先级、去重、指定承担角色与依赖；不直接修改工作区代码。",
+  "skills": [
+    "devhub-issue-intake",
+    "devhub-scheduler"
+  ],
+  "tools": [
+    "scheduler_status",
+    "queue_list",
+    "queue_get",
+    "task_upsert",
+    "input_request_list",
+    "input_request_get"
+  ],
+  "delivery": "dispatch_only",
+  "requiresApproval": true,
+  "canRequestInput": true,
+  "concurrency": {
+    "maxParallel": 1,
+    "maxAttempts": 2
+  },
+  "budget": {
+    "maxRounds": 6,
+    "maxToolCalls": 30,
+    "maxDurationSeconds": 600
+  }
+}

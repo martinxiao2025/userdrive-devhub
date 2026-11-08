@@ -12,5 +12,19 @@
     "mcp",
     "copilot",
     "task-dispatch"
-  ]
+  ],
+  "extensions": {
+    "devhub": {
+      "roles": [
+        "roles/triage.json",
+        "roles/implementer.json",
+        "roles/reviewer.json"
+      ],
+      "skills": [
+        "skills/devhub-scheduler",
+        "skills/devhub-issue-intake",
+        "skills/devhub-task-handoff"
+      ]
+    }
+  }
 }
