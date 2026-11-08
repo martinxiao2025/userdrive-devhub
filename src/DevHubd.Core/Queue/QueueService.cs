@@ -1,10 +1,12 @@
+using System.Data.Common;
 using System.Globalization;
-using System.Text;
 using System.Text.Json;
 using DevHubd.Core.Data;
+using DevHubd.Core.Data.Entities;
 using DevHubd.Core.Execution;
 using DevHubd.Core.Tasks;
-using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 
 namespace DevHubd.Core.Queue;
 
@@ -12,21 +14,36 @@ namespace DevHubd.Core.Queue;
 /// 队列服务：入队（按 dedupe_key 幂等）、原子认领、租约续期与回收、分页查询。
 /// 并发安全依赖 SQLite 的 <c>BEGIN IMMEDIATE</c>（写锁前置）+ <c>busy_timeout</c>，
 /// 而不是进程内 <c>lock</c>——后者在多连接下不成立。
+/// 除原子认领外，其余读写统一通过 EF Core（<see cref="DevHubDbContext"/>）完成。
 /// </summary>
 public sealed class QueueService
 {
+    /// <summary>未结束（仍需派发/执行）的队列状态。</summary>
+    private static readonly string[] _activeStatuses =
+    {
+        "pending", "claimed", "running",
+    };
+
+    /// <summary>全部合法状态（列表过滤与工具层校验共用）。</summary>
     private static readonly string[] _allowedStatuses =
     {
         "pending", "claimed", "running", "succeeded", "failed", "dead", "cancelled",
     };
 
-    private readonly SqliteConnectionFactory _factory;
+    private readonly IDbContextFactory<DevHubDbContext> _contextFactory;
 
-    /// <summary>注入连接工厂。</summary>
+    /// <summary>注入 EF Core 上下文工厂（每个方法内创建独立上下文，上下文不跨调用共享）。</summary>
+    /// <param name="contextFactory">上下文工厂。</param>
+    public QueueService(IDbContextFactory<DevHubDbContext> contextFactory)
+    {
+        _contextFactory = contextFactory;
+    }
+
+    /// <summary>用裸连接工厂构造（测试与不依赖 DI 的场景）；内部转换为 EF 上下文工厂。</summary>
     /// <param name="factory">SQLite 连接工厂。</param>
     public QueueService(SqliteConnectionFactory factory)
+        : this(new DevHubDbContextFactory(factory.ConnectionString))
     {
-        _factory = factory;
     }
 
     /// <summary>读取单个任务（task_view 投影）。</summary>
@@ -35,20 +52,17 @@ public sealed class QueueService
     /// <param name="cancellationToken">取消令牌。</param>
     public async Task<TaskRow?> GetTaskAsync(string workspaceId, string taskId, CancellationToken cancellationToken = default)
     {
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-        command.CommandText =
-            "SELECT id, title, status, content_hash, priority FROM task_view WHERE workspace_id = $workspace AND id = $task;";
-        command.Parameters.AddWithValue("$workspace", workspaceId);
-        command.Parameters.AddWithValue("$task", taskId);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var row = await db.TaskViews
+            .AsNoTracking()
+            .Where(task => task.WorkspaceId == workspaceId && task.Id == taskId)
+            .Select(task => new { task.Id, task.Title, task.Status, task.ContentHash, task.Priority })
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
 
-        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-        {
-            return null;
-        }
-
-        return new TaskRow(reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.GetString(3), reader.GetInt32(4));
+        return row is null
+            ? null
+            : new TaskRow(row.Id, row.Title, row.Status, row.ContentHash, row.Priority);
     }
 
     /// <summary>把工作区内所有 ready 任务翻译成队列项；重复调用零副作用。</summary>
@@ -64,25 +78,28 @@ public sealed class QueueService
     {
         var now = Now();
         var scheduledProvider = ExecutionOptions.NormalizeScheduledProvider(provider);
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var transaction = connection.BeginTransaction(deferred: false);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
-        var tasks = new List<TaskRow>();
-        using (var select = connection.CreateCommand())
-        {
-            select.Transaction = transaction;
-            select.CommandText =
-                "SELECT id, title, status, content_hash, priority FROM task_view " +
-                "WHERE workspace_id = $workspace AND status = 'ready' ORDER BY priority DESC, id ASC;";
-            select.Parameters.AddWithValue("$workspace", workspaceId);
+        var tasks = await db.TaskViews
+            .AsNoTracking()
+            .Where(task => task.WorkspaceId == workspaceId && task.Status == "ready")
+            .OrderByDescending(task => task.Priority)
+            .ThenBy(task => task.Id)
+            .Select(task => new { task.Id, task.Title, task.Status, task.ContentHash, task.Priority })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
 
-            using var reader = await select.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-            {
-                tasks.Add(new TaskRow(
-                    reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.GetString(3), reader.GetInt32(4)));
-            }
-        }
+        // 一次性取回本工作区所有"未结束"的 task_id：任务在 task_view 中天然唯一，
+        // 因此快照判断与逐条 EXISTS 等价，但把 N 次查询收敛成 1 次。
+        var activeTaskIds = (await db.QueueItems
+                .AsNoTracking()
+                .Where(item => item.WorkspaceId == workspaceId && _activeStatuses.Contains(item.Status))
+                .Select(item => item.TaskId)
+                .Distinct()
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false))
+            .ToHashSet(StringComparer.Ordinal);
 
         var enqueued = 0;
         var deduped = 0;
@@ -90,9 +107,7 @@ public sealed class QueueService
 
         foreach (var task in tasks)
         {
-            var dedupeKey = BuildDedupeKey(workspaceId, task.Id, task.ContentHash);
-
-            if (await FindActiveItemAsync(connection, transaction, workspaceId, task.Id, cancellationToken).ConfigureAwait(false) is not null)
+            if (activeTaskIds.Contains(task.Id))
             {
                 skippedActive++;
                 continue;
@@ -104,11 +119,11 @@ public sealed class QueueService
                 continue;
             }
 
-            var inserted = await InsertAsync(
-                connection,
-                transaction,
+            var dedupeKey = BuildDedupeKey(workspaceId, task.Id, task.ContentHash);
+            var inserted = await InsertIgnoreConflictAsync(
+                db,
                 workspaceId,
-                task,
+                new TaskRow(task.Id, task.Title, task.Status, task.ContentHash, task.Priority),
                 scheduledProvider,
                 dedupeKey,
                 now,
@@ -126,7 +141,7 @@ public sealed class QueueService
 
         if (!dryRun)
         {
-            transaction.Commit();
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
 
         return new EnqueueResult(enqueued, deduped, skippedActive);
@@ -148,20 +163,35 @@ public sealed class QueueService
         var now = Now();
         var dedupeKey = BuildDedupeKey(workspaceId, task.Id, task.ContentHash);
 
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var transaction = connection.BeginTransaction(deferred: false);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
-        var existing = await FindByDedupeKeyAsync(connection, transaction, dedupeKey, cancellationToken).ConfigureAwait(false);
+        var existing = await db.QueueItems
+            .AsNoTracking()
+            .Where(item => item.DedupeKey == dedupeKey)
+            .Select(item => new { item.Id, item.PreferredProvider })
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+
         if (existing is not null)
         {
             // 返回已有队列项的真实 provider，而不是本次请求的 provider——否则 deduped 会误导调用方。
-            return new ManualEnqueueResult(false, true, existing.Id, "deduped", existing.Provider);
+            return new ManualEnqueueResult(false, true, existing.Id, "deduped", existing.PreferredProvider);
         }
 
-        var active = await FindActiveItemAsync(connection, transaction, workspaceId, task.Id, cancellationToken).ConfigureAwait(false);
+        var active = await db.QueueItems
+            .AsNoTracking()
+            .Where(item =>
+                item.WorkspaceId == workspaceId &&
+                item.TaskId == task.Id &&
+                _activeStatuses.Contains(item.Status))
+            .Select(item => new { item.Id, item.PreferredProvider })
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+
         if (active is not null)
         {
-            return new ManualEnqueueResult(false, true, active.Id, "active_exists", active.Provider);
+            return new ManualEnqueueResult(false, true, active.Id, "active_exists", active.PreferredProvider);
         }
 
         if (dryRun)
@@ -170,28 +200,25 @@ public sealed class QueueService
         }
 
         var id = Guid.NewGuid().ToString("N");
-        using (var insert = connection.CreateCommand())
+        db.QueueItems.Add(new QueueItemEntity
         {
-            insert.Transaction = transaction;
-            insert.CommandText = """
-                INSERT INTO queue_item
-                  (id, workspace_id, task_id, task_hash, dedupe_key, status, priority, attempt, max_attempts,
-                   preferred_provider, available_at, created_at, updated_at)
-                VALUES
-                  ($id, $workspace, $task, $hash, $dedupe, 'pending', $priority, 0, 3, $provider, $now, $now, $now);
-                """;
-            insert.Parameters.AddWithValue("$id", id);
-            insert.Parameters.AddWithValue("$workspace", workspaceId);
-            insert.Parameters.AddWithValue("$task", task.Id);
-            insert.Parameters.AddWithValue("$hash", task.ContentHash);
-            insert.Parameters.AddWithValue("$dedupe", dedupeKey);
-            insert.Parameters.AddWithValue("$priority", task.Priority);
-            insert.Parameters.AddWithValue("$provider", provider);
-            insert.Parameters.AddWithValue("$now", now);
-            await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-        }
+            Id = id,
+            WorkspaceId = workspaceId,
+            TaskId = task.Id,
+            TaskHash = task.ContentHash,
+            DedupeKey = dedupeKey,
+            Status = "pending",
+            Priority = task.Priority,
+            Attempt = 0,
+            MaxAttempts = 3,
+            PreferredProvider = provider,
+            AvailableAt = now,
+            CreatedAt = now,
+            UpdatedAt = now,
+        });
+        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
 
-        transaction.Commit();
         return new ManualEnqueueResult(true, false, id, "pending", provider);
     }
 
@@ -204,13 +231,14 @@ public sealed class QueueService
         string taskId,
         CancellationToken cancellationToken = default)
     {
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-        command.CommandText = "SELECT payload FROM task_view WHERE workspace_id = $workspace AND id = $task;";
-        command.Parameters.AddWithValue("$workspace", workspaceId);
-        command.Parameters.AddWithValue("$task", taskId);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var payload = await db.TaskViews
+            .AsNoTracking()
+            .Where(task => task.WorkspaceId == workspaceId && task.Id == taskId)
+            .Select(task => task.Payload)
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
 
-        var payload = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) as string;
         if (payload is null)
         {
             return null;
@@ -236,6 +264,16 @@ public sealed class QueueService
     /// 原子认领并返回 attempt id，供执行器回写 attempt 终态。
     /// 认领条件包含 <c>attempt &lt; max_attempts</c>，避免用尽预算的项被反复认领。
     /// </summary>
+    /// <remarks>
+    /// 这里刻意保留原生 SQL，不能改写成普通 LINQ：
+    /// <list type="bullet">
+    /// <item>认领要跨进程互斥。若先 <c>SELECT</c> 再 <c>UPDATE</c>，两个进程可能选中同一行（先查后改丢失原子性）；</item>
+    /// <item>EF 会把 "查询 → 更新" 翻译成两条语句，无法表达 <c>UPDATE … RETURNING</c> 的单语句原子语义，
+    /// 而 <c>UPDATE … RETURNING</c> 本身也不能作为子查询交给 EF 组译。</item>
+    /// </list>
+    /// 事务仍由 EF 管理：<c>Database.BeginTransactionAsync()</c> 使用 Microsoft.Data.Sqlite 的默认
+    /// <c>BEGIN IMMEDIATE</c>（写锁前置），命令通过该事务的连接执行，保证与 attempt 写入同一事务。
+    /// </remarks>
     /// <param name="ownerId">认领者标识。</param>
     /// <param name="lease">租约时长。</param>
     /// <param name="cancellationToken">取消令牌。</param>
@@ -245,17 +283,22 @@ public sealed class QueueService
         CancellationToken cancellationToken = default)
     {
         var nowValue = DateTimeOffset.UtcNow;
-        var now = nowValue.ToString("O");
-        var expires = nowValue.Add(lease).ToString("O");
+        var now = nowValue.ToString("O", CultureInfo.InvariantCulture);
+        var expires = nowValue.Add(lease).ToString("O", CultureInfo.InvariantCulture);
 
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var transaction = connection.BeginTransaction(deferred: false);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
         QueueItem? item = null;
 
-        using (var command = connection.CreateCommand())
+        // 单语句完成"挑一行 + 占租约 + 递增 attempt"。
+        // 注意：这里不能用 Database.SqlQueryRaw/FromSqlRaw 承载 UPDATE … RETURNING——
+        // EF 会把它当作需要组译的查询源包一层 SELECT，而该语句对 EF 是"不可组合 SQL"，
+        // 运行期会直接抛 InvalidOperationException（已在本仓库实测）。因此命令挂在
+        // EF 事务的连接上执行，事务仍由 Database.BeginTransactionAsync() 统一管理。
+        await using (var command = db.Database.GetDbConnection().CreateCommand())
         {
-            command.Transaction = transaction;
+            command.Transaction = db.Database.CurrentTransaction!.GetDbTransaction();
             command.CommandText = """
                 UPDATE queue_item
                 SET status = 'claimed',
@@ -275,11 +318,11 @@ public sealed class QueueService
                           preferred_provider, available_at, lease_owner, lease_expires_at,
                           last_error_code, last_error, created_at, updated_at;
                 """;
-            command.Parameters.AddWithValue("$owner", ownerId);
-            command.Parameters.AddWithValue("$expires", expires);
-            command.Parameters.AddWithValue("$now", now);
+            AddParameter(command, "$owner", ownerId);
+            AddParameter(command, "$expires", expires);
+            AddParameter(command, "$now", now);
 
-            using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
             if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 item = ReadItem(reader);
@@ -290,21 +333,18 @@ public sealed class QueueService
         if (item is not null)
         {
             attemptId = Guid.NewGuid().ToString("N");
-            using var attempt = connection.CreateCommand();
-            attempt.Transaction = transaction;
-            attempt.CommandText = """
-                INSERT INTO attempt (id, queue_item_id, attempt_no, provider, started_at)
-                VALUES ($id, $item, $no, $provider, $now);
-                """;
-            attempt.Parameters.AddWithValue("$id", attemptId);
-            attempt.Parameters.AddWithValue("$item", item.Id);
-            attempt.Parameters.AddWithValue("$no", item.Attempt);
-            attempt.Parameters.AddWithValue("$provider", item.PreferredProvider);
-            attempt.Parameters.AddWithValue("$now", now);
-            await attempt.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            db.Attempts.Add(new AttemptEntity
+            {
+                Id = attemptId,
+                QueueItemId = item.Id,
+                AttemptNo = item.Attempt,
+                Provider = item.PreferredProvider,
+                StartedAt = now,
+            });
+            await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        transaction.Commit();
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return item is null || attemptId is null ? null : new ClaimedQueueItem(item, attemptId);
     }
 
@@ -319,19 +359,23 @@ public sealed class QueueService
         TimeSpan lease,
         CancellationToken cancellationToken = default)
     {
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-        command.CommandText = """
-            UPDATE queue_item
-            SET lease_expires_at = $expires, updated_at = $now
-            WHERE id = $id AND lease_owner = $owner AND status IN ('claimed','running');
-            """;
-        command.Parameters.AddWithValue("$expires", DateTimeOffset.UtcNow.Add(lease).ToString("O"));
-        command.Parameters.AddWithValue("$now", Now());
-        command.Parameters.AddWithValue("$id", queueItemId);
-        command.Parameters.AddWithValue("$owner", ownerId);
+        var expires = DateTimeOffset.UtcNow.Add(lease).ToString("O", CultureInfo.InvariantCulture);
+        var now = Now();
 
-        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var affected = await db.QueueItems
+            .Where(item =>
+                item.Id == queueItemId &&
+                item.LeaseOwner == ownerId &&
+                (item.Status == "claimed" || item.Status == "running"))
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(item => item.LeaseExpiresAt, expires)
+                    .SetProperty(item => item.UpdatedAt, now),
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        return affected == 1;
     }
 
     /// <summary>回收租约过期的队列项：相关 attempt 记为 abandoned，队列项回到 pending。</summary>
@@ -340,43 +384,45 @@ public sealed class QueueService
     public async Task<int> ReclaimExpiredAsync(CancellationToken cancellationToken = default)
     {
         var now = Now();
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var transaction = connection.BeginTransaction(deferred: false);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
-        using (var abandon = connection.CreateCommand())
+        var expired = db.QueueItems.Where(item =>
+            (item.Status == "claimed" || item.Status == "running") &&
+            item.LeaseExpiresAt != null &&
+            item.LeaseExpiresAt.CompareTo(now) < 0);
+
+        var expiredIds = await expired
+            .Select(item => item.Id)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        if (expiredIds.Count > 0)
         {
-            abandon.Transaction = transaction;
-            abandon.CommandText = """
-                UPDATE attempt
-                SET ended_at = $now, outcome = 'abandoned', error_code = 'LEASE_EXPIRED'
-                WHERE ended_at IS NULL AND queue_item_id IN (
-                    SELECT id FROM queue_item
-                    WHERE status IN ('claimed','running') AND lease_expires_at IS NOT NULL AND lease_expires_at < $now
-                );
-                """;
-            abandon.Parameters.AddWithValue("$now", now);
-            await abandon.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await db.Attempts
+                .Where(attempt => attempt.EndedAt == null && expiredIds.Contains(attempt.QueueItemId))
+                .ExecuteUpdateAsync(
+                    setters => setters
+                        .SetProperty(attempt => attempt.EndedAt, now)
+                        .SetProperty(attempt => attempt.Outcome, "abandoned")
+                        .SetProperty(attempt => attempt.ErrorCode, "LEASE_EXPIRED"),
+                    cancellationToken)
+                .ConfigureAwait(false);
         }
 
-        int reclaimed;
-        using (var command = connection.CreateCommand())
-        {
-            command.Transaction = transaction;
-            command.CommandText = """
-                UPDATE queue_item
-                SET status = 'pending',
-                    lease_owner = NULL,
-                    lease_expires_at = NULL,
-                    last_error_code = 'LEASE_EXPIRED',
-                    last_error = '租约过期，已自动回收',
-                    updated_at = $now
-                WHERE status IN ('claimed','running') AND lease_expires_at IS NOT NULL AND lease_expires_at < $now;
-                """;
-            command.Parameters.AddWithValue("$now", now);
-            reclaimed = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-        }
+        var reclaimed = await expired
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(item => item.Status, "pending")
+                    .SetProperty(item => item.LeaseOwner, (string?)null)
+                    .SetProperty(item => item.LeaseExpiresAt, (string?)null)
+                    .SetProperty(item => item.LastErrorCode, "LEASE_EXPIRED")
+                    .SetProperty(item => item.LastError, "租约过期，已自动回收")
+                    .SetProperty(item => item.UpdatedAt, now),
+                cancellationToken)
+            .ConfigureAwait(false);
 
-        transaction.Commit();
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return reclaimed;
     }
 
@@ -400,48 +446,33 @@ public sealed class QueueService
             throw new ArgumentException($"未知状态：{status}", nameof(status));
         }
 
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
 
-        var sql = new StringBuilder("""
-            SELECT id, workspace_id, task_id, task_hash, status, priority, attempt, max_attempts,
-                   preferred_provider, available_at, lease_owner, lease_expires_at,
-                   last_error_code, last_error, created_at, updated_at
-            FROM queue_item
-            WHERE 1 = 1
-            """);
+        var query = db.QueueItems.AsNoTracking();
 
         if (!string.Equals(status, "all", StringComparison.Ordinal))
         {
-            sql.Append(" AND status = $status");
-            command.Parameters.AddWithValue("$status", status);
+            query = query.Where(item => item.Status == status);
         }
 
         if (TryDecodeCursor(cursor, out var cursorPriority, out var cursorCreatedAt, out var cursorId))
         {
-            sql.Append("""
-                 AND (priority < $cp
-                      OR (priority = $cp AND (created_at > $cc
-                                              OR (created_at = $cc AND id > $ci))))
-                """);
-            command.Parameters.AddWithValue("$cp", cursorPriority);
-            command.Parameters.AddWithValue("$cc", cursorCreatedAt);
-            command.Parameters.AddWithValue("$ci", cursorId);
+            query = query.Where(item =>
+                item.Priority < cursorPriority ||
+                (item.Priority == cursorPriority &&
+                 (item.CreatedAt.CompareTo(cursorCreatedAt) > 0 ||
+                  (item.CreatedAt == cursorCreatedAt && item.Id.CompareTo(cursorId) > 0))));
         }
 
-        sql.Append(" ORDER BY priority DESC, created_at ASC, id ASC LIMIT $limit;");
-        command.CommandText = sql.ToString();
-        command.Parameters.AddWithValue("$limit", limit);
+        var rows = await query
+            .OrderByDescending(item => item.Priority)
+            .ThenBy(item => item.CreatedAt)
+            .ThenBy(item => item.Id)
+            .Take(limit)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
 
-        var items = new List<QueueItem>();
-        using (var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
-        {
-            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-            {
-                items.Add(ReadItem(reader));
-            }
-        }
-
+        var items = rows.Select(ToDomain).ToList();
         var nextCursor = items.Count == limit ? EncodeCursor(items[^1]) : null;
         return new QueuePage(items, nextCursor);
     }
@@ -455,42 +486,38 @@ public sealed class QueueService
     public async Task<IReadOnlyList<QueueItem>> ListActiveAsync(int limit, CancellationToken cancellationToken = default)
     {
         var capped = Math.Clamp(limit, 1, 100);
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-        command.CommandText = """
-            SELECT id, workspace_id, task_id, task_hash, status, priority, attempt, max_attempts,
-                   preferred_provider, available_at, lease_owner, lease_expires_at,
-                   last_error_code, last_error, created_at, updated_at
-            FROM queue_item
-            WHERE status IN ('pending','claimed','running')
-            ORDER BY priority DESC, created_at ASC, id ASC
-            LIMIT $limit;
-            """;
-        command.Parameters.AddWithValue("$limit", capped);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
 
-        var items = new List<QueueItem>();
-        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-        {
-            items.Add(ReadItem(reader));
-        }
+        var rows = await db.QueueItems
+            .AsNoTracking()
+            .Where(item => _activeStatuses.Contains(item.Status))
+            .OrderByDescending(item => item.Priority)
+            .ThenBy(item => item.CreatedAt)
+            .ThenBy(item => item.Id)
+            .Take(capped)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
 
-        return items;
+        return rows.Select(ToDomain).ToList();
     }
 
     /// <summary>按状态聚合队列计数（摘要与状态快照使用）。</summary>
     /// <param name="cancellationToken">取消令牌。</param>
     public async Task<IReadOnlyDictionary<string, int>> CountByStatusAsync(CancellationToken cancellationToken = default)
     {
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-        command.CommandText = "SELECT status, COUNT(*) FROM queue_item GROUP BY status;";
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+
+        var rows = await db.QueueItems
+            .AsNoTracking()
+            .GroupBy(item => item.Status)
+            .Select(group => new { Status = group.Key, Count = group.Count() })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
 
         var counters = new Dictionary<string, int>(StringComparer.Ordinal);
-        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        foreach (var row in rows)
         {
-            counters[reader.GetString(0)] = reader.GetInt32(1);
+            counters[row.Status] = row.Count;
         }
 
         return counters;
@@ -502,30 +529,29 @@ public sealed class QueueService
     public async Task<IReadOnlyList<TaskListItem>> ListTasksAsync(int limit, CancellationToken cancellationToken = default)
     {
         var capped = Math.Clamp(limit, 1, 500);
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-        command.CommandText = """
-            SELECT workspace_id, id, title, status, priority, seen_at
-            FROM task_view
-            ORDER BY workspace_id ASC, priority DESC, id ASC
-            LIMIT $limit;
-            """;
-        command.Parameters.AddWithValue("$limit", capped);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
 
-        var items = new List<TaskListItem>();
-        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-        {
-            items.Add(new TaskListItem(
-                reader.GetString(0),
-                reader.GetString(1),
-                reader.GetString(2),
-                reader.GetString(3),
-                reader.GetInt32(4),
-                reader.GetString(5)));
-        }
+        var rows = await db.TaskViews
+            .AsNoTracking()
+            .OrderBy(task => task.WorkspaceId)
+            .ThenByDescending(task => task.Priority)
+            .ThenBy(task => task.Id)
+            .Take(capped)
+            .Select(task => new
+            {
+                task.WorkspaceId,
+                task.Id,
+                task.Title,
+                task.Status,
+                task.Priority,
+                task.SeenAt,
+            })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
 
-        return items;
+        return rows
+            .Select(row => new TaskListItem(row.WorkspaceId, row.Id, row.Title, row.Status, row.Priority, row.SeenAt))
+            .ToList();
     }
 
     /// <summary>读取单个队列项详情（含任务标题与尝试列表）。</summary>
@@ -533,69 +559,37 @@ public sealed class QueueService
     /// <param name="cancellationToken">取消令牌。</param>
     public async Task<QueueItemDetail?> GetAsync(string queueItemId, CancellationToken cancellationToken = default)
     {
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
 
-        QueueItem? item = null;
-        string title = string.Empty;
+        var row = await db.QueueItems
+            .AsNoTracking()
+            .Where(item => item.Id == queueItemId)
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
 
-        using (var command = connection.CreateCommand())
+        if (row is null)
         {
-            command.CommandText = """
-                SELECT q.id, q.workspace_id, q.task_id, q.task_hash, q.status, q.priority, q.attempt, q.max_attempts,
-                       q.preferred_provider, q.available_at, q.lease_owner, q.lease_expires_at,
-                       q.last_error_code, q.last_error, q.created_at, q.updated_at,
-                       COALESCE(t.title, '')
-                FROM queue_item q
-                LEFT JOIN task_view t ON t.workspace_id = q.workspace_id AND t.id = q.task_id
-                WHERE q.id = $id;
-                """;
-            command.Parameters.AddWithValue("$id", queueItemId);
-
-            using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-            {
-                return null;
-            }
-
-            item = ReadItem(reader);
-            title = reader.GetString(16);
+            return null;
         }
 
-        var attempts = new List<AttemptRecord>();
-        using (var command = connection.CreateCommand())
-        {
-            command.CommandText = """
-                SELECT id, attempt_no, provider, model, started_at, ended_at, outcome, error_kind, error_code,
-                       tool_calls, input_tokens, output_tokens, usage_estimated, files_changed, summary
-                FROM attempt
-                WHERE queue_item_id = $id
-                ORDER BY attempt_no DESC;
-                """;
-            command.Parameters.AddWithValue("$id", queueItemId);
+        var item = ToDomain(row);
 
-            using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-            {
-                attempts.Add(new AttemptRecord(
-                    reader.GetString(0),
-                    reader.GetInt32(1),
-                    reader.GetString(2),
-                    reader.IsDBNull(3) ? null : reader.GetString(3),
-                    reader.GetString(4),
-                    reader.IsDBNull(5) ? null : reader.GetString(5),
-                    reader.IsDBNull(6) ? null : reader.GetString(6),
-                    reader.IsDBNull(7) ? null : reader.GetString(7),
-                    reader.IsDBNull(8) ? null : reader.GetString(8),
-                    reader.IsDBNull(9) ? null : reader.GetInt32(9),
-                    reader.IsDBNull(10) ? null : reader.GetInt32(10),
-                    reader.IsDBNull(11) ? null : reader.GetInt32(11),
-                    reader.GetInt32(12) == 1,
-                    reader.IsDBNull(13) ? null : reader.GetInt32(13),
-                    reader.IsDBNull(14) ? null : reader.GetString(14)));
-            }
-        }
+        // task_view 采用 LEFT JOIN 语义：任务行缺失时标题回退空串（与既有 COALESCE 行为一致）。
+        var title = await db.TaskViews
+            .AsNoTracking()
+            .Where(task => task.WorkspaceId == item.WorkspaceId && task.Id == item.TaskId)
+            .Select(task => task.Title)
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false) ?? string.Empty;
 
-        return new QueueItemDetail(item, title, attempts);
+        var attempts = await db.Attempts
+            .AsNoTracking()
+            .Where(attempt => attempt.QueueItemId == queueItemId)
+            .OrderByDescending(attempt => attempt.AttemptNo)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        return new QueueItemDetail(item, title, attempts.Select(ToDomain).ToList());
     }
 
     /// <summary>构造 dedupe_key：<c>workspace:task:contentHash</c>。</summary>
@@ -608,77 +602,13 @@ public sealed class QueueService
     /// <summary>当前 UTC 时间（ISO-8601，固定 +00:00 偏移，保证字符串可直接比较）。</summary>
     private static string Now() => DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture);
 
-    /// <summary>同一任务已存在的未结束队列项（<c>pending</c>/<c>claimed</c>/<c>running</c>）。</summary>
-    /// <param name="Id">队列项 id。</param>
-    /// <param name="Provider">该队列项的首选 provider。</param>
-    private sealed record ExistingQueueItem(string Id, string Provider);
-
-    /// <summary>查找同一任务未结束的队列项，避免内容变更后重复派发同一任务。</summary>
-    /// <returns>已存在的队列项；没有则返回 null。</returns>
-    private static async Task<ExistingQueueItem?> FindActiveItemAsync(
-        SqliteConnection connection,
-        SqliteTransaction transaction,
-        string workspaceId,
-        string taskId,
-        CancellationToken cancellationToken)
-    {
-        using var command = connection.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = """
-            SELECT id, preferred_provider FROM queue_item
-            WHERE workspace_id = $workspace AND task_id = $task AND status IN ('pending','claimed','running')
-            LIMIT 1;
-            """;
-        command.Parameters.AddWithValue("$workspace", workspaceId);
-        command.Parameters.AddWithValue("$task", taskId);
-
-        return await ReadExistingAsync(command, cancellationToken).ConfigureAwait(false);
-    }
-
-    /// <summary>按 dedupe_key 查已有队列项。</summary>
-    /// <returns>命中的队列项；没有则返回 null。</returns>
-    private static async Task<ExistingQueueItem?> FindByDedupeKeyAsync(
-        SqliteConnection connection,
-        SqliteTransaction transaction,
-        string dedupeKey,
-        CancellationToken cancellationToken)
-    {
-        using var command = connection.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = "SELECT id, preferred_provider FROM queue_item WHERE dedupe_key = $key LIMIT 1;";
-        command.Parameters.AddWithValue("$key", dedupeKey);
-
-        return await ReadExistingAsync(command, cancellationToken).ConfigureAwait(false);
-    }
-
-    /// <summary>读取"id + preferred_provider"两列的一行；无行返回 null。</summary>
-    /// <param name="command">已配置好 SQL 与参数的查询命令。</param>
-    /// <param name="cancellationToken">取消令牌。</param>
-    private static async Task<ExistingQueueItem?> ReadExistingAsync(
-        SqliteCommand command,
-        CancellationToken cancellationToken)
-    {
-        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-        {
-            return null;
-        }
-
-        return new ExistingQueueItem(reader.GetString(0), reader.GetString(1));
-    }
-
-    /// <summary>插入队列项；dedupe_key 冲突时返回 false（幂等）。</summary>
-    /// <param name="connection">连接。</param>
-    /// <param name="transaction">事务。</param>
-    /// <param name="workspaceId">工作区 id。</param>
-    /// <param name="task">任务投影。</param>
-    /// <param name="provider">已归一化的定时派发 provider。</param>
-    /// <param name="dedupeKey">去重键。</param>
-    /// <param name="now">当前时间。</param>
-    /// <param name="cancellationToken">取消令牌。</param>
-    private static async Task<bool> InsertAsync(
-        SqliteConnection connection,
-        SqliteTransaction transaction,
+    /// <summary>
+    /// 幂等插入队列项：<c>ON CONFLICT (dedupe_key) DO NOTHING</c> 是 SQLite 原生语义，
+    /// EF 没有等价的 LINQ 写法（唯一约束冲突会抛异常而不是静默跳过），因此保留这一条原生 INSERT。
+    /// </summary>
+    /// <returns>true 表示确实插入；false 表示命中去重。</returns>
+    private static async Task<bool> InsertIgnoreConflictAsync(
+        DevHubDbContext db,
         string workspaceId,
         TaskRow task,
         string provider,
@@ -686,30 +616,85 @@ public sealed class QueueService
         string now,
         CancellationToken cancellationToken)
     {
-        using var command = connection.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = """
+        var affected = await db.Database.ExecuteSqlRawAsync(
+            """
             INSERT INTO queue_item
               (id, workspace_id, task_id, task_hash, dedupe_key, status, priority, attempt, max_attempts,
                preferred_provider, available_at, created_at, updated_at)
             VALUES
-              ($id, $workspace, $task, $hash, $dedupe, 'pending', $priority, 0, 3, $provider, $now, $now, $now)
+              ({0}, {1}, {2}, {3}, {4}, 'pending', {5}, 0, 3, {6}, {7}, {7}, {7})
             ON CONFLICT (dedupe_key) DO NOTHING;
-            """;
-        command.Parameters.AddWithValue("$id", Guid.NewGuid().ToString("N"));
-        command.Parameters.AddWithValue("$workspace", workspaceId);
-        command.Parameters.AddWithValue("$task", task.Id);
-        command.Parameters.AddWithValue("$hash", task.ContentHash);
-        command.Parameters.AddWithValue("$dedupe", dedupeKey);
-        command.Parameters.AddWithValue("$priority", task.Priority);
-        command.Parameters.AddWithValue("$provider", provider);
-        command.Parameters.AddWithValue("$now", now);
+            """,
+            new object[]
+            {
+                Guid.NewGuid().ToString("N"),
+                workspaceId,
+                task.Id,
+                task.ContentHash,
+                dedupeKey,
+                task.Priority,
+                provider,
+                now,
+            },
+            cancellationToken).ConfigureAwait(false);
 
-        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
+        return affected == 1;
     }
 
-    /// <summary>按列序读取队列项。</summary>
-    private static QueueItem ReadItem(SqliteDataReader reader) => new(
+    /// <summary>给原生命令追加参数。</summary>
+    /// <param name="command">命令。</param>
+    /// <param name="name">参数名（含 <c>$</c> 前缀）。</param>
+    /// <param name="value">参数值。</param>
+    private static void AddParameter(DbCommand command, string name, object value)
+    {
+        var parameter = command.CreateParameter();
+        parameter.ParameterName = name;
+        parameter.Value = value;
+        command.Parameters.Add(parameter);
+    }
+
+    /// <summary>把持久化模型映射为领域投影。</summary>
+    /// <param name="entity">持久化模型。</param>
+    private static QueueItem ToDomain(QueueItemEntity entity) => new(
+        entity.Id,
+        entity.WorkspaceId,
+        entity.TaskId,
+        entity.TaskHash,
+        entity.Status,
+        entity.Priority,
+        entity.Attempt,
+        entity.MaxAttempts,
+        entity.PreferredProvider,
+        entity.AvailableAt,
+        entity.LeaseOwner,
+        entity.LeaseExpiresAt,
+        entity.LastErrorCode,
+        entity.LastError,
+        entity.CreatedAt,
+        entity.UpdatedAt);
+
+    /// <summary>把持久化模型映射为 attempt 投影。</summary>
+    /// <param name="entity">持久化模型。</param>
+    private static AttemptRecord ToDomain(AttemptEntity entity) => new(
+        entity.Id,
+        entity.AttemptNo,
+        entity.Provider,
+        entity.Model,
+        entity.StartedAt,
+        entity.EndedAt,
+        entity.Outcome,
+        entity.ErrorKind,
+        entity.ErrorCode,
+        entity.ToolCalls,
+        entity.InputTokens,
+        entity.OutputTokens,
+        entity.UsageEstimated,
+        entity.FilesChanged,
+        entity.Summary);
+
+    /// <summary>按列序读取原生认领语句返回的队列项。</summary>
+    /// <param name="reader">数据读取器。</param>
+    private static QueueItem ReadItem(DbDataReader reader) => new(
         reader.GetString(0),
         reader.GetString(1),
         reader.GetString(2),

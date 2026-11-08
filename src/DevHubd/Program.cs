@@ -20,6 +20,7 @@ using DevHubd.Mcp.Abstractions;
 using DevHubd.Queue;
 using DevHubd.Results;
 using DevHubd.Scheduling;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 
@@ -157,11 +158,22 @@ internal static class Program
         builder.Services.AddSingleton(factory);
         builder.Services.AddSingleton(hostInfo);
 
+        // 数据访问走 EF Core；连接串与裸连接工厂一致，PRAGMA 由拦截器在每次连接打开时执行。
+        // 注意：不走 EF Migrations/Runtime（schema 由 Migrator 独占管理），只注册上下文工厂。
+        builder.Services.AddDbContextFactory<DevHubDbContext>(dbOptions =>
+        {
+            dbOptions.UseSqlite(factory.ConnectionString);
+            dbOptions.AddInterceptors(new SqlitePragmaInterceptor());
+        });
+
         // P1：工作区清单按机器级数据目录读取，任务扫描、队列与调度状态全部复用同一份 SQLite。
         builder.Services.AddSingleton(new WorkspaceRegistry(paths.WorkspacesFilePath));
-        builder.Services.AddSingleton<TaskScanner>();
-        builder.Services.AddSingleton<QueueService>();
-        builder.Services.AddSingleton<SchedulerStateStore>();
+        builder.Services.AddSingleton(serviceProvider => new TaskScanner(
+            serviceProvider.GetRequiredService<IDbContextFactory<DevHubDbContext>>()));
+        builder.Services.AddSingleton(serviceProvider => new QueueService(
+            serviceProvider.GetRequiredService<IDbContextFactory<DevHubDbContext>>()));
+        builder.Services.AddSingleton(serviceProvider => new SchedulerStateStore(
+            serviceProvider.GetRequiredService<IDbContextFactory<DevHubDbContext>>()));
         builder.Services.AddSingleton<SchedulerEngine>();
         builder.Services.AddSingleton<SchedulerWakeSignal>();
 
@@ -211,14 +223,21 @@ internal static class Program
             serviceProvider.GetRequiredService<TurnDispatcherRegistry>(),
             serviceProvider.GetRequiredService<ILogger<VsCodeLmBridgeClient>>()));
         builder.Services.AddSingleton<ModelClientRegistry>();
-        builder.Services.AddSingleton<ProviderStateStore>();
-        builder.Services.AddSingleton<ExecutionStore>();
-        builder.Services.AddSingleton<ResultStore>();
-        builder.Services.AddSingleton<NoticeStore>();
+        builder.Services.AddSingleton(serviceProvider => new ProviderStateStore(
+            serviceProvider.GetRequiredService<IDbContextFactory<DevHubDbContext>>()));
+        builder.Services.AddSingleton(serviceProvider => new ExecutionStore(
+            serviceProvider.GetRequiredService<IDbContextFactory<DevHubDbContext>>()));
+        builder.Services.AddSingleton(serviceProvider => new ResultStore(
+            serviceProvider.GetRequiredService<IDbContextFactory<DevHubDbContext>>()));
+        builder.Services.AddSingleton(serviceProvider => new NoticeStore(
+            serviceProvider.GetRequiredService<IDbContextFactory<DevHubDbContext>>()));
         builder.Services.AddSingleton<TurnRunner>();
         builder.Services.AddSingleton<ExecutionCoordinator>();
 
-        builder.Services.AddSingleton<ISchedulerStatusSource, DevHubHostState>();
+        builder.Services.AddSingleton<ISchedulerStatusSource>(serviceProvider => new DevHubHostState(
+            serviceProvider.GetRequiredService<IDbContextFactory<DevHubDbContext>>(),
+            serviceProvider.GetRequiredService<SchedulerStateStore>(),
+            serviceProvider.GetRequiredService<HostInfo>()));
         builder.Services.AddSingleton<IQueueQuerySource, QueueQuerySource>();
         builder.Services.AddSingleton<IResultQuerySource, ResultQuerySource>();
         builder.Services.AddSingleton<IToolDigestSource, ToolDigestSource>();

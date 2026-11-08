@@ -5,6 +5,9 @@ namespace DevHubd.Core.Data;
 /// <summary>
 /// SQLite 连接工厂：统一连接串与每次开连接时必需的 PRAGMA（WAL / busy_timeout / foreign_keys）。
 /// 连接只在使用范围内持有，不跨 await 长期占用。
+/// 迁移（<see cref="Migrator"/>）、任务扫描等需要裸连接的场景仍使用本类；
+/// EF Core 侧通过 <see cref="ConnectionString"/> 复用同一条连接串，PRAGMA 由
+/// <see cref="SqlitePragmas"/> 统一提供，不存在两套配置。
 /// </summary>
 public sealed class SqliteConnectionFactory
 {
@@ -27,6 +30,9 @@ public sealed class SqliteConnectionFactory
         }.ToString();
     }
 
+    /// <summary>连接串（供 EF Core 的 <c>UseSqlite</c> 复用，保证两种访问指向同一个库）。</summary>
+    public string ConnectionString => _connectionString;
+
     /// <summary>
     /// 打开连接并应用基础 PRAGMA。调用方负责释放连接。
     /// </summary>
@@ -35,15 +41,7 @@ public sealed class SqliteConnectionFactory
     {
         var connection = new SqliteConnection(_connectionString);
         await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-
-        using var command = connection.CreateCommand();
-        command.CommandText =
-            "PRAGMA journal_mode=WAL;" +
-            "PRAGMA busy_timeout=5000;" +
-            "PRAGMA foreign_keys=ON;" +
-            "PRAGMA synchronous=NORMAL;";
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-
+        await SqlitePragmas.ApplyAsync(connection, cancellationToken).ConfigureAwait(false);
         return connection;
     }
 }

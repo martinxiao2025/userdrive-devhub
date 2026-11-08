@@ -3,28 +3,42 @@ using DevHubd.Core.Scheduling;
 using DevHubd.Mcp.Abstractions;
 using DevHubd.Mcp.Contracts;
 using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
 
 namespace DevHubd.Hosting;
 
 /// <summary>
 /// <see cref="ISchedulerStatusSource"/> 的宿主实现：读 <c>scheduler_state</c> 单例行、队列计数与 provider 状态。
 /// 调度器由 <see cref="Scheduling.SchedulerBackgroundService"/> 驱动，这里只做只读聚合。
+/// 所有聚合统一通过 EF Core（<see cref="DevHubDbContext"/>）完成，返回结构与 MCP 契约保持不变。
 /// </summary>
 public sealed class DevHubHostState : ISchedulerStatusSource
 {
-    private readonly SqliteConnectionFactory _factory;
+    private readonly IDbContextFactory<DevHubDbContext> _contextFactory;
     private readonly SchedulerStateStore _stateStore;
     private readonly HostInfo _host;
 
-    /// <summary>注入连接工厂、调度状态存取与宿主信息。</summary>
+    /// <summary>注入 EF Core 上下文工厂、调度状态存取与宿主信息。</summary>
+    /// <param name="contextFactory">上下文工厂。</param>
+    /// <param name="stateStore">调度状态存取。</param>
+    /// <param name="host">宿主信息。</param>
+    public DevHubHostState(
+        IDbContextFactory<DevHubDbContext> contextFactory,
+        SchedulerStateStore stateStore,
+        HostInfo host)
+    {
+        _contextFactory = contextFactory;
+        _stateStore = stateStore;
+        _host = host;
+    }
+
+    /// <summary>用裸连接工厂构造（不依赖 DI 的场景）；内部转换为 EF 上下文工厂。</summary>
     /// <param name="factory">SQLite 连接工厂。</param>
     /// <param name="stateStore">调度状态存取。</param>
     /// <param name="host">宿主信息。</param>
     public DevHubHostState(SqliteConnectionFactory factory, SchedulerStateStore stateStore, HostInfo host)
+        : this(new DevHubDbContextFactory(factory.ConnectionString), stateStore, host)
     {
-        _factory = factory;
-        _stateStore = stateStore;
-        _host = host;
     }
 
     /// <summary>
@@ -36,13 +50,19 @@ public sealed class DevHubHostState : ISchedulerStatusSource
     {
         var scheduler = await _stateStore.ReadAsync(cancellationToken).ConfigureAwait(false);
 
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
 
-        var schemaVersion = await Migrator.GetUserVersionAsync(connection, cancellationToken).ConfigureAwait(false);
-        var queue = await ReadQueueCountersAsync(connection, cancellationToken).ConfigureAwait(false);
-        var unread = await ReadUnreadAsync(connection, cancellationToken).ConfigureAwait(false);
-        var providers = await ReadProvidersAsync(connection, cancellationToken).ConfigureAwait(false);
-        var tokens = await ReadTokenCountersAsync(connection, cancellationToken).ConfigureAwait(false);
+        // schema 版本仍由 Migrator 负责读取（它是 DDL/版本唯一管理者），
+        // 只是改为在 EF 已打开的连接上读取，不再单独开一条裸连接。
+        await db.Database.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        var schemaVersion = await Migrator
+            .GetUserVersionAsync((SqliteConnection)db.Database.GetDbConnection(), cancellationToken)
+            .ConfigureAwait(false);
+
+        var queue = await ReadQueueCountersAsync(db, cancellationToken).ConfigureAwait(false);
+        var unread = await ReadUnreadAsync(db, cancellationToken).ConfigureAwait(false);
+        var providers = await ReadProvidersAsync(db, cancellationToken).ConfigureAwait(false);
+        var tokens = await ReadTokenCountersAsync(db, cancellationToken).ConfigureAwait(false);
 
         return new SchedulerStatusSnapshot
         {
@@ -82,22 +102,26 @@ public sealed class DevHubHostState : ISchedulerStatusSource
     };
 
     /// <summary>按状态聚合队列项数量。</summary>
-    private static async Task<QueueCounters> ReadQueueCountersAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    /// <param name="db">上下文。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private static async Task<QueueCounters> ReadQueueCountersAsync(DevHubDbContext db, CancellationToken cancellationToken)
     {
-        using var command = connection.CreateCommand();
-        command.CommandText = "SELECT status, COUNT(*) FROM queue_item GROUP BY status;";
+        var rows = await db.QueueItems
+            .AsNoTracking()
+            .GroupBy(item => item.Status)
+            .Select(group => new { Status = group.Key, Count = group.Count() })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
 
         var counters = new QueueCounters();
-        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        foreach (var row in rows)
         {
-            var count = reader.GetInt32(1);
-            counters = reader.GetString(0) switch
+            counters = row.Status switch
             {
-                "pending" => counters with { Pending = count },
-                "claimed" => counters with { Claimed = count },
-                "running" => counters with { Running = count },
-                "dead" => counters with { Dead = count },
+                "pending" => counters with { Pending = row.Count },
+                "claimed" => counters with { Claimed = row.Count },
+                "running" => counters with { Running = row.Count },
+                "dead" => counters with { Dead = row.Count },
                 _ => counters,
             };
         }
@@ -106,24 +130,24 @@ public sealed class DevHubHostState : ISchedulerStatusSource
     }
 
     /// <summary>统计未读结果与未读失败数。</summary>
-    private static async Task<UnreadCounters> ReadUnreadAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    /// <param name="db">上下文。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private static async Task<UnreadCounters> ReadUnreadAsync(DevHubDbContext db, CancellationToken cancellationToken)
     {
-        using var command = connection.CreateCommand();
-        command.CommandText =
-            "SELECT COUNT(*) AS total, " +
-            "SUM(CASE WHEN outcome = 'failed' THEN 1 ELSE 0 END) AS failures " +
-            "FROM result WHERE read_at IS NULL;";
+        var total = await db.Results
+            .AsNoTracking()
+            .CountAsync(result => result.ReadAt == null, cancellationToken)
+            .ConfigureAwait(false);
 
-        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-        {
-            return new UnreadCounters();
-        }
+        var failures = await db.Results
+            .AsNoTracking()
+            .CountAsync(result => result.ReadAt == null && result.Outcome == "failed", cancellationToken)
+            .ConfigureAwait(false);
 
         return new UnreadCounters
         {
-            Results = reader.GetInt32(0),
-            Failures = reader.IsDBNull(1) ? 0 : reader.GetInt32(1),
+            Results = total,
+            Failures = failures,
         };
     }
 
@@ -131,60 +155,77 @@ public sealed class DevHubHostState : ISchedulerStatusSource
     /// 汇总全部 attempt 的 token 用量。没有 token 的 attempt（provider 未返回 usage，
     /// 或尚未真正调用模型就收尾）单列计数，避免把缺失当成 0 混入总量。
     /// </summary>
-    /// <param name="connection">已打开的连接。</param>
+    /// <param name="db">上下文。</param>
     /// <param name="cancellationToken">取消令牌。</param>
     private static async Task<TokenCounters> ReadTokenCountersAsync(
-        SqliteConnection connection,
+        DevHubDbContext db,
         CancellationToken cancellationToken)
     {
-        using var command = connection.CreateCommand();
-        command.CommandText = """
-            SELECT COALESCE(SUM(input_tokens), 0) AS prompt,
-                   COALESCE(SUM(output_tokens), 0) AS completion,
-                   COUNT(CASE WHEN input_tokens IS NOT NULL OR output_tokens IS NOT NULL THEN 1 END) AS with_usage,
-                   COUNT(CASE WHEN input_tokens IS NULL AND output_tokens IS NULL THEN 1 END) AS without_usage,
-                   COALESCE(SUM(usage_estimated), 0) AS estimated
-            FROM attempt;
-            """;
+        // 单条聚合查询：SUM 对空表返回 NULL，用可空类型承接后再归零，语义与 COALESCE(SUM(...),0) 一致。
+        var aggregate = await db.Attempts
+            .AsNoTracking()
+            .GroupBy(attempt => 1)
+            .Select(group => new
+            {
+                Prompt = group.Sum(attempt => attempt.InputTokens),
+                Completion = group.Sum(attempt => attempt.OutputTokens),
+                WithUsage = group.Count(attempt => attempt.InputTokens != null || attempt.OutputTokens != null),
+                WithoutUsage = group.Count(attempt => attempt.InputTokens == null && attempt.OutputTokens == null),
+                Estimated = group.Count(attempt => attempt.UsageEstimated),
+            })
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
 
-        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        if (aggregate is null)
         {
             return new TokenCounters();
         }
 
-        var prompt = reader.GetInt32(0);
-        var completion = reader.GetInt32(1);
+        var prompt = aggregate.Prompt ?? 0;
+        var completion = aggregate.Completion ?? 0;
+
         return new TokenCounters
         {
             PromptTokens = prompt,
             CompletionTokens = completion,
             TotalTokens = prompt + completion,
-            AttemptsWithUsage = reader.GetInt32(2),
-            AttemptsWithoutUsage = reader.GetInt32(3),
-            EstimatedAttempts = reader.GetInt32(4),
+            AttemptsWithUsage = aggregate.WithUsage,
+            AttemptsWithoutUsage = aggregate.WithoutUsage,
+            EstimatedAttempts = aggregate.Estimated,
         };
     }
 
     /// <summary>读取 provider 状态；表为空时给出未配置的默认两项。</summary>
-    private static async Task<IReadOnlyList<ProviderStatus>> ReadProvidersAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    /// <param name="db">上下文。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private static async Task<IReadOnlyList<ProviderStatus>> ReadProvidersAsync(
+        DevHubDbContext db,
+        CancellationToken cancellationToken)
     {
-        using var command = connection.CreateCommand();
-        command.CommandText = "SELECT provider, state, breaker, detail, checked_at FROM provider_state ORDER BY provider;";
-
-        var list = new List<ProviderStatus>();
-        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-        {
-            list.Add(new ProviderStatus
+        var rows = await db.ProviderStates
+            .AsNoTracking()
+            .OrderBy(state => state.Provider)
+            .Select(state => new
             {
-                Provider = reader.GetString(0),
-                State = reader.GetString(1),
-                Breaker = reader.GetString(2),
-                Detail = reader.IsDBNull(3) ? null : reader.GetString(3),
-                CheckedAt = reader.IsDBNull(4) ? null : reader.GetString(4),
-            });
-        }
+                state.Provider,
+                state.State,
+                state.Breaker,
+                state.Detail,
+                state.CheckedAt,
+            })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        var list = rows
+            .Select(state => new ProviderStatus
+            {
+                Provider = state.Provider,
+                State = state.State,
+                Breaker = state.Breaker,
+                Detail = state.Detail,
+                CheckedAt = state.CheckedAt,
+            })
+            .ToList();
 
         if (list.Count == 0)
         {

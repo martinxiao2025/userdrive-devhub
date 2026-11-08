@@ -1,5 +1,5 @@
 using DevHubd.Core.Data;
-using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
 
 namespace DevHubd.Core.Results;
 
@@ -27,16 +27,24 @@ public sealed record NoticePage(IReadOnlyList<NoticeRecord> Items, long LatestSe
 /// 通知读取与确认。写入仍由 <c>ExecutionStore.InsertNoticeAsync</c> 负责。
 /// 去重以数据库为准：<c>dedupe_key</c> 唯一约束保证同一状态进入只提醒一次；
 /// <c>acked_at</c> 与单调 <c>seq</c> 保证崩溃重启后不会重复弹出同一条通知。
+/// 读写统一通过 EF Core（<see cref="DevHubDbContext"/>）完成。
 /// </summary>
 public sealed class NoticeStore
 {
-    private readonly SqliteConnectionFactory _factory;
+    private readonly IDbContextFactory<DevHubDbContext> _contextFactory;
 
-    /// <summary>注入连接工厂。</summary>
+    /// <summary>注入 EF Core 上下文工厂。</summary>
+    /// <param name="contextFactory">上下文工厂。</param>
+    public NoticeStore(IDbContextFactory<DevHubDbContext> contextFactory)
+    {
+        _contextFactory = contextFactory;
+    }
+
+    /// <summary>用裸连接工厂构造（测试与不依赖 DI 的场景）。</summary>
     /// <param name="factory">SQLite 连接工厂。</param>
     public NoticeStore(SqliteConnectionFactory factory)
+        : this(new DevHubDbContextFactory(factory.ConnectionString))
     {
-        _factory = factory;
     }
 
     /// <summary>
@@ -56,41 +64,38 @@ public sealed class NoticeStore
             throw new ArgumentOutOfRangeException(nameof(limit), limit, "limit 必须在 1–50 之间。");
         }
 
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
 
-        var items = new List<NoticeRecord>();
-        using (var command = connection.CreateCommand())
-        {
-            command.CommandText = """
-                SELECT seq, kind, task_id, title, COALESCE(body, ''), created_at
-                FROM notice
-                WHERE seq > $since AND acked_at IS NULL
-                ORDER BY seq ASC
-                LIMIT $limit;
-                """;
-            command.Parameters.AddWithValue("$since", sinceSeq);
-            command.Parameters.AddWithValue("$limit", limit);
-
-            using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        var rows = await db.Notices
+            .AsNoTracking()
+            .Where(notice => notice.Seq > sinceSeq && notice.AckedAt == null)
+            .OrderBy(notice => notice.Seq)
+            .Take(limit)
+            .Select(notice => new
             {
-                items.Add(new NoticeRecord(
-                    reader.GetInt64(0),
-                    reader.GetString(1),
-                    reader.IsDBNull(2) ? null : reader.GetString(2),
-                    reader.GetString(3),
-                    reader.GetString(4),
-                    reader.GetString(5)));
-            }
-        }
+                notice.Seq,
+                notice.Kind,
+                notice.TaskId,
+                notice.Title,
+                notice.Body,
+                notice.CreatedAt,
+            })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
 
-        long latestSeq;
-        using (var command = connection.CreateCommand())
-        {
-            command.CommandText = "SELECT COALESCE(MAX(seq), 0) FROM notice;";
-            var value = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-            latestSeq = Convert.ToInt64(value, System.Globalization.CultureInfo.InvariantCulture);
-        }
+        var items = rows
+            .Select(row => new NoticeRecord(
+                row.Seq,
+                row.Kind,
+                row.TaskId,
+                row.Title,
+                row.Body ?? string.Empty,
+                row.CreatedAt))
+            .ToList();
+
+        var latestSeq = await db.Notices
+            .MaxAsync(notice => (long?)notice.Seq, cancellationToken)
+            .ConfigureAwait(false) ?? 0;
 
         return new NoticePage(items, latestSeq);
     }
@@ -110,23 +115,12 @@ public sealed class NoticeStore
             return 0;
         }
 
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-
-        var placeholders = new string[seqs.Count];
-        for (var i = 0; i < seqs.Count; i++)
-        {
-            placeholders[i] = $"$seq{i}";
-            command.Parameters.AddWithValue($"$seq{i}", seqs[i]);
-        }
-
-        command.CommandText = $"""
-            UPDATE notice
-            SET acked_at = $now
-            WHERE acked_at IS NULL AND seq IN ({string.Join(", ", placeholders)});
-            """;
-        command.Parameters.AddWithValue("$now", now);
-
-        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        return await db.Notices
+            .Where(notice => notice.AckedAt == null && seqs.Contains(notice.Seq))
+            .ExecuteUpdateAsync(
+                setters => setters.SetProperty(notice => notice.AckedAt, now),
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 }

@@ -1,6 +1,8 @@
+using System.Text.Json;
 using DevHubd.Core.Data;
+using DevHubd.Core.Data.Entities;
 using DevHubd.Core.Workspaces;
-using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
 
 namespace DevHubd.Core.Tasks;
 
@@ -14,18 +16,26 @@ public sealed record TaskScanResult(int Scanned, int Accepted, int Invalid, int 
 
 /// <summary>
 /// 扫描器：把 <c>&lt;workspace&gt;/.devhub/tasks/*.json</c> 物化到 <c>task_view</c>。
-/// 只读任务文件，不改工作区；同一文件重复扫描是幂等的（按 <c>(workspace_id, id)</c> upsert）。
+/// 只读任务文件，不改工作区；同一文件重复扫描是幂等的（按 <c>(workspace_id, id)</c> 覆盖）。
 /// 文件消失时把既有行标记为 <c>missing</c>，不删除历史（保留审计）。
+/// 读写统一通过 EF Core（<see cref="DevHubDbContext"/>）完成，与其它 store 共用同一套映射。
 /// </summary>
 public sealed class TaskScanner
 {
-    private readonly SqliteConnectionFactory _factory;
+    private readonly IDbContextFactory<DevHubDbContext> _contextFactory;
 
-    /// <summary>注入连接工厂。</summary>
+    /// <summary>注入 EF Core 上下文工厂。</summary>
+    /// <param name="contextFactory">上下文工厂。</param>
+    public TaskScanner(IDbContextFactory<DevHubDbContext> contextFactory)
+    {
+        _contextFactory = contextFactory;
+    }
+
+    /// <summary>用裸连接工厂构造（测试与不依赖 DI 的场景）；内部转换为 EF 上下文工厂。</summary>
     /// <param name="factory">SQLite 连接工厂。</param>
     public TaskScanner(SqliteConnectionFactory factory)
+        : this(new DevHubDbContextFactory(factory.ConnectionString))
     {
-        _factory = factory;
     }
 
     /// <summary>扫描一个工作区并落库。</summary>
@@ -54,104 +64,64 @@ public sealed class TaskScanner
             }
         }
 
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var transaction = connection.BeginTransaction(deferred: false);
+        // 一个工作区的扫描是一个事务：要么整批可见，要么全部回滚（与原 IMMEDIATE 事务等价）。
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+
+        var existing = await db.TaskViews
+            .Where(task => task.WorkspaceId == workspace.Id)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        var rowsById = new Dictionary<string, TaskViewEntity>(StringComparer.Ordinal);
+        foreach (var row in existing)
+        {
+            rowsById[row.Id] = row;
+        }
 
         foreach (var (sourcePath, document) in accepted)
         {
-            using var command = connection.CreateCommand();
-            command.Transaction = transaction;
-            command.CommandText = """
-                INSERT INTO task_view
-                  (workspace_id, id, source_path, content_hash, title, status, priority, write_scope, payload, seen_at, updated_at)
-                VALUES
-                  ($workspace, $id, $sourcePath, $hash, $title, $status, $priority, $scope, $payload, $now, $now)
-                ON CONFLICT (workspace_id, id) DO UPDATE SET
-                  source_path  = excluded.source_path,
-                  content_hash = excluded.content_hash,
-                  title        = excluded.title,
-                  status       = excluded.status,
-                  priority     = excluded.priority,
-                  write_scope  = excluded.write_scope,
-                  payload      = excluded.payload,
-                  seen_at      = excluded.seen_at,
-                  updated_at   = excluded.updated_at;
-                """;
-            command.Parameters.AddWithValue("$workspace", workspace.Id);
-            command.Parameters.AddWithValue("$id", document.Id);
-            command.Parameters.AddWithValue("$sourcePath", sourcePath);
-            command.Parameters.AddWithValue("$hash", document.ContentHash);
-            command.Parameters.AddWithValue("$title", document.Title);
-            command.Parameters.AddWithValue("$status", document.Status);
-            command.Parameters.AddWithValue("$priority", document.Priority);
-            command.Parameters.AddWithValue("$scope", System.Text.Json.JsonSerializer.Serialize(document.WriteScope));
-            command.Parameters.AddWithValue("$payload", document.RawJson);
-            command.Parameters.AddWithValue("$now", now);
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            if (!rowsById.TryGetValue(document.Id, out var row))
+            {
+                row = new TaskViewEntity
+                {
+                    WorkspaceId = workspace.Id,
+                    Id = document.Id,
+                };
+                db.TaskViews.Add(row);
+                rowsById[document.Id] = row;
+            }
+
+            // 覆盖式写入：与原 ON CONFLICT (workspace_id, id) DO UPDATE 的列集合一一对应。
+            row.SourcePath = sourcePath;
+            row.ContentHash = document.ContentHash;
+            row.Title = document.Title;
+            row.Status = document.Status;
+            row.Priority = document.Priority;
+            row.WriteScope = JsonSerializer.Serialize(document.WriteScope);
+            row.Payload = document.RawJson;
+            row.SeenAt = now;
+            row.UpdatedAt = now;
         }
 
-        var markedMissing = await MarkMissingAsync(connection, transaction, workspace.Id, accepted, now, cancellationToken)
-            .ConfigureAwait(false);
+        var acceptedIds = accepted.Select(entry => entry.Document.Id).ToHashSet(StringComparer.Ordinal);
+        var markedMissing = 0;
 
-        transaction.Commit();
+        foreach (var row in existing)
+        {
+            if (string.Equals(row.Status, "missing", StringComparison.Ordinal) || acceptedIds.Contains(row.Id))
+            {
+                continue;
+            }
+
+            row.Status = "missing";
+            row.UpdatedAt = now;
+            markedMissing++;
+        }
+
+        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
 
         return new TaskScanResult(scanned, accepted.Count, scanned - accepted.Count, markedMissing, problems);
-    }
-
-    /// <summary>
-    /// 把本次未出现的任务标记为 missing（已是 missing 的不重复计数）。
-    /// 本次出现的 id 先写入连接级临时表再取差集：避免逐个 <c>AND id &lt;&gt; ?</c> 拼接，
-    /// 1000 个任务时会触发 SQLite "Expression tree is too large (maximum depth 1000)"。
-    /// </summary>
-    /// <param name="connection">连接。</param>
-    /// <param name="transaction">当前事务。</param>
-    /// <param name="workspaceId">工作区 id。</param>
-    /// <param name="accepted">本次出现的任务。</param>
-    /// <param name="now">时间戳。</param>
-    /// <param name="cancellationToken">取消令牌。</param>
-    private static async Task<int> MarkMissingAsync(
-        SqliteConnection connection,
-        SqliteTransaction transaction,
-        string workspaceId,
-        IReadOnlyList<(string SourcePath, TaskDocument Document)> accepted,
-        string now,
-        CancellationToken cancellationToken)
-    {
-        using (var prepare = connection.CreateCommand())
-        {
-            prepare.Transaction = transaction;
-            prepare.CommandText = """
-                CREATE TEMP TABLE IF NOT EXISTS seen_task_id (id TEXT PRIMARY KEY);
-                DELETE FROM seen_task_id;
-                """;
-            await prepare.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-        }
-
-        using (var insert = connection.CreateCommand())
-        {
-            insert.Transaction = transaction;
-            insert.CommandText = "INSERT OR IGNORE INTO seen_task_id (id) VALUES ($id);";
-            var idParameter = insert.Parameters.Add("$id", SqliteType.Text);
-
-            foreach (var (_, document) in accepted)
-            {
-                idParameter.Value = document.Id;
-                await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-            }
-        }
-
-        using var command = connection.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = """
-            UPDATE task_view
-            SET status = 'missing', updated_at = $now
-            WHERE workspace_id = $workspace
-              AND status <> 'missing'
-              AND id NOT IN (SELECT id FROM seen_task_id);
-            """;
-        command.Parameters.AddWithValue("$now", now);
-        command.Parameters.AddWithValue("$workspace", workspaceId);
-
-        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 }

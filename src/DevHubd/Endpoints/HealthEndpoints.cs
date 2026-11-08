@@ -2,6 +2,8 @@ using DevHubd.Core.Data;
 using DevHubd.Hosting;
 using HttpResults = Microsoft.AspNetCore.Http.Results;
 using DevHubd.Logging;
+using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 
 namespace DevHubd.Endpoints;
@@ -27,19 +29,28 @@ public static class HealthEndpoints
     /// <summary>健康检查处理逻辑：探一次数据库并返回结构化的状态。</summary>
     /// <param name="host">宿主信息。</param>
     /// <param name="execution">实际生效的执行参数。</param>
-    /// <param name="factory">SQLite 连接工厂。</param>
+    /// <param name="contextFactory">EF Core 上下文工厂。</param>
     /// <param name="loggerFactory">日志工厂。</param>
     /// <param name="cancellationToken">请求取消令牌。</param>
     private static async Task<IResult> HandleAsync(
         HostInfo host,
         DevHubd.Core.Execution.ExecutionOptions execution,
-        SqliteConnectionFactory factory,
+        IDbContextFactory<DevHubDbContext> contextFactory,
         ILoggerFactory loggerFactory,
         CancellationToken cancellationToken)
     {
         try
         {
-            using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
+            // 健康探针统一走 EF：CanConnectAsync 内部执行 SELECT 1，
+            // 之后在同一连接上读取 user_version 与表清单（DDL 语义仍由 Migrator 提供）。
+            await using var db = await contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+            if (!await db.Database.CanConnectAsync(cancellationToken).ConfigureAwait(false))
+            {
+                throw new InvalidOperationException("数据库不可用");
+            }
+
+            await db.Database.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+            var connection = (SqliteConnection)db.Database.GetDbConnection();
             var version = await Migrator.GetUserVersionAsync(connection, cancellationToken).ConfigureAwait(false);
             var tables = await Migrator.GetTableNamesAsync(connection, cancellationToken).ConfigureAwait(false);
 

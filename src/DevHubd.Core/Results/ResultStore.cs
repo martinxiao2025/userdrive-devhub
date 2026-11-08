@@ -1,6 +1,7 @@
 using System.Text.Json;
 using DevHubd.Core.Data;
-using Microsoft.Data.Sqlite;
+using DevHubd.Core.Data.Entities;
+using Microsoft.EntityFrameworkCore;
 
 namespace DevHubd.Core.Results;
 
@@ -47,16 +48,24 @@ public sealed record ResultDigest(int Unread, int Failures, int AwaitingReview);
 /// <summary>
 /// 结果存取：分页查询、标记已读与未读聚合。
 /// 写入仍由 <c>ExecutionStore</c> 负责，本类只做"给 Chat 看"的读侧与 ack。
+/// 读写统一通过 EF Core（<see cref="DevHubDbContext"/>）完成。
 /// </summary>
 public sealed class ResultStore
 {
-    private readonly SqliteConnectionFactory _factory;
+    private readonly IDbContextFactory<DevHubDbContext> _contextFactory;
 
-    /// <summary>注入连接工厂。</summary>
+    /// <summary>注入 EF Core 上下文工厂。</summary>
+    /// <param name="contextFactory">上下文工厂。</param>
+    public ResultStore(IDbContextFactory<DevHubDbContext> contextFactory)
+    {
+        _contextFactory = contextFactory;
+    }
+
+    /// <summary>用裸连接工厂构造（测试与不依赖 DI 的场景）。</summary>
     /// <param name="factory">SQLite 连接工厂。</param>
     public ResultStore(SqliteConnectionFactory factory)
+        : this(new DevHubDbContextFactory(factory.ConnectionString))
     {
-        _factory = factory;
     }
 
     /// <summary>
@@ -78,45 +87,54 @@ public sealed class ResultStore
             throw new ArgumentOutOfRangeException(nameof(limit), limit, "limit 必须在 1–100 之间。");
         }
 
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-
-        var sql = new System.Text.StringBuilder("""
-            SELECT r.id, r.task_id, r.queue_item_id, r.provider, r.outcome, r.summary, r.artifacts, r.created_at, r.read_at,
-                   a.tool_calls, a.input_tokens, a.output_tokens, a.usage_estimated
-            FROM result r
-            LEFT JOIN attempt a ON a.id = (
-                SELECT id FROM attempt WHERE queue_item_id = r.queue_item_id ORDER BY attempt_no DESC LIMIT 1
-            )
-            WHERE 1 = 1
-            """);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var query = db.Results.AsNoTracking();
 
         if (unreadOnly)
         {
-            sql.Append(" AND r.read_at IS NULL");
+            query = query.Where(result => result.ReadAt == null);
         }
 
         if (TryDecodeCursor(cursor, out var cursorCreatedAt, out var cursorId))
         {
-            sql.Append("""
-                 AND (r.created_at < $cc OR (r.created_at = $cc AND r.id < $ci))
-                """);
-            command.Parameters.AddWithValue("$cc", cursorCreatedAt);
-            command.Parameters.AddWithValue("$ci", cursorId);
+            query = query.Where(result =>
+                result.CreatedAt.CompareTo(cursorCreatedAt) < 0 ||
+                (result.CreatedAt == cursorCreatedAt && result.Id.CompareTo(cursorId) < 0));
         }
 
-        sql.Append(" ORDER BY r.created_at DESC, r.id DESC LIMIT $limit;");
-        command.CommandText = sql.ToString();
-        command.Parameters.AddWithValue("$limit", limit);
+        var rows = await query
+            .OrderByDescending(result => result.CreatedAt)
+            .ThenByDescending(result => result.Id)
+            .Take(limit)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
 
-        var items = new List<ResultRecord>();
-        using (var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+        // 最近一次 attempt（attempt_no 最大）用一次批量查询补齐，避免相关子查询在 EF 里被翻译成低效计划。
+        var queueItemIds = rows
+            .Select(result => result.QueueItemId)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        var attempts = queueItemIds.Count == 0
+            ? new List<AttemptEntity>()
+            : await db.Attempts
+                .AsNoTracking()
+                .Where(attempt => queueItemIds.Contains(attempt.QueueItemId))
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+        var latestAttempts = new Dictionary<string, AttemptEntity>(StringComparer.Ordinal);
+        foreach (var attempt in attempts)
         {
-            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            if (!latestAttempts.TryGetValue(attempt.QueueItemId, out var current) || attempt.AttemptNo > current.AttemptNo)
             {
-                items.Add(Read(reader));
+                latestAttempts[attempt.QueueItemId] = attempt;
             }
         }
+
+        var items = rows
+            .Select(result => Map(result, latestAttempts.GetValueOrDefault(result.QueueItemId)))
+            .ToList();
 
         var nextCursor = items.Count == limit
             ? EncodeCursor(items[^1].CreatedAt, items[^1].Id)
@@ -137,24 +155,13 @@ public sealed class ResultStore
             return 0;
         }
 
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-
-        var placeholders = new string[ids.Count];
-        for (var i = 0; i < ids.Count; i++)
-        {
-            placeholders[i] = $"$id{i}";
-            command.Parameters.AddWithValue($"$id{i}", ids[i]);
-        }
-
-        command.CommandText = $"""
-            UPDATE result
-            SET read_at = $now
-            WHERE read_at IS NULL AND id IN ({string.Join(", ", placeholders)});
-            """;
-        command.Parameters.AddWithValue("$now", now);
-
-        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        return await db.Results
+            .Where(result => result.ReadAt == null && ids.Contains(result.Id))
+            .ExecuteUpdateAsync(
+                setters => setters.SetProperty(result => result.ReadAt, now),
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
     /// <summary>把所有未读结果标记为已读。</summary>
@@ -163,58 +170,62 @@ public sealed class ResultStore
     /// <returns>实际被标记的条数。</returns>
     public async Task<int> AckAllAsync(string now, CancellationToken cancellationToken = default)
     {
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-        command.CommandText = "UPDATE result SET read_at = $now WHERE read_at IS NULL;";
-        command.Parameters.AddWithValue("$now", now);
-        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        return await db.Results
+            .Where(result => result.ReadAt == null)
+            .ExecuteUpdateAsync(
+                setters => setters.SetProperty(result => result.ReadAt, now),
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
     /// <summary>聚合未读计数：总数、失败数、待复核数。</summary>
     /// <param name="cancellationToken">取消令牌。</param>
     public async Task<ResultDigest> GetDigestAsync(CancellationToken cancellationToken = default)
     {
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-        command.CommandText = """
-            SELECT COUNT(*) AS unread,
-                   COALESCE(SUM(CASE WHEN outcome = 'failed' THEN 1 ELSE 0 END), 0) AS failures,
-                   COALESCE(SUM(CASE WHEN outcome = 'awaiting_review' THEN 1 ELSE 0 END), 0) AS awaiting
-            FROM result WHERE read_at IS NULL;
-            """;
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
 
-        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-        {
-            return new ResultDigest(0, 0, 0);
-        }
+        var digest = await db.Results
+            .AsNoTracking()
+            .Where(result => result.ReadAt == null)
+            .GroupBy(result => 1)
+            .Select(group => new
+            {
+                Unread = group.Count(),
+                Failures = group.Count(result => result.Outcome == "failed"),
+                AwaitingReview = group.Count(result => result.Outcome == "awaiting_review"),
+            })
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
 
-        return new ResultDigest(reader.GetInt32(0), reader.GetInt32(1), reader.GetInt32(2));
+        return digest is null
+            ? new ResultDigest(0, 0, 0)
+            : new ResultDigest(digest.Unread, digest.Failures, digest.AwaitingReview);
     }
 
-    /// <summary>按列序读取一行结果。</summary>
-    /// <param name="reader">数据读取器。</param>
-    private static ResultRecord Read(SqliteDataReader reader)
+    /// <summary>把持久化模型映射为结果投影（附带最近一次 attempt 的用量字段）。</summary>
+    /// <param name="result">结果行。</param>
+    /// <param name="attempt">最近一次 attempt；没有则为 null。</param>
+    private static ResultRecord Map(ResultEntity result, AttemptEntity? attempt)
     {
-        var artifactsJson = reader.IsDBNull(6) ? null : reader.GetString(6);
-        var artifacts = artifactsJson is null
+        var artifacts = result.Artifacts is null
             ? Array.Empty<string>()
-            : JsonSerializer.Deserialize<string[]>(artifactsJson) ?? Array.Empty<string>();
+            : JsonSerializer.Deserialize<string[]>(result.Artifacts) ?? Array.Empty<string>();
 
         return new ResultRecord(
-            reader.GetString(0),
-            reader.GetString(1),
-            reader.GetString(2),
-            reader.GetString(3),
-            reader.GetString(4),
-            reader.GetString(5),
+            result.Id,
+            result.TaskId,
+            result.QueueItemId,
+            result.Provider,
+            result.Outcome,
+            result.Summary,
             artifacts,
-            reader.GetString(7),
-            reader.IsDBNull(8) ? null : reader.GetString(8),
-            reader.IsDBNull(9) ? null : reader.GetInt32(9),
-            reader.IsDBNull(10) ? null : reader.GetInt32(10),
-            reader.IsDBNull(11) ? null : reader.GetInt32(11),
-            !reader.IsDBNull(12) && reader.GetInt32(12) == 1);
+            result.CreatedAt,
+            result.ReadAt,
+            attempt?.ToolCalls,
+            attempt?.InputTokens,
+            attempt?.OutputTokens,
+            attempt?.UsageEstimated ?? false);
     }
 
     /// <summary>生成下一页游标（base64url 编码的 createdAt/id）。</summary>

@@ -1,20 +1,31 @@
 using DevHubd.Core.Data;
+using DevHubd.Core.Data.Entities;
+using Microsoft.EntityFrameworkCore;
 
 namespace DevHubd.Core.Providers;
 
 /// <summary>
 /// provider 状态存取：<c>provider_state</c> 以 provider 为主键，配额/鉴权失败只影响对应 provider，
 /// 不会把其他 provider（例如 vscode 桥）一起拖下水（设计文档 §13.3）。
+/// 读取通过 EF Core（<see cref="DevHubDbContext"/>）完成；写入使用 SQLite 原生
+/// <c>INSERT … ON CONFLICT DO UPDATE</c>（EF 没有等价写法），保持单语句幂等覆盖。
 /// </summary>
 public sealed class ProviderStateStore
 {
-    private readonly SqliteConnectionFactory _factory;
+    private readonly IDbContextFactory<DevHubDbContext> _contextFactory;
 
-    /// <summary>注入连接工厂。</summary>
+    /// <summary>注入 EF Core 上下文工厂。</summary>
+    /// <param name="contextFactory">上下文工厂。</param>
+    public ProviderStateStore(IDbContextFactory<DevHubDbContext> contextFactory)
+    {
+        _contextFactory = contextFactory;
+    }
+
+    /// <summary>用裸连接工厂构造（测试与不依赖 DI 的场景）。</summary>
     /// <param name="factory">SQLite 连接工厂。</param>
     public ProviderStateStore(SqliteConnectionFactory factory)
+        : this(new DevHubDbContextFactory(factory.ConnectionString))
     {
-        _factory = factory;
     }
 
     /// <summary>读取单个 provider 状态；不存在返回 null。</summary>
@@ -22,39 +33,28 @@ public sealed class ProviderStateStore
     /// <param name="cancellationToken">取消令牌。</param>
     public async Task<ProviderStateRecord?> GetAsync(string provider, CancellationToken cancellationToken = default)
     {
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-        command.CommandText = """
-            SELECT provider, state, detail, breaker, breaker_reason, breaker_opened_at,
-                   consecutive_failures, checked_at
-            FROM provider_state WHERE provider = $provider;
-            """;
-        command.Parameters.AddWithValue("$provider", provider);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var row = await db.ProviderStates
+            .AsNoTracking()
+            .Where(state => state.Provider == provider)
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
 
-        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false) ? Read(reader) : null;
+        return row is null ? null : ToDomain(row);
     }
 
     /// <summary>读取全部 provider 状态。</summary>
     /// <param name="cancellationToken">取消令牌。</param>
     public async Task<IReadOnlyList<ProviderStateRecord>> ListAsync(CancellationToken cancellationToken = default)
     {
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-        command.CommandText = """
-            SELECT provider, state, detail, breaker, breaker_reason, breaker_opened_at,
-                   consecutive_failures, checked_at
-            FROM provider_state ORDER BY provider;
-            """;
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var rows = await db.ProviderStates
+            .AsNoTracking()
+            .OrderBy(state => state.Provider)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
 
-        var rows = new List<ProviderStateRecord>();
-        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-        {
-            rows.Add(Read(reader));
-        }
-
-        return rows;
+        return rows.Select(ToDomain).ToList();
     }
 
     /// <summary>
@@ -144,13 +144,16 @@ public sealed class ProviderStateStore
     /// <param name="cancellationToken">取消令牌。</param>
     public async Task SaveAsync(ProviderStateRecord record, CancellationToken cancellationToken = default)
     {
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-        command.CommandText = """
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+
+        // 覆盖式写入必须原子：EF 没有 UPSERT，先查后插在并发探测下会撞唯一约束，
+        // 因此保留这一条 SQLite 原生语句（语义与改造前完全一致）。
+        await db.Database.ExecuteSqlRawAsync(
+            """
             INSERT INTO provider_state
               (provider, state, detail, breaker, breaker_reason, breaker_opened_at, consecutive_failures, checked_at)
             VALUES
-              ($provider, $state, $detail, $breaker, $reason, $openedAt, $failures, $checkedAt)
+              ({0}, {1}, {2}, {3}, {4}, {5}, {6}, {7})
             ON CONFLICT (provider) DO UPDATE SET
               state = excluded.state,
               detail = excluded.detail,
@@ -159,26 +162,31 @@ public sealed class ProviderStateStore
               breaker_opened_at = excluded.breaker_opened_at,
               consecutive_failures = excluded.consecutive_failures,
               checked_at = excluded.checked_at;
-            """;
-        command.Parameters.AddWithValue("$provider", record.Provider);
-        command.Parameters.AddWithValue("$state", record.State);
-        command.Parameters.AddWithValue("$detail", (object?)record.Detail ?? DBNull.Value);
-        command.Parameters.AddWithValue("$breaker", record.Breaker);
-        command.Parameters.AddWithValue("$reason", (object?)record.BreakerReason ?? DBNull.Value);
-        command.Parameters.AddWithValue("$openedAt", (object?)record.BreakerOpenedAt ?? DBNull.Value);
-        command.Parameters.AddWithValue("$failures", record.ConsecutiveFailures);
-        command.Parameters.AddWithValue("$checkedAt", record.CheckedAt);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            """,
+            new object[]
+            {
+                record.Provider,
+                record.State,
+                // null 值直接以 null 传递：EF 会为无类型参数生成 NULL，不需要（也不应）传 DBNull。
+                record.Detail!,
+                record.Breaker,
+                record.BreakerReason!,
+                record.BreakerOpenedAt!,
+                record.ConsecutiveFailures,
+                record.CheckedAt,
+            },
+            cancellationToken).ConfigureAwait(false);
     }
 
-    /// <summary>按列序读取状态行。</summary>
-    private static ProviderStateRecord Read(Microsoft.Data.Sqlite.SqliteDataReader reader) => new(
-        reader.GetString(0),
-        reader.GetString(1),
-        reader.IsDBNull(2) ? null : reader.GetString(2),
-        reader.GetString(3),
-        reader.IsDBNull(4) ? null : reader.GetString(4),
-        reader.IsDBNull(5) ? null : reader.GetString(5),
-        reader.GetInt32(6),
-        reader.GetString(7));
+    /// <summary>把持久化模型映射为对外投影。</summary>
+    /// <param name="entity">持久化模型。</param>
+    private static ProviderStateRecord ToDomain(ProviderStateEntity entity) => new(
+        entity.Provider,
+        entity.State,
+        entity.Detail,
+        entity.Breaker,
+        entity.BreakerReason,
+        entity.BreakerOpenedAt,
+        entity.ConsecutiveFailures,
+        entity.CheckedAt);
 }

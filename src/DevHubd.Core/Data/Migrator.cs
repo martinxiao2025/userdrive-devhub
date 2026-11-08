@@ -5,6 +5,11 @@ namespace DevHubd.Core.Data;
 /// <summary>
 /// 数据库迁移器：以 <c>PRAGMA user_version</c> 记录版本，按版本号顺序执行增量迁移（V1 → V2 …）。
 /// 迁移在单个事务内完成，失败整体回滚；重复调用幂等。
+/// <para>
+/// 分工：本类是 9 张表 DDL/索引/版本推进的<b>唯一</b>管理者；EF Core
+/// （<see cref="DevHubDbContext"/>）只负责映射与读写，不建表、不新增
+/// <c>__EFMigrationsHistory</c>，也不允许另起一套迁移。修改 schema 必须在这里加版本。
+/// </para>
 /// </summary>
 public static class Migrator
 {

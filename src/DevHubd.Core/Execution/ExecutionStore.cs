@@ -1,6 +1,7 @@
 using System.Text.Json;
 using DevHubd.Core.Data;
-using Microsoft.Data.Sqlite;
+using DevHubd.Core.Data.Entities;
+using Microsoft.EntityFrameworkCore;
 
 namespace DevHubd.Core.Execution;
 
@@ -45,16 +46,25 @@ public sealed record ResultDraft(
 /// <summary>
 /// 执行结果存储：attempt 终态、队列状态迁移、result 与 notice 落库。
 /// 与 <c>QueueService</c> 分开，避免队列模块同时承担模型语义。
+/// 读写统一通过 EF Core（<see cref="DevHubDbContext"/>）完成；仅在 SQLite 原生 upsert
+/// （<c>ON CONFLICT … DO NOTHING</c>）无法用 LINQ 表达时保留单条原生 INSERT。
 /// </summary>
 public sealed class ExecutionStore
 {
-    private readonly SqliteConnectionFactory _factory;
+    private readonly IDbContextFactory<DevHubDbContext> _contextFactory;
 
-    /// <summary>注入连接工厂。</summary>
+    /// <summary>注入 EF Core 上下文工厂。</summary>
+    /// <param name="contextFactory">上下文工厂。</param>
+    public ExecutionStore(IDbContextFactory<DevHubDbContext> contextFactory)
+    {
+        _contextFactory = contextFactory;
+    }
+
+    /// <summary>用裸连接工厂构造（测试与不依赖 DI 的场景）。</summary>
     /// <param name="factory">SQLite 连接工厂。</param>
     public ExecutionStore(SqliteConnectionFactory factory)
+        : this(new DevHubDbContextFactory(factory.ConnectionString))
     {
-        _factory = factory;
     }
 
     /// <summary>把队列项置为 running（认领后的执行开始）。</summary>
@@ -66,12 +76,15 @@ public sealed class ExecutionStore
         string now,
         CancellationToken cancellationToken = default)
     {
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-        command.CommandText = "UPDATE queue_item SET status = 'running', updated_at = $now WHERE id = $id;";
-        command.Parameters.AddWithValue("$now", now);
-        command.Parameters.AddWithValue("$id", queueItemId);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        await db.QueueItems
+            .Where(item => item.Id == queueItemId)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(item => item.Status, "running")
+                    .SetProperty(item => item.UpdatedAt, now),
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
     /// <summary>写入 attempt 终态。</summary>
@@ -85,36 +98,31 @@ public sealed class ExecutionStore
         string now,
         CancellationToken cancellationToken = default)
     {
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-        command.CommandText = """
-            UPDATE attempt
-            SET ended_at = $now,
-                outcome = $outcome,
-                model = COALESCE($model, model),
-                error_kind = $kind,
-                error_code = $code,
-                tool_calls = $toolCalls,
-                input_tokens = $inputTokens,
-                output_tokens = $outputTokens,
-                usage_estimated = $usageEstimated,
-                files_changed = $filesChanged,
-                summary = $summary
-            WHERE id = $id;
-            """;
-        command.Parameters.AddWithValue("$now", now);
-        command.Parameters.AddWithValue("$outcome", completion.Outcome);
-        command.Parameters.AddWithValue("$model", (object?)completion.Model ?? DBNull.Value);
-        command.Parameters.AddWithValue("$kind", (object?)completion.ErrorKind ?? DBNull.Value);
-        command.Parameters.AddWithValue("$code", (object?)completion.ErrorCode ?? DBNull.Value);
-        command.Parameters.AddWithValue("$toolCalls", completion.ToolCalls);
-        command.Parameters.AddWithValue("$inputTokens", (object?)completion.InputTokens ?? DBNull.Value);
-        command.Parameters.AddWithValue("$outputTokens", (object?)completion.OutputTokens ?? DBNull.Value);
-        command.Parameters.AddWithValue("$usageEstimated", completion.UsageEstimated ? 1 : 0);
-        command.Parameters.AddWithValue("$filesChanged", completion.FilesChanged);
-        command.Parameters.AddWithValue("$summary", completion.Summary);
-        command.Parameters.AddWithValue("$id", attemptId);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+
+        var attempt = await db.Attempts
+            .FirstOrDefaultAsync(item => item.Id == attemptId, cancellationToken)
+            .ConfigureAwait(false);
+
+        if (attempt is null)
+        {
+            return;
+        }
+
+        attempt.EndedAt = now;
+        attempt.Outcome = completion.Outcome;
+        // 与既有 COALESCE($model, model) 等价：只有确实拿到模型名时才覆盖。
+        attempt.Model = completion.Model ?? attempt.Model;
+        attempt.ErrorKind = completion.ErrorKind;
+        attempt.ErrorCode = completion.ErrorCode;
+        attempt.ToolCalls = completion.ToolCalls;
+        attempt.InputTokens = completion.InputTokens;
+        attempt.OutputTokens = completion.OutputTokens;
+        attempt.UsageEstimated = completion.UsageEstimated;
+        attempt.FilesChanged = completion.FilesChanged;
+        attempt.Summary = completion.Summary;
+
+        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>把队列项置为终态（succeeded / dead / cancelled）。</summary>
@@ -132,24 +140,19 @@ public sealed class ExecutionStore
         string now,
         CancellationToken cancellationToken = default)
     {
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-        command.CommandText = """
-            UPDATE queue_item
-            SET status = $status,
-                lease_owner = NULL,
-                lease_expires_at = NULL,
-                last_error_code = $code,
-                last_error = $error,
-                updated_at = $now
-            WHERE id = $id;
-            """;
-        command.Parameters.AddWithValue("$status", status);
-        command.Parameters.AddWithValue("$code", (object?)errorCode ?? DBNull.Value);
-        command.Parameters.AddWithValue("$error", (object?)lastError ?? DBNull.Value);
-        command.Parameters.AddWithValue("$now", now);
-        command.Parameters.AddWithValue("$id", queueItemId);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        await db.QueueItems
+            .Where(item => item.Id == queueItemId)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(item => item.Status, status)
+                    .SetProperty(item => item.LeaseOwner, (string?)null)
+                    .SetProperty(item => item.LeaseExpiresAt, (string?)null)
+                    .SetProperty(item => item.LastErrorCode, errorCode)
+                    .SetProperty(item => item.LastError, lastError)
+                    .SetProperty(item => item.UpdatedAt, now),
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
     /// <summary>
@@ -172,27 +175,41 @@ public sealed class ExecutionStore
         string now,
         CancellationToken cancellationToken = default)
     {
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-        command.CommandText = $"""
-            UPDATE queue_item
-            SET status = 'pending',
-                lease_owner = NULL,
-                lease_expires_at = NULL,
-                available_at = $available,
-                last_error_code = $code,
-                last_error = $error,
-                attempt = CASE WHEN {(decrementAttempt ? 1 : 0)} = 1 AND attempt > 0
-                               THEN attempt - 1 ELSE attempt END,
-                updated_at = $now
-            WHERE id = $id;
-            """;
-        command.Parameters.AddWithValue("$available", availableAt);
-        command.Parameters.AddWithValue("$code", errorCode);
-        command.Parameters.AddWithValue("$error", lastError);
-        command.Parameters.AddWithValue("$now", now);
-        command.Parameters.AddWithValue("$id", queueItemId);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var target = db.QueueItems.Where(item => item.Id == queueItemId);
+
+        if (decrementAttempt)
+        {
+            // CASE WHEN attempt > 0 THEN attempt - 1 ELSE attempt END 交给 SQL 求值，
+            // 避免"先读后写"带来的并发窗口。
+            await target
+                .ExecuteUpdateAsync(
+                    setters => setters
+                        .SetProperty(item => item.Status, "pending")
+                        .SetProperty(item => item.LeaseOwner, (string?)null)
+                        .SetProperty(item => item.LeaseExpiresAt, (string?)null)
+                        .SetProperty(item => item.AvailableAt, availableAt)
+                        .SetProperty(item => item.LastErrorCode, errorCode)
+                        .SetProperty(item => item.LastError, lastError)
+                        .SetProperty(item => item.Attempt, item => item.Attempt > 0 ? item.Attempt - 1 : item.Attempt)
+                        .SetProperty(item => item.UpdatedAt, now),
+                    cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        await target
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(item => item.Status, "pending")
+                    .SetProperty(item => item.LeaseOwner, (string?)null)
+                    .SetProperty(item => item.LeaseExpiresAt, (string?)null)
+                    .SetProperty(item => item.AvailableAt, availableAt)
+                    .SetProperty(item => item.LastErrorCode, errorCode)
+                    .SetProperty(item => item.LastError, lastError)
+                    .SetProperty(item => item.UpdatedAt, now),
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
     /// <summary>写入一条结果，返回结果 id。</summary>
@@ -205,21 +222,21 @@ public sealed class ExecutionStore
         CancellationToken cancellationToken = default)
     {
         var id = Guid.NewGuid().ToString("N");
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-        command.CommandText = """
-            INSERT INTO result (id, task_id, queue_item_id, provider, outcome, summary, artifacts, created_at)
-            VALUES ($id, $task, $item, $provider, $outcome, $summary, $artifacts, $now);
-            """;
-        command.Parameters.AddWithValue("$id", id);
-        command.Parameters.AddWithValue("$task", draft.TaskId);
-        command.Parameters.AddWithValue("$item", draft.QueueItemId);
-        command.Parameters.AddWithValue("$provider", draft.Provider);
-        command.Parameters.AddWithValue("$outcome", draft.Outcome);
-        command.Parameters.AddWithValue("$summary", draft.Summary);
-        command.Parameters.AddWithValue("$artifacts", JsonSerializer.Serialize(draft.Artifacts));
-        command.Parameters.AddWithValue("$now", now);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+
+        db.Results.Add(new ResultEntity
+        {
+            Id = id,
+            TaskId = draft.TaskId,
+            QueueItemId = draft.QueueItemId,
+            Provider = draft.Provider,
+            Outcome = draft.Outcome,
+            Summary = draft.Summary,
+            Artifacts = JsonSerializer.Serialize(draft.Artifacts),
+            CreatedAt = now,
+        });
+
+        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         return id;
     }
 
@@ -240,30 +257,31 @@ public sealed class ExecutionStore
         string now,
         CancellationToken cancellationToken = default)
     {
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-        command.CommandText = """
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+
+        // 去重必须由数据库判定（多进程/多连接下"先查后插"会丢幂等），
+        // 而 EF 的 LINQ 没有 ON CONFLICT DO NOTHING 等价写法，故保留这一条原生 INSERT。
+        await db.Database.ExecuteSqlRawAsync(
+            """
             INSERT INTO notice (dedupe_key, kind, task_id, title, body, created_at)
-            VALUES ($key, $kind, $task, $title, $body, $now)
+            VALUES ({0}, {1}, {2}, {3}, {4}, {5})
             ON CONFLICT (dedupe_key) DO NOTHING;
-            """;
-        command.Parameters.AddWithValue("$key", dedupeKey);
-        command.Parameters.AddWithValue("$kind", kind);
-        command.Parameters.AddWithValue("$task", (object?)taskId ?? DBNull.Value);
-        command.Parameters.AddWithValue("$title", title);
-        command.Parameters.AddWithValue("$body", body);
-        command.Parameters.AddWithValue("$now", now);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            """,
+            // null 值直接以 null 传递：EF 会为无类型参数生成 NULL，不需要（也不应）传 DBNull。
+            new object[] { dedupeKey, kind, taskId!, title, body, now },
+            cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>统计当前 running 数量（观测与测试用）。</summary>
     /// <param name="cancellationToken">取消令牌。</param>
     public async Task<int> CountRunningAsync(CancellationToken cancellationToken = default)
     {
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-        command.CommandText = "SELECT COUNT(*) FROM queue_item WHERE status IN ('claimed','running');";
-        var value = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-        return Convert.ToInt32(value, System.Globalization.CultureInfo.InvariantCulture);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        return await db.QueueItems
+            .AsNoTracking()
+            .CountAsync(
+                item => item.Status == "claimed" || item.Status == "running",
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 }

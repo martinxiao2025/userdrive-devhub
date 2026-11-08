@@ -60,6 +60,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -A
 | `lm-bridge.json` | VS Code 扩展写入的桥接发现文件 |
 | `logs/` | `devhub-daemon.ps1` 启动时的 stdout/stderr 日志 |
 
+**数据访问与 schema 管理分工**：schema（9 张表的 DDL、索引、`PRAGMA user_version` 版本推进）由 `Migrator` 独占管理，没有 EF Migrations，也不存在 `__EFMigrationsHistory`。EF Core（`DevHubDbContext`）只做既有表的映射与读写，不会建表或改表；表名/列名保持既有 snake_case。EF 连接与裸连接共用同一段连接级 PRAGMA（WAL / `busy_timeout=5000` / `foreign_keys=ON` / `synchronous=NORMAL`）。唯一的"原生 SQL"例外是队列的原子认领（`UPDATE … RETURNING` 单语句 + IMMEDIATE 事务）与 SQLite 原生 upsert（`ON CONFLICT`）。
+
 ### 2.2 工作区清单
 
 ```json

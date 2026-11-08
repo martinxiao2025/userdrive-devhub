@@ -1,6 +1,8 @@
+using System.Globalization;
 using System.Text.Json;
 using DevHubd.Core.Data;
-using Microsoft.Data.Sqlite;
+using DevHubd.Core.Data.Entities;
+using Microsoft.EntityFrameworkCore;
 
 namespace DevHubd.Core.Scheduling;
 
@@ -24,43 +26,51 @@ public sealed record SchedulerState(
 /// <summary>
 /// 调度状态存取：读写 <c>scheduler_state</c> 单例行，并把累计计数以 JSON 落库，
 /// 让"进程重启"不会把观测值清零。
+/// 读写统一通过 EF Core（<see cref="DevHubDbContext"/>）完成。
 /// </summary>
 public sealed class SchedulerStateStore
 {
-    private readonly SqliteConnectionFactory _factory;
+    private readonly IDbContextFactory<DevHubDbContext> _contextFactory;
 
-    /// <summary>注入连接工厂。</summary>
+    /// <summary>注入 EF Core 上下文工厂。</summary>
+    /// <param name="contextFactory">上下文工厂。</param>
+    public SchedulerStateStore(IDbContextFactory<DevHubDbContext> contextFactory)
+    {
+        _contextFactory = contextFactory;
+    }
+
+    /// <summary>用裸连接工厂构造（测试与不依赖 DI 的场景）。</summary>
     /// <param name="factory">SQLite 连接工厂。</param>
     public SchedulerStateStore(SqliteConnectionFactory factory)
+        : this(new DevHubDbContextFactory(factory.ConnectionString))
     {
-        _factory = factory;
     }
 
     /// <summary>读取当前状态。</summary>
     /// <param name="cancellationToken">取消令牌。</param>
+    /// <exception cref="InvalidOperationException">缺少 id=1 的单例行。</exception>
     public async Task<SchedulerState> ReadAsync(CancellationToken cancellationToken = default)
     {
-        using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-        command.CommandText = """
-            SELECT enabled, mode, pause_reason, interval_seconds, last_scan_at, next_scan_at, counters
-            FROM scheduler_state WHERE id = 1;
-            """;
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var row = await db.SchedulerStates
+            .AsNoTracking()
+            .Where(state => state.Id == 1)
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
 
-        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        if (row is null)
         {
             throw new InvalidOperationException("scheduler_state 缺少 id=1 的行，迁移可能未完成。");
         }
 
         return new SchedulerState(
-            reader.GetInt64(0) == 1,
-            reader.GetString(1),
-            reader.IsDBNull(2) ? null : reader.GetString(2),
-            reader.GetInt32(3),
-            reader.IsDBNull(4) ? null : reader.GetString(4),
-            reader.IsDBNull(5) ? null : reader.GetString(5),
-            ParseCounters(reader.IsDBNull(6) ? "{}" : reader.GetString(6)));
+            row.Enabled,
+            row.Mode,
+            row.PauseReason,
+            row.IntervalSeconds,
+            row.LastScanAt,
+            row.NextScanAt,
+            ParseCounters(row.Counters));
     }
 
     /// <summary>写入一次扫描的时间戳与计数增量。</summary>
@@ -82,20 +92,20 @@ public sealed class SchedulerStateStore
             counters[key] = counters.GetValueOrDefault(key) + value;
         }
 
-        await UpdateAsync(
-            """
-            UPDATE scheduler_state
-            SET last_scan_at = $last, next_scan_at = $next, counters = $counters, updated_at = $now
-            WHERE id = 1;
-            """,
-            command =>
-            {
-                command.Parameters.AddWithValue("$last", lastScanAt);
-                command.Parameters.AddWithValue("$next", nextScanAt);
-                command.Parameters.AddWithValue("$counters", JsonSerializer.Serialize(counters));
-                command.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
-            },
-            cancellationToken).ConfigureAwait(false);
+        var countersJson = JsonSerializer.Serialize(counters);
+        var now = Now();
+
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        await db.SchedulerStates
+            .Where(state => state.Id == 1)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(state => state.LastScanAt, lastScanAt)
+                    .SetProperty(state => state.NextScanAt, nextScanAt)
+                    .SetProperty(state => state.Counters, countersJson)
+                    .SetProperty(state => state.UpdatedAt, now),
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
     /// <summary>启用或暂停调度。</summary>
@@ -104,19 +114,17 @@ public sealed class SchedulerStateStore
     /// <param name="cancellationToken">取消令牌。</param>
     public async Task SetEnabledAsync(bool enabled, string? reason, CancellationToken cancellationToken = default)
     {
-        await UpdateAsync(
-            """
-            UPDATE scheduler_state
-            SET enabled = $enabled, pause_reason = $reason, updated_at = $now
-            WHERE id = 1;
-            """,
-            command =>
-            {
-                command.Parameters.AddWithValue("$enabled", enabled ? 1 : 0);
-                command.Parameters.AddWithValue("$reason", (object?)reason ?? DBNull.Value);
-                command.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
-            },
-            cancellationToken).ConfigureAwait(false);
+        var now = Now();
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        await db.SchedulerStates
+            .Where(state => state.Id == 1)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(state => state.Enabled, enabled)
+                    .SetProperty(state => state.PauseReason, reason)
+                    .SetProperty(state => state.UpdatedAt, now),
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
     /// <summary>
@@ -134,18 +142,16 @@ public sealed class SchedulerStateStore
             throw new ArgumentException($"未知交付档位：{mode}", nameof(mode));
         }
 
-        await UpdateAsync(
-            """
-            UPDATE scheduler_state
-            SET mode = $mode, updated_at = $now
-            WHERE id = 1;
-            """,
-            command =>
-            {
-                command.Parameters.AddWithValue("$mode", mode);
-                command.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
-            },
-            cancellationToken).ConfigureAwait(false);
+        var now = Now();
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        await db.SchedulerStates
+            .Where(state => state.Id == 1)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(state => state.Mode, mode)
+                    .SetProperty(state => state.UpdatedAt, now),
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
     /// <summary>写一条审计记录。</summary>
@@ -161,29 +167,21 @@ public sealed class SchedulerStateStore
         string? detail,
         CancellationToken cancellationToken = default)
     {
-        await using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
-        command.CommandText = """
-            INSERT INTO audit (at, actor, action, subject, detail)
-            VALUES ($at, $actor, $action, $subject, $detail);
-            """;
-        command.Parameters.AddWithValue("$at", DateTimeOffset.UtcNow.ToString("O"));
-        command.Parameters.AddWithValue("$actor", actor);
-        command.Parameters.AddWithValue("$action", action);
-        command.Parameters.AddWithValue("$subject", (object?)subject ?? DBNull.Value);
-        command.Parameters.AddWithValue("$detail", (object?)detail ?? DBNull.Value);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        db.Audits.Add(new AuditEntity
+        {
+            At = Now(),
+            Actor = actor,
+            Action = action,
+            Subject = subject,
+            Detail = detail,
+        });
+
+        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    /// <summary>执行一条更新语句。</summary>
-    private async Task UpdateAsync(string sql, Action<SqliteCommand> bind, CancellationToken cancellationToken)
-    {
-        await using var connection = await _factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
-        command.CommandText = sql;
-        bind(command);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-    }
+    /// <summary>当前 UTC 时间（ISO-8601）。</summary>
+    private static string Now() => DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture);
 
     /// <summary>解析计数 JSON；损坏时返回空字典而不是抛错（观测数据不应阻断调度）。</summary>
     private static IReadOnlyDictionary<string, long> ParseCounters(string json)
