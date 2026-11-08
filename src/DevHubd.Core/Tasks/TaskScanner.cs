@@ -79,6 +79,13 @@ public sealed class TaskScanner
             rowsById[row.Id] = row;
         }
 
+        // 已交付（审批通过）的任务不允许被文件里的旧状态退回可执行态。
+        // 这层防御针对历史遗留的"库已交付、文件未落"半成品；正常路径下审批已先写文件再提交。
+        var deliveredIds = existing
+            .Where(row => string.Equals(row.ApprovalState, "approved", StringComparison.Ordinal))
+            .Select(row => row.Id)
+            .ToHashSet(StringComparer.Ordinal);
+
         foreach (var (sourcePath, document) in accepted)
         {
             if (!rowsById.TryGetValue(document.Id, out var row))
@@ -97,7 +104,7 @@ public sealed class TaskScanner
             row.SourcePath = sourcePath;
             row.ContentHash = document.ContentHash;
             row.Title = document.Title;
-            row.Status = document.Status;
+            row.Status = deliveredIds.Contains(document.Id) ? "done" : document.Status;
             row.Priority = document.Priority;
             row.WriteScope = JsonSerializer.Serialize(document.WriteScope);
             row.Payload = document.RawJson;
@@ -112,7 +119,9 @@ public sealed class TaskScanner
 
         foreach (var row in existing)
         {
-            if (string.Equals(row.Status, "missing", StringComparison.Ordinal) || acceptedIds.Contains(row.Id))
+            if (string.Equals(row.Status, "missing", StringComparison.Ordinal) ||
+                acceptedIds.Contains(row.Id) ||
+                deliveredIds.Contains(row.Id))
             {
                 continue;
             }
@@ -124,9 +133,11 @@ public sealed class TaskScanner
 
         // 依赖闸门：文件声明 ready 但前置任务尚未 done 时，任务视图按“有效状态”置为 blocked。
         // 每次扫描都从文件状态重新推导，所以前置任务完成后下一轮会自动回到 ready，无需回写用户文件。
+        // 已交付任务不参与推导：它们必须保持 done。
         foreach (var (_, document) in accepted)
         {
             if (document.DependsOn.Count == 0 ||
+                deliveredIds.Contains(document.Id) ||
                 !string.Equals(document.Status, "ready", StringComparison.Ordinal))
             {
                 continue;
@@ -158,6 +169,7 @@ public sealed class TaskScanner
             foreach (var (_, document) in accepted)
             {
                 if (!string.Equals(document.Status, "ready", StringComparison.Ordinal) ||
+                    deliveredIds.Contains(document.Id) ||
                     knownRoles.Contains(document.Role))
                 {
                     continue;

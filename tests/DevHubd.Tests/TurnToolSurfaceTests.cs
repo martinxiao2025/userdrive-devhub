@@ -1,5 +1,6 @@
 using System.Text.Json;
 using DevHubd.Core.Execution;
+using DevHubd.Core.Input;
 using DevHubd.Core.Models;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
@@ -91,17 +92,81 @@ public sealed class TurnToolSurfaceTests : IDisposable
         Assert.Equal(TurnRunner.DefaultRoleId, "implementer");
     }
 
+    [Fact]
+    public async Task AskInput_WhenCapabilityDisabled_IsHiddenAndRejectedAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        // 白名单里有 ask_input，但角色能力不允许提问：列表本身就不应出现该工具。
+        var dispatcher = CreateDispatcher(null, ["read_file", "ask_input"], canRequestInput: false);
+        Assert.DoesNotContain(dispatcher.Describe(), descriptor => descriptor.Name == "ask_input");
+
+        var result = await dispatcher.ExecuteAsync(
+            "turn-1",
+            "ask_input",
+            JsonDocument.Parse("""{"question":"写入哪个目录？"}""").RootElement,
+            ct);
+
+        Assert.False(result.Success);
+        Assert.Equal(DevHubErrorCodes.InputNotAllowed, result.ErrorCode);
+    }
+
+    [Fact]
+    public void AskInput_WhenCapabilityEnabled_IsVisible()
+    {
+        var dispatcher = CreateDispatcher(
+            null,
+            ["read_file", "ask_input"],
+            canRequestInput: true,
+            askInput: (_, _) => Task.FromResult(InputAcceptance.Ok("ir-1", created: true)));
+
+        Assert.Contains(dispatcher.Describe(), descriptor => descriptor.Name == "ask_input");
+    }
+
+    [Fact]
+    public async Task MaxToolCalls_WhenExceeded_FailsWithoutCountingAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await File.WriteAllTextAsync(Path.Combine(_directory, "a.txt"), "hello", ct);
+        var budget = _budget with { MaxToolCalls = 1 };
+        var dispatcher = CreateDispatcher(null, ["read_file"], budget: budget);
+
+        var first = await dispatcher.ExecuteAsync(
+            "turn-1",
+            "read_file",
+            JsonDocument.Parse("""{"path":"a.txt"}""").RootElement,
+            ct);
+        var second = await dispatcher.ExecuteAsync(
+            "turn-1",
+            "read_file",
+            JsonDocument.Parse("""{"path":"a.txt"}""").RootElement,
+            ct);
+
+        Assert.True(first.Success);
+        Assert.False(second.Success);
+        Assert.Equal(DevHubErrorCodes.BudgetExceeded, second.ErrorCode);
+        Assert.Equal(1, dispatcher.ExecutedCalls);
+    }
+
     /// <summary>构造带白名单与服务层端口的派发器。</summary>
     /// <param name="service">服务层工具端口。</param>
     /// <param name="allowed">允许的工具名。</param>
-    private ToolDispatcher CreateDispatcher(ITurnToolService service, IReadOnlyCollection<string> allowed) =>
+    /// <param name="canRequestInput">角色是否允许提问。</param>
+    /// <param name="askInput">提问落库回调。</param>
+    /// <param name="budget">预算上限；null 使用默认预算。</param>
+    private ToolDispatcher CreateDispatcher(
+        ITurnToolService? service,
+        IReadOnlyCollection<string> allowed,
+        bool canRequestInput = false,
+        Func<InputPrompt, CancellationToken, Task<InputAcceptance>>? askInput = null,
+        BudgetLimits? budget = null) =>
         new(
             _workspace,
-            _budget,
+            budget ?? _budget,
             allowed,
             NullLogger<ToolDispatcher>.Instance,
-            canRequestInput: false,
-            askInput: null,
+            canRequestInput: canRequestInput,
+            askInput: askInput,
             serviceTools: service);
 
     /// <summary>记录调用的服务层工具端口。</summary>

@@ -126,6 +126,39 @@ public sealed class ResultDecisionTests : IDisposable
         Assert.Null(decision.TaskId);
     }
 
+    [Fact]
+    public async Task DecideAsync_WhenTaskFileReadOnly_RollsBackAndReportsFileWriteFailedAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await SeedAsync(ct);
+        File.SetAttributes(_taskFile, FileAttributes.ReadOnly);
+
+        ResultDecisionOutcome failed;
+        try
+        {
+            failed = await _store.DecideAsync("r1", approve: true, "通过", actor: null, ct);
+
+            // 文件写不进去时审批必须整体回滚：不能出现"库已交付、文件仍 ready"的半边状态。
+            Assert.Equal(ResultDecisionStatus.FileWriteFailed, failed.Status);
+            Assert.NotNull(failed.Reason);
+            Assert.Equal("awaiting_review", await ScalarStringAsync("SELECT outcome FROM result WHERE id = 'r1';", ct));
+            Assert.Equal("pending", await ScalarStringAsync("SELECT approval_state FROM task_view WHERE id = 'T-1';", ct));
+            Assert.Equal("ready", await ScalarStringAsync("SELECT status FROM task_view WHERE id = 'T-1';", ct));
+            Assert.DoesNotContain("\"done\"", await File.ReadAllTextAsync(_taskFile, ct), StringComparison.Ordinal);
+            Assert.Equal(0, await CountAsync("SELECT COUNT(*) FROM audit WHERE action = 'result.approved';", ct));
+        }
+        finally
+        {
+            File.SetAttributes(_taskFile, FileAttributes.Normal);
+        }
+
+        var retried = await _store.DecideAsync("r1", approve: true, "通过", actor: null, ct);
+        Assert.Equal(ResultDecisionStatus.Decided, retried.Status);
+        Assert.Equal("approved", await ScalarStringAsync("SELECT approval_state FROM task_view WHERE id = 'T-1';", ct));
+        Assert.Equal("done", await ScalarStringAsync("SELECT status FROM task_view WHERE id = 'T-1';", ct));
+        Assert.Contains("\"status\": \"done\"", await File.ReadAllTextAsync(_taskFile, ct), StringComparison.Ordinal);
+    }
+
     /// <summary>插入一条已完成的队列项、任务视图与待审结果，并准备真实任务文件。</summary>
     /// <param name="ct">取消令牌。</param>
     private async Task SeedAsync(CancellationToken ct)

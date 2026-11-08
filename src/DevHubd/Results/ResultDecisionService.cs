@@ -43,6 +43,7 @@ public sealed class ResultDecisionService : IResultDecisionSource
             CoreDecisionStatus.Decided => DecisionStatus.Decided,
             CoreDecisionStatus.Duplicate => DecisionStatus.Duplicate,
             CoreDecisionStatus.NotPending => DecisionStatus.NotPending,
+            CoreDecisionStatus.FileWriteFailed => DecisionStatus.FileWriteFailed,
             _ => DecisionStatus.NotFound,
         };
 

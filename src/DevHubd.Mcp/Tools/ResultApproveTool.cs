@@ -49,16 +49,24 @@ public sealed class ResultApproveTool
                 .ConfigureAwait(false);
         }
 
-        var code = status == ResultDecisionStatus.NotFound
-            ? DevHubErrorCodes.UnknownResult
-            : DevHubErrorCodes.ResultNotPending;
+        var code = status switch
+        {
+            ResultDecisionStatus.NotFound => DevHubErrorCodes.UnknownResult,
+            ResultDecisionStatus.FileWriteFailed => DevHubErrorCodes.TaskFileWriteFailed,
+            _ => DevHubErrorCodes.ResultNotPending,
+        };
+
+        var retryable = status == ResultDecisionStatus.FileWriteFailed;
+        var next = retryable
+            ? "检查并修复任务文件权限后重试；审批未生效，结果仍在待审批。"
+            : "用 result_list 查看结果的当前 outcome 后再决定。";
 
         return await ToolResults.FailureAsync(
             McpErrors.Envelope(
                 code,
                 reason ?? "结果不能通过。",
-                retryable: false,
-                next: "用 result_list 查看结果的当前 outcome 后再决定。",
+                retryable: retryable,
+                next: next,
                 new { resultId }),
             _digest,
             cancellationToken).ConfigureAwait(false);

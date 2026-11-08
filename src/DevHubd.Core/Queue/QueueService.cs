@@ -83,12 +83,26 @@ public sealed class QueueService
 
         var tasks = await db.TaskViews
             .AsNoTracking()
-            .Where(task => task.WorkspaceId == workspaceId && task.Status == "ready")
+            .Where(task =>
+                task.WorkspaceId == workspaceId &&
+                task.Status == "ready" &&
+                task.ApprovalState != "approved")
             .OrderByDescending(task => task.Priority)
             .ThenBy(task => task.Id)
             .Select(task => new { task.Id, task.Title, task.Status, task.ContentHash, task.Priority, task.RoleId })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
+
+        // 重派去重按"任务队列代次"而非文件字节：同一任务每次成功入队都会产生新代次，
+        // 驳回后即使任务文件字节完全没变（规范形态），也仍能再次派发。
+        var generations = (await db.QueueItems
+                .AsNoTracking()
+                .Where(item => item.WorkspaceId == workspaceId)
+                .GroupBy(item => item.TaskId)
+                .Select(group => new { TaskId = group.Key, Count = group.Count() })
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false))
+            .ToDictionary(entry => entry.TaskId, entry => entry.Count, StringComparer.Ordinal);
 
         // 一次性取回本工作区所有"未结束"的 task_id：任务在 task_view 中天然唯一，
         // 因此快照判断与逐条 EXISTS 等价，但把 N 次查询收敛成 1 次。
@@ -119,7 +133,8 @@ public sealed class QueueService
                 continue;
             }
 
-            var dedupeKey = BuildDedupeKey(workspaceId, task.Id, task.ContentHash);
+            var generation = generations.GetValueOrDefault(task.Id) + 1;
+            var dedupeKey = BuildDedupeKey(workspaceId, task.Id, generation);
             var inserted = await InsertIgnoreConflictAsync(
                 db,
                 workspaceId,
@@ -165,12 +180,42 @@ public sealed class QueueService
     {
         var now = Now();
         // 幂等键直接作为 dedupe_key：复用它既有的唯一约束与去重分支，避免为请求号新增列。
-        var dedupeKey = string.IsNullOrWhiteSpace(requestId)
-            ? BuildDedupeKey(workspaceId, task.Id, task.ContentHash)
+        var requestDedupeKey = string.IsNullOrWhiteSpace(requestId)
+            ? null
             : $"request:{workspaceId}:{requestId.Trim()}";
 
         await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+
+        // 无 requestId 时按任务队列代次去重：同一任务每次派发都产生新代次，
+        // 因此驳回后即使任务文件字节未变，也能重新派发。
+        // 但若该任务已有进行中的队列项，手动派发仍按幂等处理并返回既有项。
+        var dedupeKey = requestDedupeKey;
+        if (dedupeKey is null)
+        {
+            var latest = await db.QueueItems
+                .AsNoTracking()
+                .Where(item => item.WorkspaceId == workspaceId && item.TaskId == task.Id)
+                .OrderByDescending(item => item.CreatedAt)
+                .ThenByDescending(item => item.Id)
+                .Select(item => new { item.Id, item.Status, item.PreferredProvider })
+                .FirstOrDefaultAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+            if (latest is not null &&
+                latest.Status is "pending" or "claimed" or "running")
+            {
+                return new ManualEnqueueResult(false, true, latest.Id, "deduped", latest.PreferredProvider);
+            }
+
+            var generation = await db.QueueItems
+                .AsNoTracking()
+                .CountAsync(
+                    item => item.WorkspaceId == workspaceId && item.TaskId == task.Id,
+                    cancellationToken)
+                .ConfigureAwait(false) + 1;
+            dedupeKey = BuildDedupeKey(workspaceId, task.Id, generation);
+        }
 
         var existing = await db.QueueItems
             .AsNoTracking()
@@ -230,8 +275,30 @@ public sealed class QueueService
             CreatedAt = now,
             UpdatedAt = now,
         });
-        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (DbUpdateException)
+        {
+            // 并发下两次派发可能计算出同一代次：唯一约束只允许一条落库。
+            // 命中已存在行时按去重语义返回，而不是把唯一冲突暴露成内部错误。
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            var raced = await db.QueueItems
+                .AsNoTracking()
+                .Where(item => item.DedupeKey == dedupeKey)
+                .Select(item => new { item.Id, item.PreferredProvider })
+                .FirstOrDefaultAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+            if (raced is null)
+            {
+                throw;
+            }
+
+            return new ManualEnqueueResult(false, true, raced.Id, "deduped", raced.PreferredProvider);
+        }
 
         return new ManualEnqueueResult(true, false, id, "pending", provider);
     }
@@ -292,14 +359,26 @@ public sealed class QueueService
     /// <param name="ownerId">认领者标识。</param>
     /// <param name="lease">租约时长。</param>
     /// <param name="cancellationToken">取消令牌。</param>
+    /// <param name="excludedRoles">角色并发已满、本轮不参与认领的角色 id 集合。</param>
     public async Task<ClaimedQueueItem?> ClaimDetailedAsync(
         string ownerId,
         TimeSpan lease,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        IReadOnlyCollection<string>? excludedRoles = null)
     {
         var nowValue = DateTimeOffset.UtcNow;
         var now = nowValue.ToString("O", CultureInfo.InvariantCulture);
         var expires = nowValue.Add(lease).ToString("O", CultureInfo.InvariantCulture);
+
+        // 角色并发已满时不认领该角色的项：避免"认领后才等待"浪费 attempt，
+        // 也不让一个满额角色堵住其它角色。
+        var excluded = excludedRoles?
+            .Where(role => !string.IsNullOrWhiteSpace(role))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray() ?? Array.Empty<string>();
+        var roleClause = excluded.Length == 0
+            ? string.Empty
+            : $"AND COALESCE(role_id, '{TurnRunner.DefaultRoleId}') NOT IN ({string.Join(", ", excluded.Select((_, index) => $"$excludedRole{index}"))})";
 
         await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
@@ -314,7 +393,7 @@ public sealed class QueueService
         await using (var command = db.Database.GetDbConnection().CreateCommand())
         {
             command.Transaction = db.Database.CurrentTransaction!.GetDbTransaction();
-            command.CommandText = """
+            command.CommandText = $"""
                 UPDATE queue_item
                 SET status = 'claimed',
                     lease_owner = $owner,
@@ -335,6 +414,7 @@ public sealed class QueueService
                               AND (a.error_kind IS NULL OR a.error_kind NOT IN ('auth', 'quota', 'no_model', 'bridge_down'))
                           ) < max_attempts
                       AND hold_kind IS NULL
+                      {roleClause}
                     ORDER BY priority DESC, created_at ASC, id ASC
                     LIMIT 1
                 )
@@ -345,6 +425,10 @@ public sealed class QueueService
             AddParameter(command, "$owner", ownerId);
             AddParameter(command, "$expires", expires);
             AddParameter(command, "$now", now);
+            for (var index = 0; index < excluded.Length; index++)
+            {
+                AddParameter(command, $"$excludedRole{index}", excluded[index]);
+            }
 
             await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
             if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
@@ -637,12 +721,12 @@ public sealed class QueueService
         return new QueueItemDetail(item, title, attempts.Select(ToDomain).ToList());
     }
 
-    /// <summary>构造 dedupe_key：<c>workspace:task:contentHash</c>。</summary>
+    /// <summary>构造 dedupe_key：<c>workspace:task:g&lt;generation&gt;</c>（任务队列代次，与文件字节无关）。</summary>
     /// <param name="workspaceId">工作区 id。</param>
     /// <param name="taskId">任务 id。</param>
-    /// <param name="contentHash">内容哈希。</param>
-    public static string BuildDedupeKey(string workspaceId, string taskId, string contentHash) =>
-        $"{workspaceId}:{taskId}:{contentHash}";
+    /// <param name="generation">该任务第几次入队（从 1 开始）。</param>
+    public static string BuildDedupeKey(string workspaceId, string taskId, int generation) =>
+        $"{workspaceId}:{taskId}:g{generation}";
 
     /// <summary>当前 UTC 时间（ISO-8601，固定 +00:00 偏移，保证字符串可直接比较）。</summary>
     private static string Now() => DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture);

@@ -16,6 +16,9 @@ public enum ResultDecisionStatus
 
     /// <summary>结果不存在。</summary>
     NotFound,
+
+    /// <summary>任务文件回写失败，审批已回滚：修复文件权限后可重试。</summary>
+    FileWriteFailed,
 }
 
 /// <summary>

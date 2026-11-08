@@ -127,10 +127,20 @@ public sealed class ToolDispatcher : IToolDispatcher
         var result = new List<ToolDescriptor>();
         foreach (var descriptor in _descriptors)
         {
-            if (_allowedTools.Contains(descriptor.Name))
+            if (!_allowedTools.Contains(descriptor.Name))
             {
-                result.Add(descriptor);
+                continue;
             }
+
+            // 工具列表本身按角色能力过滤：不允许提问的角色看不到 ask_input，
+            // 避免模型白看一个必然失败的工具并浪费一轮。
+            if (string.Equals(descriptor.Name, AskInputToolName, StringComparison.Ordinal) &&
+                !_canRequestInput)
+            {
+                continue;
+            }
+
+            result.Add(descriptor);
         }
 
         if (_serviceTools is not null)
@@ -176,6 +186,19 @@ public sealed class ToolDispatcher : IToolDispatcher
             return ToolExecutionResult.Fail(
                 DevHubErrorCodes.ToolNotAllowed,
                 $"角色未声明工具 {toolName}，调用被拒绝（TOOL_NOT_ALLOWED）。");
+        }
+
+        // 角色声明的工具调用总预算：超限后不再执行，也不记账，避免越过上限继续消耗。
+        if (_budget.MaxToolCalls is { } maxToolCalls && ExecutedCalls >= maxToolCalls)
+        {
+            _logger.LogWarning(
+                "工具调用次数已达上限：turnId={TurnId} tool={ToolName} limit={Limit}",
+                turnId,
+                toolName,
+                maxToolCalls);
+            return ToolExecutionResult.Fail(
+                DevHubErrorCodes.BudgetExceeded,
+                $"工具调用次数已达上限 {maxToolCalls}。");
         }
 
         ExecutedCalls++;

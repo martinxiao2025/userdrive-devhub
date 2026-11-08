@@ -104,6 +104,9 @@ public static class DevHubErrorCodes
     /// <summary>结果不处于待审批状态，不能通过或驳回。</summary>
     public const string ResultNotPending = "RESULT_NOT_PENDING";
 
+    /// <summary>任务文件回写失败：审批/驳回未生效，可修复文件权限后重试。</summary>
+    public const string TaskFileWriteFailed = "TASK_FILE_WRITE_FAILED";
+
     /// <summary>进程重启导致上一个进程的回合中断（attempt 兜底为 abandoned）。</summary>
     public const string ProcessRestart = "PROCESS_RESTART";
 

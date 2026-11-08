@@ -739,6 +739,152 @@ public sealed class P2ExecutionTests : IDisposable
         Assert.Equal(1, fake.Calls);
     }
 
+    /// <summary>
+    /// 角色声明的预算必须真正进入回合：maxRounds → 轮次、maxToolCalls → 工具总数、
+    /// maxDurationSeconds → 墙钟；requiresApproval 即使在 auto 档位也必须让结果进入待审。
+    /// </summary>
+    [Fact]
+    public async Task Pump_RoleBudget_IsAppliedToTurnRequestAndDeliveryAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "角色预算", "ready", 10, delivery: "auto");
+        await InsertRoleAsync(
+            "implementer",
+            tools: """["read_file"]""",
+            requiresApproval: 1,
+            maxParallel: 1,
+            maxRounds: 2,
+            maxToolCalls: 5,
+            maxDurationSeconds: 30,
+            ct);
+
+        await PrepareQueueAsync(ct);
+
+        TurnRequest? captured = null;
+        var fake = new FakeModelClient(
+            "openai",
+            (request, _, _) =>
+            {
+                captured = request;
+                return Task.FromResult(TurnResult.Done("完成", 0, null, Array.Empty<string>()));
+            });
+
+        var coordinator = CreateCoordinator(fake, new ExecutionOptions { MaxParallel = 1 }, mode: "auto");
+        Assert.Equal(1, await coordinator.PumpAsync(ct));
+        await WaitUntilAsync(
+            async () => await CountAsync("SELECT COUNT(*) FROM result WHERE task_id = 'T-001';", ct) == 1,
+            ct);
+
+        Assert.NotNull(captured);
+        Assert.Equal(2, captured!.Budget.MaxToolRounds);
+        Assert.Equal(5, captured.Budget.MaxToolCalls);
+        Assert.Equal(TimeSpan.FromSeconds(30), captured.Budget.MaxDuration);
+        Assert.Equal(TimeSpan.FromSeconds(30), captured.Timeout);
+        // 任务 delivery=auto + 全局 auto，但角色声明 requiresApproval：结果必须待审。
+        Assert.Equal(
+            "awaiting_review",
+            await ScalarStringAsync("SELECT outcome FROM result WHERE task_id = 'T-001';", ct));
+    }
+
+    /// <summary>角色声明的 maxParallel 必须限制同角色同时运行的回合数，即使全局允许更多。</summary>
+    [Fact]
+    public async Task Pump_RoleMaxParallel_LimitsConcurrentTurnsAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "并发 A", "ready", 10, delivery: "auto");
+        WriteTask(root, "T-002", "并发 B", "ready", 10, delivery: "auto");
+        await InsertRoleAsync(
+            "implementer",
+            tools: """["read_file"]""",
+            requiresApproval: 0,
+            maxParallel: 1,
+            maxRounds: 10,
+            maxToolCalls: 20,
+            maxDurationSeconds: 300,
+            ct);
+
+        await PrepareQueueAsync(ct);
+
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var running = 0;
+        var peak = 0;
+        var fake = new FakeModelClient(
+            "openai",
+            async (_, _, _) =>
+            {
+                var current = Interlocked.Increment(ref running);
+                var observed = Volatile.Read(ref peak);
+                while (current > observed &&
+                       Interlocked.CompareExchange(ref peak, current, observed) != observed)
+                {
+                    observed = Volatile.Read(ref peak);
+                }
+
+                try
+                {
+                    await gate.Task;
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref running);
+                }
+
+                return TurnResult.Done("完成", 0, null, Array.Empty<string>());
+            });
+
+        var coordinator = CreateCoordinator(fake, new ExecutionOptions { MaxParallel = 2 }, mode: "auto");
+
+        // 全局允许 2，但角色 maxParallel=1：第一次 pump 只能启动 1 个。
+        Assert.Equal(1, await coordinator.PumpAsync(ct));
+        Assert.Equal(1, coordinator.ActiveCount);
+
+        gate.SetResult();
+        await WaitUntilAsync(() => Task.FromResult(coordinator.ActiveCount == 0), ct);
+
+        // 前一个结束后，角色槽位释放，下一轮再启动第二个。
+        Assert.Equal(1, await coordinator.PumpAsync(ct));
+        await WaitUntilAsync(
+            async () => await CountAsync("SELECT COUNT(*) FROM result;", ct) == 2,
+            ct);
+
+        Assert.Equal(1, peak);
+        Assert.Equal(2, fake.Calls);
+    }
+
+    /// <summary>插入一条角色快照，用于验证角色声明进入回合预算与并发控制。</summary>
+    /// <param name="id">角色 id。</param>
+    /// <param name="tools">工具白名单 JSON。</param>
+    /// <param name="requiresApproval">是否必须审批（0/1）。</param>
+    /// <param name="maxParallel">角色并发上限。</param>
+    /// <param name="maxRounds">回合模型轮次上限。</param>
+    /// <param name="maxToolCalls">回合工具调用上限。</param>
+    /// <param name="maxDurationSeconds">回合墙钟上限（秒）。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private Task InsertRoleAsync(
+        string id,
+        string tools,
+        int requiresApproval,
+        int maxParallel,
+        int maxRounds,
+        int maxToolCalls,
+        int maxDurationSeconds,
+        CancellationToken cancellationToken) => ExecuteAsync(
+        $$"""
+        INSERT INTO role_view (
+            id, name, description, source_path, content_hash, skills, tools, delivery,
+            requires_approval, can_request_input, max_parallel, max_attempts, max_rounds,
+            max_tool_calls, max_duration_seconds, max_input_tokens, payload, loaded_at, updated_at)
+        VALUES (
+            '{{id}}', '实现', 'desc', 'p', 'h', '[]', '{{tools}}', 'dispatch_only',
+            {{requiresApproval}}, 0, {{maxParallel}}, 3, {{maxRounds}},
+            {{maxToolCalls}}, {{maxDurationSeconds}}, NULL, '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+        """,
+        cancellationToken);
+
     /// <summary>插入一个允许提问的 implementer 角色快照。</summary>
     /// <param name="cancellationToken">取消令牌。</param>
     private Task InsertAskableRoleAsync(CancellationToken cancellationToken) => ExecuteAsync(
@@ -774,13 +920,14 @@ public sealed class P2ExecutionTests : IDisposable
             stateStore.SetModeAsync(mode, TestContext.Current.CancellationToken).GetAwaiter().GetResult();
         }
 
+        var roleSnapshots = new RoleSnapshotStore(new DevHubDbContextFactory(_factory.ConnectionString));
         var runner = new TurnRunner(
             new ModelClientRegistry(new[] { fake }),
             normalized,
             stateStore,
             new DevHubPaths(_directory),
             new InputRequestStore(_factory),
-            new RoleSnapshotStore(new DevHubDbContextFactory(_factory.ConnectionString)),
+            roleSnapshots,
             NullLoggerFactory.Instance,
             turnLogger ?? NullLogger<TurnRunner>.Instance);
 
@@ -791,7 +938,8 @@ public sealed class P2ExecutionTests : IDisposable
             _registry,
             runner,
             normalized,
-            coordinatorLogger ?? NullLogger<ExecutionCoordinator>.Instance);
+            coordinatorLogger ?? NullLogger<ExecutionCoordinator>.Instance,
+            roleSnapshots);
     }
 
     /// <summary>扫描工作区并入队全部 ready 任务。</summary>

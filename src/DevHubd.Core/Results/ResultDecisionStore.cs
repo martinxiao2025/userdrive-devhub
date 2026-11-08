@@ -22,6 +22,9 @@ public enum ResultDecisionStatus
 
     /// <summary>结果不存在。</summary>
     NotFound,
+
+    /// <summary>任务文件回写失败：本次审批/驳回已回滚，结果仍是 <c>awaiting_review</c>。</summary>
+    FileWriteFailed,
 }
 
 /// <summary>一次审批决定的持久化结果。</summary>
@@ -121,8 +124,6 @@ public sealed class ResultDecisionStore
                 $"结果状态为 {entity.Outcome}，只有 awaiting_review 可以审批。");
         }
 
-        entity.Outcome = target;
-
         var workspaceId = await db.QueueItems
             .AsNoTracking()
             .Where(item => item.Id == entity.QueueItemId)
@@ -131,7 +132,8 @@ public sealed class ResultDecisionStore
             .ConfigureAwait(false);
 
         // 任务状态与审批态同事务回写：通过 → done，驳回 → ready（保留可重做），待审不变。
-        // 任务文件在提交后按同一状态回写，扫描器下一轮读到的就是一致状态。
+        // 关键顺序：先写任务文件，再提交数据库。文件不可写时整体回滚，绝不产生
+        // "库已交付、文件未落"的中间态——否则扫描器下一轮会按文件把已交付任务退回可执行。
         var taskStatus = approve ? "done" : "ready";
         TaskViewEntity? taskView = null;
         if (!string.IsNullOrEmpty(workspaceId))
@@ -144,11 +146,26 @@ public sealed class ResultDecisionStore
 
             if (taskView is not null)
             {
+                var fileError = await TryWriteTaskFileAsync(taskView, taskStatus, cancellationToken).ConfigureAwait(false);
+                if (fileError is not null)
+                {
+                    await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+                    return new ResultDecisionOutcome(
+                        ResultDecisionStatus.FileWriteFailed,
+                        entity.Id,
+                        entity.TaskId,
+                        "awaiting_review",
+                        null,
+                        fileError);
+                }
+
                 taskView.ApprovalState = approve ? "approved" : "rejected";
                 taskView.Status = taskStatus;
                 taskView.UpdatedAt = now;
             }
         }
+
+        entity.Outcome = target;
 
         db.Audits.Add(new AuditEntity
         {
@@ -185,12 +202,6 @@ public sealed class ResultDecisionStore
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
 
-        // 任务文件与 task_view 必须同步：文件写失败时记录完整上下文，下一轮扫描会以文件为准重新物化。
-        if (taskView is not null)
-        {
-            await WriteTaskFileStatusAsync(taskView, taskStatus, cancellationToken).ConfigureAwait(false);
-        }
-
         return new ResultDecisionOutcome(
             ResultDecisionStatus.Decided,
             entity.Id,
@@ -200,11 +211,14 @@ public sealed class ResultDecisionStore
             null);
     }
 
-    /// <summary>按审批结论回写任务文件状态；失败只记录日志，不推翻已经提交的审批事务。</summary>
+    /// <summary>
+    /// 在审批事务提交前回写任务文件状态。
+    /// </summary>
     /// <param name="taskView">任务视图行（提供文件路径）。</param>
     /// <param name="status">目标状态。</param>
     /// <param name="cancellationToken">取消令牌。</param>
-    private async Task WriteTaskFileStatusAsync(
+    /// <returns>成功或可跳过时返回 null；文件不可写时返回可诊断原因，由调用方回滚事务。</returns>
+    private async Task<string?> TryWriteTaskFileAsync(
         TaskViewEntity taskView,
         string status,
         CancellationToken cancellationToken)
@@ -212,10 +226,10 @@ public sealed class ResultDecisionStore
         if (string.IsNullOrWhiteSpace(taskView.SourcePath))
         {
             _logger.LogWarning(
-                "任务视图缺少 source_path，无法回写任务文件：workspaceId={WorkspaceId} taskId={TaskId}",
+                "任务视图缺少 source_path，跳过任务文件回写：workspaceId={WorkspaceId} taskId={TaskId}",
                 taskView.WorkspaceId,
                 taskView.Id);
-            return;
+            return null;
         }
 
         try
@@ -231,23 +245,26 @@ public sealed class ResultDecisionStore
                     taskView.Id,
                     status,
                     taskView.SourcePath);
+                return null;
             }
-            else
-            {
-                _logger.LogWarning(
-                    "任务文件不存在或不是 JSON 对象，跳过回写：taskId={TaskId} path={Path}",
-                    taskView.Id,
-                    taskView.SourcePath);
-            }
+
+            // 文件不存在或不是 JSON 对象：不阻断审批。文件缺失时扫描器会标 missing，
+            // 不是可执行状态；非法 JSON 会被扫描器跳过，都不会把已交付任务退回可执行。
+            _logger.LogWarning(
+                "任务文件不存在或不是 JSON 对象，跳过回写：taskId={TaskId} path={Path}",
+                taskView.Id,
+                taskView.SourcePath);
+            return null;
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or System.Text.Json.JsonException)
         {
             _logger.LogError(
                 exception,
-                "任务文件状态回写失败：taskId={TaskId} status={Status} path={Path}",
+                "任务文件状态回写失败，审批已回滚：taskId={TaskId} status={Status} path={Path}",
                 taskView.Id,
                 status,
                 taskView.SourcePath);
+            return $"任务文件无法写入（{exception.GetType().Name}）：{taskView.SourcePath}";
         }
     }
 

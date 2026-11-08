@@ -243,7 +243,10 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 语义：仅 `awaiting_review` 可审批；通过后结果终态置 `delivered`，`task_view.approval_state` 置 `approved`、
 `task_view.status` 置 `done`，并把任务文件的 `status` 同步写成 `done`，
 同时写 `audit(action='result.approved', actor='mcp')`。
-错误码：`UNKNOWN_RESULT`、`RESULT_NOT_PENDING`（均 retryable=false）。
+**写入顺序**：先写任务文件、再提交数据库；任务文件不可写时整个审批回滚，返回
+`TASK_FILE_WRITE_FAILED`（retryable=true），结果仍为 `awaiting_review`、任务状态不变，
+不会产生“库已交付、文件未落”的中间态。
+错误码：`UNKNOWN_RESULT`、`RESULT_NOT_PENDING`、`TASK_FILE_WRITE_FAILED`。
 
 ### 3.13 `result_reject`
 
@@ -251,8 +254,8 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 返回：`{ resultId, outcome:"failed", taskId, decidedAt }`。
 语义：驳回后结果终态置 `failed`，`task_view.approval_state` 置 `rejected`、`task_view.status` 回到 `ready`
 （等待重新派发），任务文件 `status` 同步写成 `ready`；写 `audit(action='result.rejected')`
-与 `notice.kind='failure'`（去重键 `result-rejected:<resultId>`）。
-错误码：`UNKNOWN_RESULT`、`RESULT_NOT_PENDING`。
+与 `notice.kind='failure'`（去重键 `result-rejected:<resultId>`）。写入顺序与失败回滚同 `result_approve`。
+错误码：`UNKNOWN_RESULT`、`RESULT_NOT_PENDING`、`TASK_FILE_WRITE_FAILED`。
 
 两个工具同向重复提交是幂等的（`decidedAt=null`，不重复写审计/通知）；反向提交返回
 `RESULT_NOT_PENDING`，不覆盖既有终态。**任务状态与任务文件、`task_view` 同时回写**：
@@ -313,6 +316,10 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
   `../` 与绝对路径越界读被拒绝、敏感路径被拒绝）。
 - 边界差异：`dispatch_only` 下读工具**看不到**隔离目录里的产物（读根是工作区）；模型需要确认产物时
   以回合总结中的相对路径为准，人工从 `work/<queueItemId>` 复核。
+- **`task_upsert` 是有意例外**：它直接写工作区的 `<workspace>/.devhub/tasks/<id>.json`，不经过回合写根。
+  理由：任务文件是调度控制面产物（扫描器与入队的事实来源），必须在 `dispatch_only` 的隔离写根下仍可
+  维护；它不是交付物，写入前仍经工作区选择与任务结构校验，且不受 `writeScope`（源码交付边界）约束。
+  这条例外是设计决定，不是遗漏；文件工具与 `task_upsert` 的写边界因此是两套语义，调用方不要互相推断。
 - `scheduler_status.execution` 把上述边界显式暴露给调用方：
   `{ modelRuns: true, readRoot: "workspace", writeRoot: "workspace" | "isolation", resultDelivery: "delivered" | "awaiting_review" }`。
 
@@ -352,6 +359,28 @@ COUNT(attempt WHERE queue_item_id = ?
 ---
 
 ## 6. 变更记录
+
+### 交付态与重派修正 — 2026-11-08（不可回退、去重代次、角色预算、提问过滤）
+
+- **交付态不可回退**：`result_approve` / `result_reject` 改为**先写任务文件、后提交数据库**；
+  文件不可写时整体回滚并返回 `TASK_FILE_WRITE_FAILED`（retryable=true），不再产生
+  “库 `done/approved`、文件 `ready`”的中间态。扫描器额外防御：库内 `approval_state='approved'`
+  的任务不会被文件状态覆盖回 `ready/blocked/missing`；入队查询同时排除 `approval_state='approved'`。
+  测试：只读任务文件审批回滚、历史半边态扫描后仍 `done` 且不入队。
+- **重派去重与文件字节解耦**：`dedupe_key` 从 `workspace:task:contentHash` 改为
+  `workspace:task:g<generation>`（该任务已有队列项数 + 1）。任务内容哈希仍写入 `queue_item.task_hash`
+  供追溯，但不参与去重；手动派发在存在进行中队列项时仍返回 `deduped`。
+  测试：规范字节文件连续两轮“执行→驳回→重派”均真实入队，且第二轮驳回前后文件哈希一致。
+- **角色预算生效**：`maxRounds → MaxToolRounds`、`maxToolCalls → 工具调用总数`、
+  `maxDurationSeconds → 墙钟/Timeout`、`requiresApproval → 交付待审`、`maxParallel → 角色并发上限`。
+  角色字段未声明时用显式默认（`TurnRunner.DefaultMax*`）；角色快照整体缺失时沿用全局配置。
+  工具超限返回 `BUDGET_EXCEEDED`，且不递增 `ExecutedCalls`。测试：角色预算进入 `TurnRequest`、
+  角色 `maxParallel=1` 时全局允许 2 也只启动 1 个。
+- **工具列表按角色能力过滤**：`ToolDispatcher.Describe()` 在 `canRequestInput=false` 时不再列出 `ask_input`，
+  与调用侧 `INPUT_NOT_ALLOWED` 保持一致，避免模型白看一个必然失败的工具。
+- **待定政策（本轮不改行为）**：后台回合目前可通过 `result_approve` / `result_reject` 审批其它待审结果；
+  是否增加“只能审批本队列项结果”的闸门等待产品答复。本条仅为记录，当前行为不变。
+- 新增错误码（只增不改）：`TASK_FILE_WRITE_FAILED`。
 
 ### 读写边界修正 — 2026-11-08（dispatch_only 读放开、写仍受控）
 

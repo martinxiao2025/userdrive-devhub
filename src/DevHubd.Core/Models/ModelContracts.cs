@@ -96,7 +96,11 @@ public sealed record BudgetLimits(
     int MaxFilesChanged,
     int MaxWrites,
     long MaxPatchBytes,
-    int MaxReadBytes);
+    int MaxReadBytes)
+{
+    /// <summary>单回合工具调用总数上限；null 表示不额外限制（由 <see cref="MaxToolRounds"/> 间接约束）。</summary>
+    public int? MaxToolCalls { get; init; }
+}
 
 /// <summary>
 /// 一次模型回合的请求。携带 queueItemId / workspaceId / taskId 三个关联字段，

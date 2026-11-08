@@ -61,6 +61,18 @@ public sealed class TurnRunner
     /// <summary>队列项未声明角色时使用的显式缺省角色。</summary>
     public const string DefaultRoleId = "implementer";
 
+    /// <summary>角色快照缺失或未声明时的显式默认：单回合模型轮次上限。</summary>
+    public const int DefaultMaxRounds = 12;
+
+    /// <summary>角色快照缺失或未声明时的显式默认：单回合工具调用上限。</summary>
+    public const int DefaultMaxToolCalls = 60;
+
+    /// <summary>角色快照缺失或未声明时的显式默认：单回合墙钟上限（秒）。</summary>
+    public const int DefaultMaxDurationSeconds = 1800;
+
+    /// <summary>角色快照缺失或未声明时的显式默认：该角色同时运行的回合上限。</summary>
+    public const int DefaultMaxParallel = 1;
+
     /// <summary>
     /// 缺省角色的显式工具集：角色快照缺失（如未部署插件包）时使用，不做隐式兜底。
     /// 仍受 <c>canRequestInput</c> 影响，<c>ask_input</c> 会在不允许提问时被过滤。
@@ -162,8 +174,11 @@ public sealed class TurnRunner
         }
 
         // 交付档位以库为准：每回合读取 scheduler_state.mode，控制面改档后下一次判定立即生效。
+        // 角色先加载：交付判定要把角色 requiresApproval 纳入，回合预算也由角色声明决定。
         var schedulerState = await _stateStore.ReadAsync(cancellationToken).ConfigureAwait(false);
-        var deliveryOutcome = ResolveDeliveryOutcome(task, schedulerState.Mode);
+        var roleId = string.IsNullOrWhiteSpace(item.RoleId) ? DefaultRoleId : item.RoleId;
+        var role = await _roleSnapshots.GetAsync(roleId, cancellationToken).ConfigureAwait(false);
+        var deliveryOutcome = ResolveDeliveryOutcome(task, schedulerState.Mode, role);
         var workDirectory = deliveryOutcome == "delivered" ? null : CreateWorkDirectory(item.Id);
 
         // 读根固定为工作区（只读），写根由交付档位决定：
@@ -175,9 +190,7 @@ public sealed class TurnRunner
             task.WriteScope,
             EnforceScope: deliveryOutcome == "delivered");
 
-        var budget = _options.ToBudget();
-        var roleId = string.IsNullOrWhiteSpace(item.RoleId) ? DefaultRoleId : item.RoleId;
-        var role = await _roleSnapshots.GetAsync(roleId, cancellationToken).ConfigureAwait(false);
+        var budget = BuildBudget(role);
         var canRequestInput = role?.CanRequestInput ?? false;
         var allowedTools = ResolveAllowedTools(roleId, role);
 
@@ -218,7 +231,7 @@ public sealed class TurnRunner
             dispatcher.Describe(),
             budget,
             Model: null,
-            TimeSpan.FromSeconds(_options.MaxDurationSeconds));
+            budget.MaxDuration);
 
         _logger.LogInformation(
             "模型回合开始：queueItemId={QueueItemId} attempt={Attempt} turnId={TurnId} provider={Provider} delivery={Delivery}",
@@ -420,13 +433,43 @@ public sealed class TurnRunner
     }
 
     /// <summary>
-    /// 解析交付档位：任务显式 <c>requiresApproval</c>、全局档位或任务档位任一不是 <c>auto</c> 时进入待审。
-    /// 任务级声明优先于全局档位，避免全局 auto 绕过任务自带的人工闸门。
+    /// 把角色声明转换为回合预算：maxRounds → 模型轮次，maxToolCalls → 工具调用总数，
+    /// maxDurationSeconds → 墙钟上限。角色字段未声明时用显式默认值；角色快照整体缺失时沿用全局配置。
+    /// 写入数、字节数等文件预算仍取全局配置。
+    /// </summary>
+    /// <param name="role">角色快照；null 表示未加载。</param>
+    private BudgetLimits BuildBudget(Data.Entities.RoleViewEntity? role)
+    {
+        // 角色快照缺失时沿用全局配置（本身就是显式配置），不凭空替换默认值。
+        if (role is null)
+        {
+            return _options.ToBudget();
+        }
+
+        var maxRounds = role.MaxRounds > 0 ? role.MaxRounds : DefaultMaxRounds;
+        var maxToolCalls = role.MaxToolCalls > 0 ? role.MaxToolCalls : DefaultMaxToolCalls;
+        var maxDurationSeconds = role.MaxDurationSeconds > 0
+            ? role.MaxDurationSeconds
+            : DefaultMaxDurationSeconds;
+
+        return _options.ToBudget() with
+        {
+            MaxToolRounds = maxRounds,
+            MaxToolCalls = maxToolCalls,
+            MaxDuration = TimeSpan.FromSeconds(maxDurationSeconds),
+        };
+    }
+
+    /// <summary>
+    /// 解析交付档位：任务显式 <c>requiresApproval</c>、角色声明必须审批、全局档位或任务档位
+    /// 任一不是 <c>auto</c> 时进入待审。任务级与角色级声明都优先于全局档位，避免全局 auto 绕过人工闸门。
     /// </summary>
     /// <param name="task">任务文档。</param>
     /// <param name="mode">库中的当前交付档位（<c>scheduler_state.mode</c>）。</param>
-    private static string ResolveDeliveryOutcome(TaskDocument task, string mode) =>
+    /// <param name="role">角色快照；null 表示未加载。</param>
+    private static string ResolveDeliveryOutcome(TaskDocument task, string mode, Data.Entities.RoleViewEntity? role) =>
         !task.RequiresApproval &&
+        role?.RequiresApproval != true &&
         string.Equals(mode, "auto", StringComparison.Ordinal) &&
         string.Equals(task.Delivery, "auto", StringComparison.Ordinal)
             ? "delivered"

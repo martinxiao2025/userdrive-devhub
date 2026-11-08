@@ -294,6 +294,9 @@ public sealed class McpTurnToolService : ITurnToolService
             ResultDecisionStatus.NotPending => ToolExecutionResult.Fail(
                 "NOT_PENDING",
                 reason ?? "结果不在待审批状态。"),
+            ResultDecisionStatus.FileWriteFailed => ToolExecutionResult.Fail(
+                DevHubErrorCodes.TaskFileWriteFailed,
+                reason ?? "任务文件无法写入，审批未生效。"),
             _ => ToolExecutionResult.Fail(DevHubErrorCodes.Internal, $"未知的审批状态：{status}"),
         };
     }

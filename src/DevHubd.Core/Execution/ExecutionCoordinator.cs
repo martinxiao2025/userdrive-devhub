@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using DevHubd.Core.Models;
 using DevHubd.Core.Providers;
 using DevHubd.Core.Queue;
+using DevHubd.Core.Roles;
 using DevHubd.Core.Tasks;
 using DevHubd.Core.Workspaces;
 using Microsoft.Extensions.Logging;
@@ -24,8 +25,12 @@ public sealed class ExecutionCoordinator
     private readonly TurnRunner _runner;
     private readonly ExecutionOptions _options;
     private readonly ILogger<ExecutionCoordinator> _logger;
+    private readonly RoleSnapshotStore? _roleSnapshots;
     private readonly SemaphoreSlim _slots;
     private readonly ConcurrentDictionary<string, Task> _active = new(StringComparer.Ordinal);
+
+    /// <summary>角色 → 当前运行中回合数；用于执行角色声明的 maxParallel。</summary>
+    private readonly ConcurrentDictionary<string, int> _roleActive = new(StringComparer.Ordinal);
     private readonly CancellationTokenSource _shutdown = new();
     private readonly string _ownerId;
 
@@ -37,6 +42,7 @@ public sealed class ExecutionCoordinator
     /// <param name="runner">回合执行器。</param>
     /// <param name="options">执行配置。</param>
     /// <param name="logger">日志器。</param>
+    /// <param name="roleSnapshots">角色快照；用于执行角色声明的 maxParallel，null 表示不启用角色并发上限。</param>
     public ExecutionCoordinator(
         QueueService queue,
         ExecutionStore store,
@@ -44,7 +50,8 @@ public sealed class ExecutionCoordinator
         WorkspaceRegistry workspaces,
         TurnRunner runner,
         ExecutionOptions options,
-        ILogger<ExecutionCoordinator> logger)
+        ILogger<ExecutionCoordinator> logger,
+        RoleSnapshotStore? roleSnapshots = null)
     {
         _queue = queue;
         _store = store;
@@ -53,6 +60,7 @@ public sealed class ExecutionCoordinator
         _runner = runner;
         _options = options.Normalize();
         _logger = logger;
+        _roleSnapshots = roleSnapshots;
         _slots = new SemaphoreSlim(_options.MaxParallel, _options.MaxParallel);
         _ownerId = $"{Environment.MachineName}:{Environment.ProcessId}";
     }
@@ -69,6 +77,9 @@ public sealed class ExecutionCoordinator
     {
         var started = 0;
 
+        // 角色并发上限每次 pump 读一次库：控制面改角色声明后下一轮立即生效。
+        var roleCaps = await LoadRoleCapsAsync(cancellationToken).ConfigureAwait(false);
+
         while (!cancellationToken.IsCancellationRequested && _active.Count < _options.MaxParallel)
         {
             if (!await _slots.WaitAsync(0, cancellationToken).ConfigureAwait(false))
@@ -77,13 +88,18 @@ public sealed class ExecutionCoordinator
             }
 
             var slotHandedOff = false;
+            string? countedRoleId = null;
             try
             {
                 ClaimedQueueItem? claimed;
                 try
                 {
                     claimed = await _queue
-                        .ClaimDetailedAsync(_ownerId, TimeSpan.FromSeconds(_options.LeaseSeconds), cancellationToken)
+                        .ClaimDetailedAsync(
+                            _ownerId,
+                            TimeSpan.FromSeconds(_options.LeaseSeconds),
+                            cancellationToken,
+                            RolesAtCapacity(roleCaps))
                         .ConfigureAwait(false);
                 }
                 catch (QueueItemClaimException exception)
@@ -125,6 +141,8 @@ public sealed class ExecutionCoordinator
 
                 await _store.MarkRunningAsync(claimed.Item.Id, Now(), cancellationToken).ConfigureAwait(false);
 
+                IncrementRoleActive(claimed.Item.RoleId);
+                countedRoleId = claimed.Item.RoleId;
                 var task = RunTrackedAsync(claimed, cancellationToken);
                 _active[claimed.Item.Id] = task;
                 slotHandedOff = true;
@@ -146,6 +164,11 @@ public sealed class ExecutionCoordinator
                 // 成功交给 RunTrackedAsync 后由它负责释放，避免重复 Release。
                 if (!slotHandedOff)
                 {
+                    if (countedRoleId is not null)
+                    {
+                        DecrementRoleActive(countedRoleId);
+                    }
+
                     _slots.Release();
                 }
             }
@@ -213,6 +236,7 @@ public sealed class ExecutionCoordinator
                     // 先归还并发槽位再摘除活动记录：这样 ActiveCount 归零即可断定槽位已可用，
                     // 观测方（调度循环与测试）不必在两者之间猜测顺序。
                     _slots.Release();
+                    DecrementRoleActive(claimed.Item.RoleId);
                     _active.TryRemove(claimed.Item.Id, out _);
                 }
             },
@@ -731,6 +755,62 @@ public sealed class ExecutionCoordinator
             now,
             cancellationToken).ConfigureAwait(false);
     }
+
+    /// <summary>读取角色声明的并发上限；未声明或非正时用显式默认值，并夹在全局并发内。</summary>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private async Task<Dictionary<string, int>> LoadRoleCapsAsync(CancellationToken cancellationToken)
+    {
+        var caps = new Dictionary<string, int>(StringComparer.Ordinal);
+        if (_roleSnapshots is null)
+        {
+            return caps;
+        }
+
+        var roles = await _roleSnapshots.ListAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var role in roles)
+        {
+            var declared = role.MaxParallel > 0 ? role.MaxParallel : TurnRunner.DefaultMaxParallel;
+            caps[role.Id] = Math.Clamp(declared, 1, _options.MaxParallel);
+        }
+
+        return caps;
+    }
+
+    /// <summary>列出当前已满额的角色 id：本轮认领时跳过，避免浪费 attempt。</summary>
+    /// <param name="roleCaps">角色并发上限。</param>
+    private string[] RolesAtCapacity(Dictionary<string, int> roleCaps)
+    {
+        if (roleCaps.Count == 0)
+        {
+            return Array.Empty<string>();
+        }
+
+        var blocked = new List<string>();
+        foreach (var (roleId, cap) in roleCaps)
+        {
+            if (_roleActive.GetValueOrDefault(roleId) >= cap)
+            {
+                blocked.Add(roleId);
+            }
+        }
+
+        return blocked.ToArray();
+    }
+
+    /// <summary>角色运行计数 +1。</summary>
+    /// <param name="roleId">角色 id；空值按缺省角色计。</param>
+    private void IncrementRoleActive(string? roleId) =>
+        _roleActive.AddOrUpdate(RoleKey(roleId), 1, (_, value) => value + 1);
+
+    /// <summary>角色运行计数 -1（不会低于 0）。</summary>
+    /// <param name="roleId">角色 id；空值按缺省角色计。</param>
+    private void DecrementRoleActive(string? roleId) =>
+        _roleActive.AddOrUpdate(RoleKey(roleId), 0, (_, value) => Math.Max(0, value - 1));
+
+    /// <summary>队列项角色键：未声明时归入缺省角色。</summary>
+    /// <param name="roleId">角色 id。</param>
+    private static string RoleKey(string? roleId) =>
+        string.IsNullOrWhiteSpace(roleId) ? TurnRunner.DefaultRoleId : roleId;
 
     /// <summary>裁剪文本，避免 result.summary 无界增长。</summary>
     /// <param name="text">原文。</param>

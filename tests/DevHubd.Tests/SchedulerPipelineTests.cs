@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using DevHubd.Core.Data;
@@ -106,6 +107,84 @@ public sealed class SchedulerPipelineTests : IDisposable
         var secondKeys = await ReadDedupeKeysAsync(ct);
         Assert.Equal(2, secondKeys.Count);
         Assert.Equal(2, secondKeys.Distinct(StringComparer.Ordinal).Count());
+    }
+
+    /// <summary>
+    /// 已交付任务不允许被文件里的旧状态退回可执行：即使库里是 done/approved、文件仍是 ready，
+    /// 扫描保持 done，入队也不会再派发。
+    /// </summary>
+    [Fact]
+    public async Task TickAsync_DeliveredTaskWhoseFileRegressed_IsNotReEnqueuedAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "已交付任务", "ready", 10);
+
+        await _engine.TickAsync(ct);
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+
+        // 模拟旧版本遗留的半边态：审批已落库，任务文件未同步。
+        await ExecuteAsync(
+            """
+            UPDATE queue_item SET status = 'succeeded';
+            UPDATE task_view SET status = 'done', approval_state = 'approved';
+            """,
+            ct);
+
+        await _engine.TickAsync(ct);
+
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+        Assert.Equal(
+            new[] { "done|approved" },
+            await ReadColumnAsync("SELECT status || '|' || approval_state FROM task_view WHERE id = 'T-001';", ct));
+    }
+
+    /// <summary>
+    /// 重派去重不依赖任务文件字节：同一任务连续两轮"执行→驳回→重派"都必须真的入队，
+    /// 即使驳回回写后的文件字节完全一致。
+    /// </summary>
+    [Fact]
+    public async Task TickAsync_AfterTwoRejections_RedispatchesWithUnchangedFileBytesAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "连续驳回", "ready", 10);
+        var file = Path.Combine(root, ".devhub", "tasks", "T-001.json");
+
+        await _engine.TickAsync(ct);
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+
+        // 第一轮驳回：把文件写成审批回写后的规范形态，并记录字节哈希。
+        await ExecuteAsync(
+            """
+            UPDATE queue_item SET status = 'succeeded';
+            UPDATE task_view SET status = 'ready', approval_state = 'rejected';
+            """,
+            ct);
+        Assert.True(await TaskFileStatusUpdater.TrySetStatusAsync(file, "ready", ct));
+        var canonicalHash = await ComputeHashAsync(file, ct);
+
+        // 第二轮派发必须真的发生（修复前这里会 deduped=1）。
+        await _engine.TickAsync(ct);
+        Assert.Equal(2, await CountQueueItemsAsync(ct));
+
+        // 第二轮驳回：文件本来就是规范形态，回写后字节不变。
+        await ExecuteAsync(
+            """
+            UPDATE queue_item SET status = 'succeeded' WHERE status = 'pending';
+            UPDATE task_view SET status = 'ready', approval_state = 'rejected';
+            """,
+            ct);
+        Assert.True(await TaskFileStatusUpdater.TrySetStatusAsync(file, "ready", ct));
+        Assert.Equal(canonicalHash, await ComputeHashAsync(file, ct));
+
+        await _engine.TickAsync(ct);
+        Assert.Equal(3, await CountQueueItemsAsync(ct));
+
+        var keys = await ReadDedupeKeysAsync(ct);
+        Assert.Equal(3, keys.Distinct(StringComparer.Ordinal).Count());
     }
 
     /// <summary>两个工作区存在同名任务：task_view 与队列项都按 workspace 隔离。</summary>
@@ -497,6 +576,12 @@ public sealed class SchedulerPipelineTests : IDisposable
         command.CommandText = "SELECT COUNT(*) FROM queue_item;";
         return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken));
     }
+
+    /// <summary>计算文件字节的 SHA-256，用于断言写入前后字节形态是否变化。</summary>
+    /// <param name="path">文件路径。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private static async Task<string> ComputeHashAsync(string path, CancellationToken cancellationToken) =>
+        Convert.ToHexString(SHA256.HashData(await File.ReadAllBytesAsync(path, cancellationToken)));
 
     /// <summary>读取全部 dedupe_key。</summary>
     /// <param name="cancellationToken">取消令牌。</param>
