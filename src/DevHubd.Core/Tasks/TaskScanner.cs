@@ -133,11 +133,11 @@ public sealed class TaskScanner
 
             if (!isNew && string.Equals(row.ApprovalState, "approved", StringComparison.Ordinal))
             {
-                if (row.RerunPending)
+                if (!string.IsNullOrEmpty(row.RerunPendingHash))
                 {
                     // 待审期间登记过再执行需求：审批已落地，作为新需求重新进入 ready（正常情况下
                     // 审批决策已清掉标记，这里兜底处理历史数据）。
-                    row.RerunPending = false;
+                    row.RerunPendingHash = string.Empty;
                     row.ApprovalState = "none";
                     row.Status = "ready";
                 }
@@ -160,13 +160,21 @@ public sealed class TaskScanner
             {
                 // 待审期间状态以库为准；实质变化只登记"决策落地后需再跑一轮"，
                 // 绝不与待审结果并行派发（并行会产生第二个待审结果，审批语义错位）。
+                // 登记的是内容哈希而非布尔量：改回已审内容后哈希一致，决策时不会多跑一轮。
                 if (substantiveChange)
                 {
-                    row.RerunPending = true;
+                    row.RerunPendingHash = document.ContentHash;
                 }
 
                 pendingReviewIds.Add(document.Id);
                 continue;
+            }
+
+            // 结果丢失的残留：approval_state=pending 但已无对应待审结果（例如结果行被清理）。
+            // 不静默改状态：收敛为 none、清掉再执行标记，并落一条可见通知。
+            if (!isNew && string.Equals(row.ApprovalState, "pending", StringComparison.Ordinal))
+            {
+                ReconcileLostPending(db, workspace.Id, row, now);
             }
 
             row.Status = document.Status;
@@ -188,6 +196,13 @@ public sealed class TaskScanner
                 deliveredIds.Contains(row.Id))
             {
                 continue;
+            }
+
+            // 文件已消失但审批态仍停在 pending，且没有待审结果：同样按残留收敛并通知。
+            if (!pendingReviewTaskIds.Contains(row.Id) &&
+                string.Equals(row.ApprovalState, "pending", StringComparison.Ordinal))
+            {
+                ReconcileLostPending(db, workspace.Id, row, now);
             }
 
             row.Status = "missing";
@@ -252,6 +267,31 @@ public sealed class TaskScanner
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
 
         return new TaskScanResult(scanned, accepted.Count, scanned - accepted.Count, markedMissing, problems);
+    }
+
+    /// <summary>
+    /// 收敛"审批态为 pending 但已无对应待审结果"的残留：重置为 none、清除再执行哈希，
+    /// 并落一条用户可见的 notice（kind=failure），避免视图长期卡在待审、后续审批误触发再执行。
+    /// </summary>
+    /// <param name="db">扫描事务内的上下文。</param>
+    /// <param name="workspaceId">工作区 id。</param>
+    /// <param name="row">任务视图行。</param>
+    /// <param name="now">当前时间（ISO-8601）。</param>
+    private static void ReconcileLostPending(DevHubDbContext db, string workspaceId, TaskViewEntity row, string now)
+    {
+        row.ApprovalState = "none";
+        row.RerunPendingHash = string.Empty;
+        row.UpdatedAt = now;
+
+        db.Notices.Add(new NoticeEntity
+        {
+            DedupeKey = $"state:reconcile:{workspaceId}:{row.Id}:{now}",
+            Kind = "failure",
+            TaskId = row.Id,
+            Title = $"任务 {row.Id} 的待审状态已收敛",
+            Body = "approval_state=pending 但不存在对应的待审结果，已重置为 none 并清除再执行标记。",
+            CreatedAt = now,
+        });
     }
 
     /// <summary>

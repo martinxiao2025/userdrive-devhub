@@ -42,8 +42,11 @@ public sealed class TaskViewEntity
     /// <summary>审批状态：none / pending / approved / rejected。</summary>
     public string ApprovalState { get; set; } = "none";
 
-    /// <summary>待审期间发生实质内容变化后登记的"决策落地后需再跑一轮"标记（v6）。</summary>
-    public bool RerunPending { get; set; }
+    /// <summary>
+    /// 待审期间发生实质内容变化后登记的"决策落地后需再跑一轮"所对应的内容哈希（v6；空串表示无）。
+    /// 绑定内容版本而非布尔量，改回已审内容时不会多跑一轮。
+    /// </summary>
+    public string RerunPendingHash { get; set; } = string.Empty;
 
     /// <summary>最近一次被扫描到的时间（ISO-8601）。</summary>
     public string SeenAt { get; set; } = string.Empty;

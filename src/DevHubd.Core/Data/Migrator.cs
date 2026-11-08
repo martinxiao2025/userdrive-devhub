@@ -16,7 +16,7 @@ public static class Migrator
     /// <summary>
     /// 当前 schema 版本。V1 = 9 张表；V2 = attempt.usage_estimated；V3 = attempt.usage_available / rounds_exhausted；
     /// V4 = 旧行 usage_available 回填；V5 = 角色快照、任务角色/依赖/审批列、队列挂起列与问题单表；
-    /// V6 = queue_item.forced（force 派发标记）与 task_view.rerun_pending（待审期间的再执行需求）。
+    /// V6 = queue_item.forced（force 派发标记）与 task_view.rerun_pending（待审期间再执行需求的内容哈希）。
     /// </summary>
     public const int CurrentVersion = 6;
 
@@ -268,13 +268,13 @@ public static class Migrator
     /// 审计里同时有 <c>queue.dispatch_forced</c> 记录，便于追责与统计。
     /// </para>
     /// <para>
-    /// <c>task_view.rerun_pending</c>：1 表示任务在待审期间发生了实质内容变化，
-    /// 已登记"决策落地后还需再跑一轮"的需求；待审期间不会并行派发。
+    /// <c>task_view.rerun_pending</c>：记录"决策落地后还需再跑一轮"所对应的内容哈希（空串表示没有）。
+    /// 绑定内容版本而不是布尔量：待审期间改动后又改回原内容时，哈希与已审内容一致，不应多跑一轮。
     /// </para>
     /// </summary>
     private const string SchemaV6 = """
         ALTER TABLE queue_item ADD COLUMN forced INTEGER NOT NULL DEFAULT 0;
-        ALTER TABLE task_view ADD COLUMN rerun_pending INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE task_view ADD COLUMN rerun_pending TEXT NOT NULL DEFAULT '';
         """;
 
     /// <summary>P0 期望存在的 9 张表（用于启动自检与测试断言）。</summary>

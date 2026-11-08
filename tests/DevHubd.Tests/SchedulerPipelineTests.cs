@@ -456,6 +456,133 @@ public sealed class SchedulerPipelineTests : IDisposable
         Assert.Equal(2, await CountQueueItemsAsync(ct));
     }
 
+    /// <summary>
+    /// auto 交付成功只写审批态、不回写任务文件：同一内容已存在 delivered 结果时不得每 tick 重跑；
+    /// 内容实质变化后允许新一轮。
+    /// </summary>
+    [Fact]
+    public async Task TickAsync_AutoDeliveredSameContent_IsNotRequeuedAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "自动交付任务", "ready", 10);
+
+        await _engine.TickAsync(ct);
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+
+        var queueItemId = (await ReadColumnAsync("SELECT id FROM queue_item;", ct)).Single();
+        await InsertDeliveredResultAsync(queueItemId, "res-1", cancellationToken: ct);
+        await ExecuteAsync("UPDATE queue_item SET status = 'succeeded';", ct);
+
+        await _engine.TickAsync(ct);
+        await _engine.TickAsync(ct);
+
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+
+        // 内容实质变化属于新需求，哈希不同，允许新一轮。
+        WriteTask(root, "T-001", "自动交付任务", "ready", 10, prompt: "新的需求");
+        await _engine.TickAsync(ct);
+
+        Assert.Equal(2, await CountQueueItemsAsync(ct));
+    }
+
+    /// <summary>
+    /// <c>rerun_pending</c> 绑定内容版本：待审期间改了又改回原内容（哈希与被审内容一致）时，
+    /// 审批通过后不应多跑一轮。
+    /// </summary>
+    [Fact]
+    public async Task TickAsync_PendingReviewRevertedContent_DoesNotRerunAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "待审任务", "ready", 10, prompt: "执行该任务");
+
+        await _engine.TickAsync(ct);
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+
+        var queueItemId = (await ReadColumnAsync("SELECT id FROM queue_item;", ct)).Single();
+        await InsertAwaitingResultAsync(queueItemId, "res-1", cancellationToken: ct);
+        await ExecuteAsync("UPDATE queue_item SET status = 'succeeded';", ct);
+
+        // 改成 B，再改回与已审内容完全一致的 A。
+        WriteTask(root, "T-001", "待审任务", "ready", 10, prompt: "临时需求");
+        await _engine.TickAsync(ct);
+        WriteTask(root, "T-001", "待审任务", "ready", 10, prompt: "执行该任务");
+        await _engine.TickAsync(ct);
+
+        var decision = await new ResultDecisionStore(_factory).DecideAsync("res-1", approve: true, "同意", null, ct);
+        Assert.Equal(CoreResultDecisionStatus.Decided, decision.Status);
+
+        await _engine.TickAsync(ct);
+
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+    }
+
+    /// <summary>
+    /// <c>force</c> 必须显式覆盖活跃队列项并写审计，不能静默返回 deduped。
+    /// </summary>
+    [Fact]
+    public async Task DispatchNow_WithForce_OverridesActiveQueueItemAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "活跃任务", "ready", 10);
+
+        await _engine.TickAsync(ct);
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+
+        var dispatcher = new DispatchService(_registry, _queue, _stateStore, new ProviderStateStore(_factory));
+
+        var forced = await dispatcher.DispatchNowAsync(
+            "T-001", "alpha", "auto", dryRun: false, force: true, requestId: null, ct);
+
+        Assert.Equal(DispatchStatus.Enqueued, forced.Status);
+        Assert.Equal(2, await CountQueueItemsAsync(ct));
+        Assert.Equal(
+            1,
+            await CountRowsAsync(
+                "SELECT COUNT(*) FROM audit WHERE action = 'queue.dispatch_forced' AND detail LIKE '%override=active_exists%';",
+                ct));
+        Assert.Equal(1, await CountRowsAsync("SELECT COUNT(*) FROM queue_item WHERE forced = 1;", ct));
+    }
+
+    /// <summary>
+    /// 结果丢失的残留：<c>approval_state=pending</c> 但无待审结果时，扫描收敛为 none、清再执行标记，
+    /// 并落一条可见通知（kind=failure），而不是长期卡在待审。
+    /// </summary>
+    [Fact]
+    public async Task TickAsync_PendingApprovalWithoutResult_IsReconciledWithNoticeAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "残留任务", "ready", 10);
+
+        await _engine.TickAsync(ct);
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+
+        // 模拟结果行丢失：队列项已结束、审批态停在 pending、还留着再执行标记。
+        await ExecuteAsync(
+            "UPDATE task_view SET approval_state = 'pending', rerun_pending = 1 WHERE id = 'T-001';" +
+            "UPDATE queue_item SET status = 'succeeded';",
+            ct);
+
+        await _engine.TickAsync(ct);
+
+        Assert.Equal(
+            new[] { "none" },
+            await ReadColumnAsync("SELECT approval_state FROM task_view WHERE id = 'T-001';", ct));
+        Assert.Equal(
+            new[] { string.Empty },
+            await ReadColumnAsync("SELECT rerun_pending FROM task_view WHERE id = 'T-001';", ct));
+        Assert.Equal(
+            1,
+            await CountRowsAsync("SELECT COUNT(*) FROM notice WHERE kind = 'failure' AND task_id = 'T-001';", ct));
+    }
+
     /// <summary>两个工作区存在同名任务：task_view 与队列项都按 workspace 隔离。</summary>
     [Fact]
     public async Task TickAsync_TwoWorkspaces_WithSameTaskId_StayIsolatedAsync()
@@ -886,6 +1013,34 @@ public sealed class SchedulerPipelineTests : IDisposable
             INSERT INTO result (id, task_id, queue_item_id, provider, outcome, summary, artifacts, created_at, read_at)
             VALUES ($id, $task, $queue, 'openai', 'awaiting_review', '待审', '[]', '2026-01-01T00:00:00Z', NULL);
             UPDATE task_view SET approval_state = 'pending' WHERE workspace_id = $workspace AND id = $task;
+            """;
+        command.Parameters.AddWithValue("$id", resultId);
+        command.Parameters.AddWithValue("$task", taskId);
+        command.Parameters.AddWithValue("$queue", queueItemId);
+        command.Parameters.AddWithValue("$workspace", workspaceId);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    /// <summary>插入一条自动交付结果（auto 交付只写审批态，不回写任务文件）。</summary>
+    /// <param name="queueItemId">队列项 id。</param>
+    /// <param name="resultId">结果 id。</param>
+    /// <param name="taskId">任务 id。</param>
+    /// <param name="workspaceId">工作区 id。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private async Task InsertDeliveredResultAsync(
+        string queueItemId,
+        string resultId,
+        string taskId = "T-001",
+        string workspaceId = "alpha",
+        CancellationToken cancellationToken = default)
+    {
+        using var connection = await _factory.OpenAsync(cancellationToken);
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            INSERT INTO result (id, task_id, queue_item_id, provider, outcome, summary, artifacts, created_at, read_at)
+            VALUES ($id, $task, $queue, 'openai', 'delivered', '已交付', '[]', '2026-01-01T00:00:00Z', NULL);
+            UPDATE task_view SET approval_state = 'none' WHERE workspace_id = $workspace AND id = $task;
             """;
         command.Parameters.AddWithValue("$id", resultId);
         command.Parameters.AddWithValue("$task", taskId);

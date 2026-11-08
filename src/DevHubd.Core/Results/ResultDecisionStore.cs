@@ -46,8 +46,9 @@ public sealed record ResultDecisionOutcome(
 /// 结果审批闸门（U11）：把 <c>awaiting_review</c> 的结果推进到 <c>delivered</c>（通过）或
 /// <c>failed</c>（驳回），并同步 <c>task_view</c> 与任务文件：
 /// 通过 → 任务 <c>done</c>；驳回 → 任务回到 <c>ready</c>（可重新派发）。
-/// 待审期间任务文件发生过实质变化（<c>rerun_pending</c>）时，通过也会回到 <c>ready</c>，
-/// 由下一轮扫描派发新内容，避免审批语义与并行的新待审结果错位。
+/// 待审期间任务文件发生过实质变化（<c>rerun_pending</c> 记录了待再执行的内容哈希）且与被审内容不同，
+/// 通过也会回到 <c>ready</c>，由下一轮扫描派发新内容，避免审批语义与并行的新待审结果错位；
+/// 改动后又改回原内容（哈希一致）则不会多跑一轮。
 /// 两处同时回写，避免"审批态变了、任务状态不动"的半边同步。
 /// </summary>
 public sealed class ResultDecisionStore
@@ -126,21 +127,25 @@ public sealed class ResultDecisionStore
                 $"结果状态为 {entity.Outcome}，只有 awaiting_review 可以审批。");
         }
 
-        var workspaceId = await db.QueueItems
+        var queueItem = await db.QueueItems
             .AsNoTracking()
             .Where(item => item.Id == entity.QueueItemId)
-            .Select(item => item.WorkspaceId)
+            .Select(item => new { item.WorkspaceId, item.TaskHash })
             .FirstOrDefaultAsync(cancellationToken)
             .ConfigureAwait(false);
+        var workspaceId = queueItem?.WorkspaceId;
+        var reviewedHash = queueItem?.TaskHash;
 
         // 任务状态与审批态同事务回写：通过 → done，驳回 → ready（保留可重做），待审不变。
-        // 特例：待审期间任务文件发生过实质变化（rerun_pending），审批通过也不代表新需求已交付，
-        // 因此任务回到 ready 并把审批态重置为 none，由下一轮扫描派发新内容——不在此处并行派发。
+        // 特例：待审期间任务文件发生过实质变化（rerun_pending 记录了待再执行的内容哈希），
+        // 且该哈希与被审内容不同，说明这份新需求尚未交付：审批通过也要回到 ready 并把审批态
+        // 重置为 none，由下一轮扫描派发新内容——不在此处并行派发。
+        // 若登记哈希与被审内容一致（改动后又改回原内容），则无需多跑一轮。
         // 关键顺序：先写任务文件，再提交数据库。文件不可写时整体回滚，绝不产生
         // "库已交付、文件未落"的中间态——否则扫描器下一轮会按文件把已交付任务退回可执行。
         var taskStatus = approve ? "done" : "ready";
         TaskViewEntity? taskView = null;
-        var rerunPending = false;
+        var rerunDue = false;
         if (!string.IsNullOrEmpty(workspaceId))
         {
             taskView = await db.TaskViews
@@ -151,8 +156,9 @@ public sealed class ResultDecisionStore
 
             if (taskView is not null)
             {
-                rerunPending = taskView.RerunPending;
-                taskStatus = approve && !rerunPending ? "done" : "ready";
+                rerunDue = !string.IsNullOrEmpty(taskView.RerunPendingHash) &&
+                           !string.Equals(taskView.RerunPendingHash, reviewedHash, StringComparison.Ordinal);
+                taskStatus = approve && !rerunDue ? "done" : "ready";
 
                 var fileError = await TryWriteTaskFileAsync(taskView, taskStatus, cancellationToken).ConfigureAwait(false);
                 if (fileError is not null)
@@ -168,9 +174,9 @@ public sealed class ResultDecisionStore
                 }
 
                 taskView.ApprovalState = approve
-                    ? (rerunPending ? "none" : "approved")
+                    ? (rerunDue ? "none" : "approved")
                     : "rejected";
-                taskView.RerunPending = false;
+                taskView.RerunPendingHash = string.Empty;
                 taskView.Status = taskStatus;
                 taskView.UpdatedAt = now;
             }

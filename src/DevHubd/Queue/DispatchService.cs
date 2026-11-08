@@ -117,6 +117,7 @@ public sealed class DispatchService : IDispatchService
             "deduped" => DispatchStatus.Deduped,
             "active_exists" => DispatchStatus.ActiveExists,
             "pending_review" => DispatchStatus.PendingReview,
+            "delivered_exists" => DispatchStatus.Deduped,
             "would_enqueue" => DispatchStatus.WouldEnqueue,
             _ => DispatchStatus.Enqueued,
         };

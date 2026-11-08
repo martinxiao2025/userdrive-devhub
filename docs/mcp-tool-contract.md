@@ -137,12 +137,19 @@
 | `workspaceId` | string? | null | 任务 id 跨工作区重名时必须提供 |
 | `provider` | string | `auto` | `auto` / `openai` / `vscode` |
 | `dryRun` | bool | false | 只校验不派发 |
-| `force` | bool | false | 跳过 manual 暂停，并显式覆盖“已有活跃队列项 / 待审结果”的入队闸门（写审计与 `queue_item.forced=1`；quota/auth 等硬暂停不可覆盖） |
+| `force` | bool | false | 跳过 manual 暂停，并显式覆盖“已有活跃队列项 / 待审结果 / 同内容已交付”的入队闸门（写审计与 `queue_item.forced=1`；quota/auth 等硬暂停不可覆盖）。对活跃队列项**真正插入新项**，不会静默返回 `deduped` |
 | `requestId` | string? | null | 幂等键（1–100 字符）；同键重复调用返回首次创建的队列项 |
 
-返回 `{ taskId, workspaceId, status, queueItemId, provider, dryRun }`。
-手动入口与定时派发走同一道闸：同一 `workspaceId` + `taskId` 已有活跃队列项或待审结果时，
-不带 `force` 一律拒绝（待审返回 `RESULT_AWAITING_REVIEW`），不会因内容哈希不同而放行。
+返回 `{ taskId, workspaceId, status, queueItemId, provider, dryRun }`，`status` 取值：
+`pending`（已入队）/ `deduped`（同 `requestId` 或同内容已交付）/ `pending_review`（待审结果存在）/
+`delivered_exists`（同内容已交付）/ `active_exists`（活跃队列项存在）/ `would_enqueue`（dryRun）。
+
+手动入口与定时派发走同一道闸：同一 `workspaceId` + `taskId`
+① 已有活跃队列项、② 已有待审结果（`result.outcome='awaiting_review'`）、
+③ 内容哈希未变且已有 `delivered` 结果（auto 交付不回写任务文件，缺此条会每 tick 重跑），
+命中任一且不带 `force` 一律拒绝；前两项与哈希无关，③ 才比较内容哈希——内容实质变化后允许新一轮。
+待审拒绝返回 `RESULT_AWAITING_REVIEW`；`force=true` 覆盖时按优先级写审计
+`detail=…override=pending_review|delivered_same_content|active_exists|none`。
 需要幂等复用首次派发时使用 `requestId`。
 
 错误码：`UNKNOWN_TASK`、`AMBIGUOUS_TASK`、`TASK_NOT_READY`、`RESULT_AWAITING_REVIEW`、
@@ -245,6 +252,9 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 语义：仅 `awaiting_review` 可审批；通过后结果终态置 `delivered`，`task_view.approval_state` 置 `approved`、
 `task_view.status` 置 `done`，并把任务文件的 `status` 同步写成 `done`，
 同时写 `audit(action='result.approved', actor='mcp')`。
+**例外**：待审期间任务内容发生过实质变化（`task_view.rerun_pending` 记录了与被审队列项 `task_hash`
+不同的内容哈希）时，通过后 `approval_state='none'`、`status='ready'`，由下一轮扫描派发新内容；
+改后又改回原内容（哈希一致）则按正常通过与 `done` 处理，不多跑一轮。
 **写入顺序**：先写任务文件、再提交数据库；任务文件不可写时整个审批回滚，返回
 `TASK_FILE_WRITE_FAILED`（retryable=true），结果仍为 `awaiting_review`、任务状态不变，
 不会产生“库已交付、文件未落”的中间态。
@@ -362,6 +372,42 @@ COUNT(attempt WHERE queue_item_id = ?
 
 ## 6. 变更记录
 
+### 第四轮核验修正（schema 仍 v6）— 2026-11-09
+
+- **auto 交付不再每 tick 重跑（严重回归）**：`delivery=auto` 成功只写 `approval_state='none'`，
+  不回写任务文件与 `task_view.status`，扫描器把 `ready` 写回后下一 tick 又入队。闸门新增第三条：
+  同一 `workspace_id` + `task_id`，当前内容哈希未变且已存在 `outcome='delivered'` 结果时不派发
+  （自动路径计入 `deduped`，手动路径返回 `status='delivered_exists'`）。内容哈希只用于判定
+  “这份内容是否已交付过”，不参与活跃/待审判断；内容实质变化后允许新一轮。
+- **`force` 对活跃队列项生效**：手动入口原先在闸门之前先查最新队列项、命中即 `deduped`，
+  `force` 分支走不到。现改为活跃项早返回加 `!force` 条件；`force=true` 继续插入新队列项，
+  写 `queue_item.forced=1` 与 `audit.action='queue.dispatch_forced'`（`detail` 带 `override=`）。
+  不再出现“调用方以为覆盖成功、实际队列未变”的静默 `deduped`。
+- **`rerun_pending` 绑定内容版本**：`task_view.rerun_pending` 由 `INTEGER`（布尔量）改为
+  `TEXT NOT NULL DEFAULT ''`，存待再执行内容的内容哈希。决策时与该待审队列项的 `task_hash`
+  比较：不同才认为有新需求（审批通过也回 `ready`）；改后又改回原内容（哈希一致）不多跑一轮。
+  列名不变，`DevHubDbContext` 映射为 `RerunPendingHash`。
+- **待审残留收敛（可见通知）**：扫描发现 `approval_state='pending'` 但不存在对应
+  `awaiting_review` 结果时，重置为 `none`、清空 `rerun_pending`，并写入
+  `notice.kind='failure'`（标题“任务 … 的待审状态已收敛”，去重键 `state:reconcile:<workspace>:<task>:<at>`）。
+  覆盖“任务文件缺失”和“文件仍在”两条扫描分支，不再静默停留在永久待审。
+- **dead 退避没有时间维度**：`dead` 退避只按“最新队列项为 `dead` 且内容哈希一致”判断，
+  不设冷却时间，因此同样内容不会自动重试；解除方式只有内容实质变化或 `force=true`
+  （`dispatch_now` 覆盖并写审计）。这是有意设计，不是漏实现。
+- **`acceptance` 没有独立字段**：验收条件由 `prompt` 承载。`task.schema.json` 是
+  `additionalProperties=false`，擅自增加 `acceptance` 等未知字段会导致任务解析失败、视图变 `missing`；
+  该说明已写入 schema 的 `prompt.description`。
+- **schema v6 迁移用真实旧库验证**：取现存 v2 库副本（`task_view`/`queue_item`/`result`/`notice`
+  各 5 行、`audit` 1 行、`attempt` 6 行）直接迁移到 v6，结果：`user_version=6`；六张表行数
+  保持 5/5/5/1/5/6 不变；新增列类型为 `queue_item.forced INTEGER NOT NULL DEFAULT 0`、
+  `task_view.rerun_pending TEXT NOT NULL DEFAULT ''`，存量行取值为 `0` 与 `''`；
+  `PRAGMA integrity_check=ok`；`PRAGMA foreign_key_check` 无违规（0 行）。启动日志输出
+  `数据库就绪（schema v6）`。
+- 测试（同一批用例在修复前全部失败，见提交说明）：`TickAsync_AutoDeliveredSameContent_IsNotRequeuedAsync`、
+  `TickAsync_PendingApprovalWithoutResult_IsReconciledWithNoticeAsync`、
+  `TickAsync_PendingReviewRevertedContent_DoesNotRerunAsync`、
+  `DispatchNow_WithForce_OverridesActiveQueueItemAsync`。
+
 ### 入队闸门改按工作区事实判定（schema v6）— 2026-11-09
 
 - **闸门判据**：同一 `workspace_id` + `task_id` 同一时刻只允许存在一个活跃队列项
@@ -377,9 +423,10 @@ COUNT(attempt WHERE queue_item_id = ?
   `prompt` 承载）、`delivery`、`requiresApproval`、`dependsOn`；`writeScope` 与 `dependsOn`
   按集合比较（换序不算变化）。`source`、`title`、`priority`、`status` 以及 JSON 缩进/键序
   不参与比较（`task.schema.json` 已写明 `source` 不参与调度）。
-- **待审期间的实质变化**：只写 `task_view.rerun_pending=1` 登记再执行需求，不与待审结果
+- **待审期间的实质变化**：只写 `task_view.rerun_pending` 登记再执行需求，不与待审结果
   并行派发、不产生第二个待审结果；审批决策落地时清除标记（通过 → `ready` 且
   `approval_state='none'`，驳回 → `ready`），由下一轮扫描派发新内容。
+  （2026-11-09 第四轮把该列从布尔量改为内容哈希，见下条。）
 - **失败退避**：任务最新队列项为 `dead` 且 `task_hash` 与当前内容一致时退避，不再每 tick
   新建队列项并重置 attempt 预算；内容实质变化或 `force` 可重新派发。
 - **schema v6**：新增 `queue_item.forced`、`task_view.rerun_pending`。

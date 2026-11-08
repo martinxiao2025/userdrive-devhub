@@ -40,7 +40,8 @@
     },
     "prompt": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "description": "任务需求与验收条件都写在这里；没有独立的 acceptance 字段。additionalProperties=false，擅自增加 acceptance 等未知字段会导致任务解析失败、视图变成 missing"
     },
     "role": {
       "type": "string",

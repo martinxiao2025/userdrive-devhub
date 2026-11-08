@@ -59,7 +59,7 @@ public sealed record EnqueueResult(int Enqueued, int Deduped, int SkippedActive,
 /// <param name="Enqueued">true 表示本次确实写入了队列项。</param>
 /// <param name="Deduped">true 表示命中去重或已有未结束的同类队列项。</param>
 /// <param name="QueueItemId">关联的队列项 id；仅在已存在或已写入时非 null。</param>
-/// <param name="Status">pending / deduped / active_exists / would_enqueue。</param>
+/// <param name="Status">pending / deduped / pending_review / delivered_exists / active_exists / would_enqueue。</param>
 /// <param name="Provider">该队列项真实使用的 provider；dryRun 时为本次将要使用的 provider。</param>
 public sealed record ManualEnqueueResult(
     bool Enqueued,

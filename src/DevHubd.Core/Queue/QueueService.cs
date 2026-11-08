@@ -112,6 +112,24 @@ public sealed class QueueService
                 .ConfigureAwait(false))
             .ToHashSet(StringComparer.Ordinal);
 
+        // 已交付过的内容：auto 交付成功只写 approval_state，不回写任务文件与 task_view.status，
+        // 扫描器会把 ready 写回。若只拦"活跃/待审"而不认"这份内容已交付"，同一内容会每 tick 重复执行。
+        // 哈希在这里只回答"这份内容是否已交付过"，不参与活跃/待审判断；内容实质变化后哈希不同，自然放行。
+        var deliveredPairs = (await db.Results
+                .AsNoTracking()
+                .Where(result => result.Outcome == "delivered")
+                .Join(
+                    db.QueueItems.AsNoTracking(),
+                    result => result.QueueItemId,
+                    item => item.Id,
+                    (result, item) => new { item.WorkspaceId, result.TaskId, item.TaskHash })
+                .Where(entry => entry.WorkspaceId == workspaceId)
+                .Select(entry => new { entry.TaskId, entry.TaskHash })
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false))
+            .Select(entry => (entry.TaskId, entry.TaskHash))
+            .ToHashSet();
+
         // 驳回次数取审计（result.rejected）里的持久计数：被驳回的结果 outcome 会变成 failed，
         // 与传输失败产生的 failed 结果无法区分，因此不能直接数 result.outcome。
         var rejectedCounts = await LoadRejectedCountsAsync(db, cancellationToken).ConfigureAwait(false);
@@ -165,6 +183,14 @@ public sealed class QueueService
             // 同一 workspace + task 已有待审结果：不派发（待审期间的实质变化由扫描器登记 rerun_pending，
             // 决策落地后才进入下一轮），也绝不与待审结果并行。
             if (pendingReviewTaskIds.Contains(task.Id))
+            {
+                deduped++;
+                continue;
+            }
+
+            // 同一 workspace + task 且内容哈希未变、已存在 delivered 结果：这份内容已经交付过，
+            // 不再重复入队（auto 交付不回写任务文件，仅靠活跃/待审闸门会每 tick 重跑）。
+            if (deliveredPairs.Contains((task.Id, task.ContentHash)))
             {
                 deduped++;
                 continue;
@@ -262,7 +288,10 @@ public sealed class QueueService
                 .FirstOrDefaultAsync(cancellationToken)
                 .ConfigureAwait(false);
 
-            if (latest is not null &&
+            // force 是显式覆盖：即使已有活跃项也继续走后面的 forced 分支（写审计与标记），
+            // 不能静默返回 deduped——否则调用方以为覆盖成功、实际没有新队列项。
+            if (!force &&
+                latest is not null &&
                 latest.Status is "pending" or "claimed" or "running")
             {
                 return new ManualEnqueueResult(false, true, latest.Id, "deduped", latest.PreferredProvider);
@@ -313,6 +342,28 @@ public sealed class QueueService
         if (hasPendingReview && !force)
         {
             return new ManualEnqueueResult(false, true, null, "pending_review", null);
+        }
+
+        // 与自动派发一致：同一任务、内容哈希未变且已有 delivered 结果时默认拒绝，避免重复执行；
+        // force 可显式覆盖（会写审计与 forced 标记）。
+        var hasDeliveredSameContent = await db.Results
+            .AsNoTracking()
+            .Where(result => result.Outcome == "delivered")
+            .Join(
+                db.QueueItems.AsNoTracking(),
+                result => result.QueueItemId,
+                item => item.Id,
+                (result, item) => new { item.WorkspaceId, result.TaskId, item.TaskHash })
+            .AnyAsync(
+                entry => entry.WorkspaceId == workspaceId &&
+                         entry.TaskId == task.Id &&
+                         entry.TaskHash == task.ContentHash,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        if (hasDeliveredSameContent && !force)
+        {
+            return new ManualEnqueueResult(false, true, null, "delivered_exists", null);
         }
 
         var active = await db.QueueItems
@@ -374,9 +425,11 @@ public sealed class QueueService
                 Provider = provider,
                 Detail = hasPendingReview
                     ? $"workspace={workspaceId};task={task.Id};override=pending_review"
-                    : active is not null
-                        ? $"workspace={workspaceId};task={task.Id};override=active_exists"
-                        : $"workspace={workspaceId};task={task.Id};override=none",
+                    : hasDeliveredSameContent
+                        ? $"workspace={workspaceId};task={task.Id};override=delivered_same_content"
+                        : active is not null
+                            ? $"workspace={workspaceId};task={task.Id};override=active_exists"
+                            : $"workspace={workspaceId};task={task.Id};override=none",
             });
         }
         try
