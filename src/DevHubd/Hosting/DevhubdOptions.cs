@@ -1,8 +1,9 @@
 namespace DevHubd.Hosting;
 
 /// <summary>
-/// 启动选项：端口固定 3091（可用 <c>--port</c> 覆盖），数据目录默认 %LOCALAPPDATA%\userdrive-devhub，
-/// 交付档位默认 <c>dispatch_only</c>（需 <c>--allow-auto-delivery</c> 显式解锁）。
+/// 启动选项：端口固定 3091（可用 <c>--port</c> 覆盖），数据目录默认 %LOCALAPPDATA%\userdrive-devhub。
+/// 交付档位由用户配置的 <c>Execution:DeliveryMode</c> 决定；<c>--allow-auto-delivery</c>
+/// 只用于解锁 <c>scheduler_control set_mode auto</c>，不参与上报。
 /// </summary>
 public sealed class DevHubdOptions
 {
@@ -18,7 +19,10 @@ public sealed class DevHubdOptions
     /// <summary>自定义数据目录；null 表示默认目录。</summary>
     public string? DataDirectory { get; private init; }
 
-    /// <summary>是否显式解锁 <c>auto</c> 交付档位。</summary>
+    /// <summary>
+    /// 是否显式解锁 <c>auto</c> 交付档位；仅作为 <c>scheduler_control set_mode</c> 的闸门，
+    /// 不参与上报（实际档位以 <c>Execution:DeliveryMode</c> 为准）。
+    /// </summary>
     public bool AllowAutoDelivery { get; private init; }
 
     /// <summary>默认扫描间隔（秒）；数据库中的 <c>scheduler_state.interval_seconds</c> 优先。</summary>
@@ -29,9 +33,6 @@ public sealed class DevHubdOptions
     /// 用于"只保留 MCP 观测、不自动派发"的运维场景。
     /// </summary>
     public bool SchedulerEnabled { get; private init; } = true;
-
-    /// <summary>实际生效的交付档位。</summary>
-    public string DeliveryMode => AllowAutoDelivery ? "auto" : "dispatch_only";
 
     /// <summary>
     /// 解析命令行与环境变量。<c>--port</c>/<c>--data-dir</c>/<c>--interval</c>/<c>--allow-auto-delivery</c>；

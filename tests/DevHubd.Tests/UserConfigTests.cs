@@ -39,11 +39,78 @@ public sealed class UserConfigTests : IDisposable
     [Fact]
     public void Load_MissingFile_ReturnsDefaults()
     {
-        var config = DevHubUserConfig.Load(Path.Combine(_directory, "missing.json"));
+        WithClearedEnvironment(
+            new[]
+            {
+                "DEVHUB__Model__OpenAi__BaseUrl",
+                "DEVHUB__Model__OpenAi__Model",
+                "DEVHUB__Model__OpenAi__ApiKeyEnvironmentVariable",
+            },
+            () =>
+            {
+                var config = DevHubUserConfig.Load(Path.Combine(_directory, "missing.json"));
 
-        Assert.Empty(config.Problems);
-        Assert.Equal("https://api.openai.com/v1", config.OpenAi.BaseUrl);
-        Assert.Equal("DEVHUB_OPENAI_API_KEY", config.OpenAi.ApiKeyEnvironmentVariable);
+                Assert.Empty(config.Problems);
+                Assert.Equal("https://api.openai.com/v1", config.OpenAi.BaseUrl);
+                Assert.Equal("DEVHUB_OPENAI_API_KEY", config.OpenAi.ApiKeyEnvironmentVariable);
+            });
+    }
+
+    /// <summary>文件缺失时 DEVHUB__... 环境变量覆盖仍然生效（配置层叠不依赖文件存在）。</summary>
+    [Fact]
+    public void Load_MissingFile_StillAppliesEnvironmentOverrides()
+    {
+        const string name = "DEVHUB__Model__OpenAi__RequestTimeoutSeconds";
+        WithEnvironment(name, "77", () =>
+        {
+            var config = DevHubUserConfig.Load(Path.Combine(_directory, "missing.json"));
+
+            Assert.Equal(77, config.OpenAi.RequestTimeoutSeconds);
+        });
+    }
+
+    /// <summary>在清除指定环境变量的状态下执行断言，结束后恢复原值。</summary>
+    /// <param name="names">环境变量名。</param>
+    /// <param name="assertion">断言逻辑。</param>
+    private static void WithClearedEnvironment(string[] names, Action assertion)
+    {
+        var saved = names
+            .Select(name => (Name: name, Value: Environment.GetEnvironmentVariable(name)))
+            .ToArray();
+        try
+        {
+            foreach (var name in names)
+            {
+                Environment.SetEnvironmentVariable(name, null);
+            }
+
+            assertion();
+        }
+        finally
+        {
+            foreach (var (name, value) in saved)
+            {
+                Environment.SetEnvironmentVariable(name, value);
+            }
+        }
+    }
+
+    /// <summary>在设置指定环境变量的状态下执行断言，结束后恢复原值。</summary>
+    /// <param name="name">环境变量名。</param>
+    /// <param name="value">临时值。</param>
+    /// <param name="assertion">断言逻辑。</param>
+    private static void WithEnvironment(string name, string value, Action assertion)
+    {
+        var saved = Environment.GetEnvironmentVariable(name);
+        try
+        {
+            Environment.SetEnvironmentVariable(name, value);
+            assertion();
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(name, saved);
+        }
     }
 
     /// <summary>camelCase 配置文件按 <c>Model:OpenAi</c> / <c>Execution</c> 键绑定。</summary>

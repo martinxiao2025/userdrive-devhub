@@ -55,6 +55,20 @@ public sealed class P3ControlTests : IAsyncLifetime
         return ValueTask.CompletedTask;
     }
 
+    /// <summary>上报的 deliveryMode 必须等于实际执行配置，而不是命令行解锁标记。</summary>
+    [Fact]
+    public async Task Limits_DeliveryMode_MatchesExecutionConfigAsync()
+    {
+        var options = DevHubdOptions.FromArgsAndEnvironment(Array.Empty<string>());
+        Assert.False(options.AllowAutoDelivery);
+
+        var execution = new ExecutionOptions { DeliveryMode = "auto" }.Normalize();
+        var limits = await new DevHubd.Endpoints.LimitsSource(execution, options)
+            .GetAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal("auto", limits.Mode);
+    }
+
     /// <summary>未解锁 auto 时 set_mode auto 返回 MODE_LOCKED，且数据库档位不变。</summary>
     [Fact]
     public async Task SetMode_AutoWithoutUnlock_ReturnsModeLockedAsync()

@@ -18,9 +18,15 @@ public static class RuntimeFileWriter
     /// </summary>
     /// <param name="paths">运行时路径。</param>
     /// <param name="options">启动选项。</param>
+    /// <param name="deliveryMode">实际生效的交付档位（来自用户配置，而不是命令行解锁标记）。</param>
     /// <param name="startedAt">进程启动时间。</param>
     /// <param name="apiToken">内部 API 令牌。</param>
-    public static void Write(DevHubPaths paths, DevHubdOptions options, DateTimeOffset startedAt, string apiToken)
+    public static void Write(
+        DevHubPaths paths,
+        DevHubdOptions options,
+        string deliveryMode,
+        DateTimeOffset startedAt,
+        string apiToken)
     {
         var payload = JsonSerializer.Serialize(new
         {
@@ -32,7 +38,7 @@ public static class RuntimeFileWriter
             token = apiToken,
             startedAt = startedAt.ToString("O"),
             version = typeof(RuntimeFileWriter).Assembly.GetName().Version?.ToString(3) ?? "0.1.0",
-            deliveryMode = options.DeliveryMode,
+            deliveryMode = deliveryMode,
             dataDirectory = paths.DataDirectory,
         }, new JsonSerializerOptions { WriteIndented = true });
 

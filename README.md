@@ -117,7 +117,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -A
 3. **环境变量 `DEVHUB__...`（双下划线）**：后加载，覆盖第 2 步 JSON 中的同名键。
 4. **API key 只从环境变量读取**：配置文件出现 `apiKey` / `openAiApiKey` / `api_key` 非空字符串会被忽略并记 Warning，key 不落盘、不进日志。
 5. **改完必须重启守护进程**：配置在启动时读取一次（`reloadOnChange=false`），key 也来自进程启动时继承的环境块。
-6. 注意：`config.json` 不存在时宿主直接使用内置默认值，`DEVHUB__...` 覆盖也不会被加载；先确保该文件存在（内容至少是 `{}`）。
+6. 注意：`config.json` 是可选的。文件不存在时宿主仍会读取 `DEVHUB__...` 环境变量覆盖；文件存在但内容损坏时回退内置默认值并记录 Warning。
 
 #### 2.4.3 设置示例（可直接复制）
 

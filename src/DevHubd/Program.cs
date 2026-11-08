@@ -62,12 +62,21 @@ internal static class Program
         }
 
         var paths = new DevHubPaths(options.DataDirectory);
+
+        // 用户级配置要在启动日志之前加载：日志与 runtime.json 里的 deliveryMode
+        // 必须是真正生效的配置值，而不是命令行解锁标记派生的值。
+        var userConfig = DevHubUserConfig.Load(paths.UserConfigPath);
+        foreach (var problem in userConfig.Problems)
+        {
+            DevHubLog.UserConfigProblem(logger, problem);
+        }
+
         DevHubLog.Starting(
             logger,
             version,
             Environment.ProcessId,
             BuildMcpUrl(options),
-            options.DeliveryMode,
+            userConfig.Execution.DeliveryMode,
             paths.DataDirectory);
 
         using var guard = new SingleInstanceGuard(loggerFactory.CreateLogger<SingleInstanceGuard>());
@@ -115,14 +124,7 @@ internal static class Program
 
         DevHubLog.DatabaseReady(logger, paths.DatabasePath, schemaVersion);
 
-        // P2：用户级配置（baseUrl / model / 执行参数）与执行器依赖。
-        // API key 只从环境变量读取；配置文件里的 apiKey 明文字段会被拒绝并记录 Warning。
-        var userConfig = DevHubUserConfig.Load(paths.UserConfigPath);
-        foreach (var problem in userConfig.Problems)
-        {
-            DevHubLog.UserConfigProblem(logger, problem);
-        }
-
+        // P2：用户级配置已在启动日志之前加载完成，这里只做执行器依赖装配。
         var apiKeys = new EnvironmentApiKeyProvider(userConfig.OpenAi.ApiKeyEnvironmentVariable);
         DevHubLog.ExecutionConfigured(
             logger,
@@ -218,7 +220,12 @@ internal static class Program
 
             try
             {
-                RuntimeFileWriter.Write(paths, options, startedAt, apiToken);
+                RuntimeFileWriter.Write(
+                    paths,
+                    options,
+                    userConfig.Execution.DeliveryMode,
+                    startedAt,
+                    apiToken);
                 DevHubLog.RuntimeFileWritten(logger, paths.RuntimeFilePath);
             }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)

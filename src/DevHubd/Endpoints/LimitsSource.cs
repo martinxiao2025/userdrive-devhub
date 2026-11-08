@@ -29,7 +29,8 @@ public sealed class LimitsSource : ILimitsSource
     {
         var budget = _execution.ToBudget();
         var limits = new LimitsResult(
-            _options.DeliveryMode,
+            // 上报实际生效的执行档位，而不是命令行解锁标记，避免观测值与行为不一致。
+            _execution.DeliveryMode,
             _options.SchedulerEnabled,
             _execution.MaxParallel,
             (int)budget.MaxDuration.TotalSeconds,

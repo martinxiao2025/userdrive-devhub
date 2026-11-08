@@ -32,11 +32,8 @@ public sealed record DevHubUserConfig(
     {
         var problems = new List<string>();
 
-        if (!File.Exists(filePath))
-        {
-            return Defaults;
-        }
-
+        // 配置文件可选：不存在时仍要读取 DEVHUB__... 环境变量覆盖，
+        // 否则配置层叠语义会取决于文件是否存在（与 .NET Configuration 的通行做法相反）。
         OpenAiModelOptions openAi;
         ExecutionOptions execution;
         try
