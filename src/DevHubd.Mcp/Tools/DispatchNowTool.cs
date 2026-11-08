@@ -39,7 +39,7 @@ public sealed class DispatchNowTool
         [Description("可选：工作区 id；同名任务存在于多个工作区时必须指定。")] string? workspaceId = null,
         [Description("首选 provider：" + ToolVocabulary.Providers + "（auto 为默认，按可用性选择）。")] string provider = "auto",
         [Description("true 时只判定不写入。")] bool dryRun = false,
-        [Description("true 时跳过 manual 暂停，并覆盖「已有活跃队列项 / 待审结果」的入队闸门（会写审计）；quota/auth 等硬暂停不可覆盖。")] bool force = false,
+        [Description("true 时跳过 manual 暂停，并覆盖「已有活跃队列项 / 待审结果 / 同内容已交付」的入队闸门（会写审计）；quota/auth 等硬暂停不可覆盖。")] bool force = false,
         [Description("可选幂等键（1–100 字符）：同一键重复调用返回首次创建的队列项。")] string? requestId = null,
         CancellationToken cancellationToken = default)
     {
@@ -64,12 +64,13 @@ public sealed class DispatchNowTool
             case DispatchStatus.Enqueued:
             case DispatchStatus.Deduped:
             case DispatchStatus.ActiveExists:
+            case DispatchStatus.DeliveredExists:
             case DispatchStatus.WouldEnqueue:
             {
                 var result = new DispatchNowResult(
                     taskId,
                     outcome.WorkspaceId,
-                    outcome.Status.ToString().ToLowerInvariant(),
+                    DispatchStatusText.ToText(outcome.Status),
                     outcome.QueueItemId,
                     outcome.Provider,
                     dryRun);

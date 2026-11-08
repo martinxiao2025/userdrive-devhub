@@ -184,6 +184,37 @@ public sealed class ResultDecisionStore
 
         entity.Outcome = target;
 
+        // 决策落地后，同任务其余非终态队列项不再有意义：典型来源是 force 覆盖活跃项造出的并行项。
+        // 不取消的话，任务已 done 仍会再跑同一内容并产出第二个结果；ClaimAsync 另有 done/cancelled 闸门兜底。
+        var cancelledCount = 0;
+        if (!string.IsNullOrEmpty(workspaceId))
+        {
+            cancelledCount = await db.Database.ExecuteSqlRawAsync(
+                """
+                UPDATE queue_item
+                SET status = 'cancelled',
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    last_error_code = {0},
+                    last_error = {1},
+                    updated_at = {2}
+                WHERE workspace_id = {3}
+                  AND task_id = {4}
+                  AND id <> {5}
+                  AND status IN ('pending', 'claimed', 'running');
+                """,
+                new object[]
+                {
+                    DevHubErrorCodes.SupersededByDecision,
+                    "审批已落地，同任务的其它非终态队列项被取消。",
+                    now,
+                    workspaceId,
+                    entity.TaskId,
+                    entity.QueueItemId,
+                },
+                cancellationToken).ConfigureAwait(false);
+        }
+
         db.Audits.Add(new AuditEntity
         {
             At = now,
@@ -193,6 +224,18 @@ public sealed class ResultDecisionStore
             Provider = entity.Provider,
             Detail = $"outcome={target} comment={Truncate(comment, 200)}",
         });
+
+        if (cancelledCount > 0)
+        {
+            db.Audits.Add(new AuditEntity
+            {
+                At = now,
+                Actor = string.IsNullOrWhiteSpace(actor) ? "mcp" : actor.Trim(),
+                Action = "queue.superseded",
+                Subject = entity.TaskId,
+                Detail = $"cancelled={cancelledCount} resultId={entity.Id}",
+            });
+        }
 
         await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
 

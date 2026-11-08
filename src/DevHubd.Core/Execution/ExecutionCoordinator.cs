@@ -517,6 +517,15 @@ public sealed class ExecutionCoordinator
                     now,
                     cancellationToken).ConfigureAwait(false);
 
+                // 凡是产出 awaiting_review 结果，任务视图必须同步待审态：
+                // 否则视图看不到待审、闸门却拦住重派，任务会卡在无人可见的状态。
+                await _store.SetApprovalStateAsync(
+                    item.WorkspaceId,
+                    item.TaskId,
+                    "pending",
+                    now,
+                    cancellationToken).ConfigureAwait(false);
+
                 await _store.InsertNoticeAsync(
                     $"failure:{item.Id}:{error.Code}:{item.Attempt}",
                     "failure",

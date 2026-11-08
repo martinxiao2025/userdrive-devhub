@@ -1,10 +1,11 @@
 using DevHubd.Core.Data;
+using Microsoft.Data.Sqlite;
 using Xunit;
 
 namespace DevHubd.Tests;
 
 /// <summary>
-/// 迁移骨架测试：版本、9 张表、关键索引、单例行与幂等性。
+/// 迁移骨架测试：版本、期望表、关键索引、单例行与幂等性。
 /// xUnit v3 起所有异步调用传入 <see cref="TestContext.Current"/> 的取消令牌，以便测试超时能被及时打断。
 /// </summary>
 public sealed class MigratorTests : IDisposable
@@ -31,7 +32,7 @@ public sealed class MigratorTests : IDisposable
         }
     }
 
-    /// <summary>迁移后版本为 1，且 9 张表全部存在。</summary>
+    /// <summary>迁移后版本为最新，且期望表全部存在。</summary>
     [Fact]
     public async Task Migrate_CreatesAllExpectedTablesAsync()
     {
@@ -82,7 +83,6 @@ public sealed class MigratorTests : IDisposable
         Assert.Contains("idx_queue_ready", indexes);
         Assert.Contains("idx_queue_task", indexes);
         Assert.Contains("idx_result_unread", indexes);
-        Assert.Contains("idx_scope_expiry", indexes);
         Assert.Contains("idx_audit_at", indexes);
     }
 
@@ -236,6 +236,131 @@ public sealed class MigratorTests : IDisposable
         Assert.Equal("none", reader.GetString(1));
     }
 
+    /// <summary>
+    /// V7 必须把"旧 v6 把 rerun_pending 建成了 INTEGER"的完整库重建为 TEXT，并把历史布尔值归一化为空串：
+    /// 历史值 <c>1</c> 无法还原对应内容哈希，保留会被误读成哈希导致审批后多跑一轮。
+    /// 同时验证行数、其它列与外键完整性不受重建影响，未使用的 scope_lock 被删除。
+    /// </summary>
+    [Fact]
+    public async Task Migrate_V7_RebuildsLegacyV6RerunPendingAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var factory = new SqliteConnectionFactory(Path.Combine(_directory, "devhub.db"));
+
+        using (var connection = await factory.OpenAsync(ct))
+        {
+            using var seed = connection.CreateCommand();
+            seed.CommandText = """
+                CREATE TABLE task_view (
+                  workspace_id   TEXT NOT NULL,
+                  id             TEXT NOT NULL,
+                  source_path    TEXT NOT NULL,
+                  content_hash   TEXT NOT NULL,
+                  title          TEXT NOT NULL,
+                  status         TEXT NOT NULL CHECK (status IN ('ready','blocked','done','cancelled','missing')),
+                  priority       INTEGER NOT NULL,
+                  write_scope    TEXT NOT NULL,
+                  payload        TEXT NOT NULL,
+                  seen_at        TEXT NOT NULL,
+                  updated_at     TEXT NOT NULL,
+                  role_id        TEXT NOT NULL DEFAULT 'implementer',
+                  depends_on     TEXT,
+                  approval_state TEXT NOT NULL DEFAULT 'none'
+                    CHECK (approval_state IN ('none','pending','approved','rejected')),
+                  rerun_pending  INTEGER NOT NULL DEFAULT 0,
+                  PRIMARY KEY (workspace_id, id)
+                );
+                CREATE INDEX idx_task_view_status ON task_view(workspace_id, status);
+                CREATE TABLE scope_lock (
+                  workspace_id TEXT NOT NULL,
+                  scope        TEXT NOT NULL,
+                  owner_id     TEXT NOT NULL,
+                  acquired_at  TEXT NOT NULL,
+                  expires_at   TEXT NOT NULL,
+                  PRIMARY KEY (workspace_id, scope)
+                );
+                INSERT INTO task_view
+                  (workspace_id, id, source_path, content_hash, title, status, priority, write_scope,
+                   payload, seen_at, updated_at, role_id, depends_on, approval_state, rerun_pending)
+                VALUES
+                  ('alpha', 'T-001', '.devhub/tasks/T-001.json', 'h1', '待审任务', 'ready', 10, '["src"]',
+                   '{"id":"T-001"}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'implementer', '["T-000"]', 'pending', 1),
+                  ('alpha', 'T-002', '.devhub/tasks/T-002.json', 'h2', '已交付任务', 'done', 5, '[]',
+                   '{"id":"T-002"}', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z', 'reviewer', NULL, 'approved', 0);
+                PRAGMA user_version = 6;
+                """;
+            await seed.ExecuteNonQueryAsync(ct);
+        }
+
+        Assert.Equal(Migrator.CurrentVersion, await Migrator.MigrateAsync(factory, ct));
+
+        using var verify = await factory.OpenAsync(ct);
+        using (var type = verify.CreateCommand())
+        {
+            type.CommandText = "SELECT type FROM pragma_table_info('task_view') WHERE name = 'rerun_pending';";
+            Assert.Equal("TEXT", Convert.ToString(await type.ExecuteScalarAsync(ct)));
+        }
+
+        using (var rows = verify.CreateCommand())
+        {
+            rows.CommandText = "SELECT id, status, approval_state, role_id, depends_on, rerun_pending FROM task_view ORDER BY id;";
+            using var reader = await rows.ExecuteReaderAsync(ct);
+            Assert.True(await reader.ReadAsync(ct));
+            Assert.Equal("T-001", reader.GetString(0));
+            Assert.Equal("ready", reader.GetString(1));
+            Assert.Equal("pending", reader.GetString(2));
+            Assert.Equal("implementer", reader.GetString(3));
+            Assert.Equal("[\"T-000\"]", reader.GetString(4));
+            Assert.Equal(string.Empty, reader.GetString(5));
+
+            Assert.True(await reader.ReadAsync(ct));
+            Assert.Equal("T-002", reader.GetString(0));
+            Assert.Equal("done", reader.GetString(1));
+            Assert.Equal("approved", reader.GetString(2));
+            Assert.Equal("reviewer", reader.GetString(3));
+            Assert.True(reader.IsDBNull(4));
+            Assert.Equal(string.Empty, reader.GetString(5));
+        }
+
+        Assert.Equal(2L, await ScalarLongAsync(verify, "SELECT COUNT(*) FROM task_view;", ct));
+        Assert.Equal("ok", Convert.ToString(await ScalarAsync(verify, "PRAGMA integrity_check;", ct)));
+        Assert.Null(await ScalarAsync(verify, "PRAGMA foreign_key_check;", ct));
+
+        var tables = await Migrator.GetTableNamesAsync(verify, ct);
+        Assert.DoesNotContain("scope_lock", tables);
+        Assert.Contains("task_view", tables);
+    }
+
+    /// <summary>
+    /// V7 对极简自建库（无 source_path 等完整列）只做值归一化，不尝试重建表：
+    /// 历史 <c>1</c> 归一化为空串，其它列结构保持不变。
+    /// </summary>
+    [Fact]
+    public async Task Migrate_V7_NormalizesMinimalLegacyV6Async()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var factory = new SqliteConnectionFactory(Path.Combine(_directory, "devhub.db"));
+
+        using (var connection = await factory.OpenAsync(ct))
+        {
+            using var seed = connection.CreateCommand();
+            seed.CommandText = """
+                CREATE TABLE task_view (workspace_id TEXT, id TEXT, rerun_pending INTEGER NOT NULL DEFAULT 0);
+                INSERT INTO task_view (workspace_id, id, rerun_pending) VALUES ('ws', 'T1', 1);
+                INSERT INTO task_view (workspace_id, id, rerun_pending) VALUES ('ws', 'T2', 0);
+                PRAGMA user_version = 6;
+                """;
+            await seed.ExecuteNonQueryAsync(ct);
+        }
+
+        Assert.Equal(Migrator.CurrentVersion, await Migrator.MigrateAsync(factory, ct));
+
+        using var verify = await factory.OpenAsync(ct);
+        using var command = verify.CreateCommand();
+        command.CommandText = "SELECT DISTINCT rerun_pending FROM task_view;";
+        Assert.Equal(string.Empty, Convert.ToString(await command.ExecuteScalarAsync(ct)));
+    }
+
     /// <summary>已有 V1 库升级时必须逐级补 V2/V3/V4，不重建表，并保持 user_version 递增。</summary>
     [Fact]
     public async Task Migrate_FromV1_UpgradesToLatestAsync()
@@ -262,6 +387,24 @@ public sealed class MigratorTests : IDisposable
         Assert.True(await HasColumnAsync(factory, "attempt", "usage_available", ct));
         Assert.True(await HasColumnAsync(factory, "attempt", "rounds_exhausted", ct));
     }
+
+    /// <summary>在已打开的连接上执行标量查询。</summary>
+    /// <param name="connection">连接。</param>
+    /// <param name="sql">查询。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private static async Task<object?> ScalarAsync(SqliteConnection connection, string sql, CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        return await command.ExecuteScalarAsync(cancellationToken);
+    }
+
+    /// <summary>在已打开的连接上执行返回计数的查询。</summary>
+    /// <param name="connection">连接。</param>
+    /// <param name="sql">查询。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private static async Task<long> ScalarLongAsync(SqliteConnection connection, string sql, CancellationToken cancellationToken)
+        => Convert.ToInt64(await ScalarAsync(connection, sql, cancellationToken), System.Globalization.CultureInfo.InvariantCulture);
 
     /// <summary>判断指定表是否已有某列。</summary>
     /// <param name="factory">连接工厂。</param>

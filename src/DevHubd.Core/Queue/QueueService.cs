@@ -571,6 +571,15 @@ public sealed class QueueService
                               AND (a.error_kind IS NULL OR a.error_kind NOT IN ('auth', 'quota', 'no_model', 'bridge_down'))
                           ) < max_attempts
                       AND hold_kind IS NULL
+                      -- 任务已在决策落地后进入 done/cancelled：即使队列项仍是非终态（例如 force
+                      -- 造出的并行项），也不得再执行同一内容。任务视图缺失时保持可认领，
+                      -- 由执行侧按"任务缺失"收尾，避免历史行永久堵住队列。
+                      AND NOT EXISTS (
+                            SELECT 1 FROM task_view t
+                            WHERE t.workspace_id = queue_item.workspace_id
+                              AND t.id = queue_item.task_id
+                              AND t.status IN ('done', 'cancelled')
+                          )
                       {roleClause}
                     ORDER BY priority DESC, created_at ASC, id ASC
                     LIMIT 1

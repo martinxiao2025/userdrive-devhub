@@ -6,7 +6,7 @@
 `tests/DevHubd.Tests/ToolSurfaceSnapshotTests.cs` 对工具名、参数名、枚举词表与关键字段做快照，
 任何改动都会先让测试失败，必须同步更新本文件。
 
-- 契约版本：**schema v6**（数据目录 `devhub.db` 的 `user_version`）
+- 契约版本：**schema v7**（数据目录 `devhub.db` 的 `user_version`）
 - 更新时间：2026-11-09
 
 ---
@@ -65,6 +65,7 @@
 | 手动派发 provider（`dispatch_now.provider`） | `auto` / `openai` / `vscode` |
 | provider 熔断状态 | `closed` / `open` / `half_open` |
 | 结果终态（`result.outcome`） | `delivered` / `awaiting_review` / `failed` |
+| 手动派发状态（`dispatch_now.status`） | `enqueued` / `deduped` / `active_exists` / `delivered_exists` / `pending_review` / `would_enqueue`（dryRun） |
 | 任务状态（`devhub://tasks`） | `ready` / `blocked` / `done` / `cancelled` / `missing` |
 | 问题单状态（`input_request.*`） | `open` / `answered` / `expired` / `cancelled` / `all`（仅过滤用） |
 | 任务审批状态（`devhub://tasks.approvalState`） | `none` / `pending` / `approved` / `rejected` |
@@ -150,6 +151,9 @@
 命中任一且不带 `force` 一律拒绝；前两项与哈希无关，③ 才比较内容哈希——内容实质变化后允许新一轮。
 待审拒绝返回 `RESULT_AWAITING_REVIEW`；`force=true` 覆盖时按优先级写审计
 `detail=…override=pending_review|delivered_same_content|active_exists|none`。
+`force` 造出的并行项不会在决策落地后继续执行：审批通过/驳回时同任务其余非终态队列项被置
+`cancelled`（`last_error_code=SUPERSEDED_BY_DECISION`，审计 `queue.superseded`）；
+认领侧另有 `task_view.status ∈ {done, cancelled}` 的兜底闸门。
 需要幂等复用首次派发时使用 `requestId`。
 
 错误码：`UNKNOWN_TASK`、`AMBIGUOUS_TASK`、`TASK_NOT_READY`、`RESULT_AWAITING_REVIEW`、
@@ -371,6 +375,41 @@ COUNT(attempt WHERE queue_item_id = ?
 ---
 
 ## 6. 变更记录
+
+### 第五轮核验修正（schema v7）— 2026-11-09
+
+- **v6 原地改列类型导致已升级库无迁移路径（硬伤）**：上一轮把 V6 脚本里的
+  `task_view.rerun_pending` 从 INTEGER 原地改成 TEXT，但 `user_version` 仍是 6，
+  已迁到 v6 的库不会重跑。历史值 `1` 会被当作内容哈希 `"1"`，审批通过后多跑一轮。
+  现升 **v7**：完整 v6 库重建 `task_view` 把列类型改为 `TEXT`，并把历史 `0/1` 归一化为空串
+  （旧布尔值无法还原内容哈希）；极简自建库只做值归一化，不重建表。`CurrentVersion=7`。
+- **`delivered_exists` 不再被吞成 `deduped`**：`DispatchStatus` 新增 `DeliveredExists`，
+  `DispatchService` 不再把它映射为 `Deduped`；`DispatchNowTool` 改用
+  `DispatchStatusText` 显式输出 snake_case（修复 `activeexists` 这类枚举名小写），
+  `enqueued/deduped/active_exists/delivered_exists/pending_review/would_enqueue` 与 §2 逐字一致。
+  `deduped` 仅表示同一 `dedupe_key` 已入队（幂等命中，含相同 `requestId`）。
+- **`force` 并行项在任务 done 后不再执行**：审批决策落地时，同 `workspace_id` + `task_id`
+  的其余 `pending/claimed/running` 队列项被置 `cancelled`
+  （`last_error_code=SUPERSEDED_BY_DECISION`，清租约，写 `audit(action='queue.superseded')`）；
+  认领 SQL 同时增加 `task_view.status IN ('done','cancelled')` 排除条件，兜底拦住历史遗留项。
+- **`scope_lock` 删除**：该表只有建表与 EF 映射，全仓库无使用点，属于“看着像保护、实际没用”。
+  V7 直接 `DROP TABLE` 并从 `ExpectedTables`/EF 映射中移除；本版本**没有**写作用域并发互斥，
+  并发上限只由 `maxParallel` 控制。后续如需该能力必须重新设计并接入认领路径。
+- **`awaiting_review` 必须同步视图待审态**：`BudgetExceeded`、`UserCancelled` 等终止分支
+  产出 `awaiting_review` 结果时，同步把 `task_view.approval_state` 置 `pending`，
+  避免“有结果但视图不显示、闸门又挡住重派”的无人可见状态。
+- **schema v7 真实旧库升级实测**：取真实 v2 库副本 → 用 `80de920` 升到旧 v6
+  （`rerun_pending INTEGER`，人工写入一个历史值 `1`）→ 用当前版本升到 v7。结果：
+  `user_version=7`；`task_view.rerun_pending` 声明类型 `TEXT`；存量值归一化为 `''`
+  （`typeof='text'`）；行数保持 `task_view 5 / queue_item 5 / result 5 / notice 5 / attempt 6 / audit 1`；
+  `PRAGMA integrity_check=ok`；`PRAGMA foreign_key_check` 0 违规；`scope_lock` 已不存在；
+  启动日志 `数据库就绪（schema v7）`。
+- 测试（修复前 worktree 基线失败，见汇报）：`Migrate_V7_RebuildsLegacyV6RerunPendingAsync`、
+  `Migrate_V7_NormalizesMinimalLegacyV6Async`、`DispatchNow_WhenDeliveredSameContent_ReturnsDeliveredExistsAsync`、
+  `DispatchStatusText_MatchesContractVocabulary`、`Decide_AfterApproval_CancelsForcedParallelItemAsync`、
+  `ClaimDetailed_WhenTaskDone_ReturnsNullAsync`、`Pump_ReviewTerminalFailure_SetsTaskApprovalPendingAsync`。
+- **遗留待办（本轮不改表）**：`notice` 缺 `workspace_id`，跨工作区同名任务的通知无法归属，
+  已记入待办清单。
 
 ### 第四轮核验修正（schema 仍 v6）— 2026-11-09
 

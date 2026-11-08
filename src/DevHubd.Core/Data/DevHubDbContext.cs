@@ -39,9 +39,6 @@ public sealed class DevHubDbContext : DbContext
     /// <summary>调度状态（单例）。</summary>
     public DbSet<SchedulerStateEntity> SchedulerStates => Set<SchedulerStateEntity>();
 
-    /// <summary>写入范围租约。</summary>
-    public DbSet<ScopeLockEntity> ScopeLocks => Set<ScopeLockEntity>();
-
     /// <summary>审计流水。</summary>
     public DbSet<AuditEntity> Audits => Set<AuditEntity>();
 
@@ -66,7 +63,6 @@ public sealed class DevHubDbContext : DbContext
         ConfigureNotice(modelBuilder);
         ConfigureProviderState(modelBuilder);
         ConfigureSchedulerState(modelBuilder);
-        ConfigureScopeLock(modelBuilder);
         ConfigureAudit(modelBuilder);
         ConfigureRoleView(modelBuilder);
         ConfigureInputRequest(modelBuilder);
@@ -376,24 +372,6 @@ public sealed class DevHubDbContext : DbContext
         entity.Property(item => item.NextScanAt).HasColumnName("next_scan_at");
         entity.Property(item => item.Counters).HasColumnName("counters");
         entity.Property(item => item.UpdatedAt).HasColumnName("updated_at");
-    }
-
-    /// <summary>映射 <c>scope_lock</c>。</summary>
-    /// <param name="modelBuilder">模型构建器。</param>
-    private static void ConfigureScopeLock(ModelBuilder modelBuilder)
-    {
-        var entity = modelBuilder.Entity<ScopeLockEntity>();
-        entity.ToTable("scope_lock");
-
-        entity.HasKey(item => new { item.WorkspaceId, item.Scope });
-
-        entity.Property(item => item.WorkspaceId).HasColumnName("workspace_id").ValueGeneratedNever();
-        entity.Property(item => item.Scope).HasColumnName("scope").ValueGeneratedNever();
-        entity.Property(item => item.OwnerId).HasColumnName("owner_id");
-        entity.Property(item => item.AcquiredAt).HasColumnName("acquired_at");
-        entity.Property(item => item.ExpiresAt).HasColumnName("expires_at");
-
-        entity.HasIndex(item => item.ExpiresAt).HasDatabaseName("idx_scope_expiry");
     }
 
     /// <summary>映射 <c>audit</c>。</summary>

@@ -16,9 +16,10 @@ public static class Migrator
     /// <summary>
     /// 当前 schema 版本。V1 = 9 张表；V2 = attempt.usage_estimated；V3 = attempt.usage_available / rounds_exhausted；
     /// V4 = 旧行 usage_available 回填；V5 = 角色快照、任务角色/依赖/审批列、队列挂起列与问题单表；
-    /// V6 = queue_item.forced（force 派发标记）与 task_view.rerun_pending（待审期间再执行需求的内容哈希）。
+    /// V6 = queue_item.forced（force 派发标记）与 task_view.rerun_pending（待审期间再执行需求的内容哈希）；
+    /// V7 = 把误写为 INTEGER 的 <c>task_view.rerun_pending</c> 归一化为内容哈希形态，并删除未接入实现的 scope_lock。
     /// </summary>
-    public const int CurrentVersion = 6;
+    public const int CurrentVersion = 7;
 
     /// <summary>V1 的全部 DDL 与初始数据。</summary>
     private const string SchemaV1 = """
@@ -136,6 +137,7 @@ public static class Migrator
           PRIMARY KEY (workspace_id, scope)
         );
         CREATE INDEX idx_scope_expiry ON scope_lock(expires_at);
+        -- 注：scope_lock 尚未接入任何写入互斥实现，V7 会删除该表；保留在 V1 仅为历史版本可重放。
 
         CREATE TABLE audit (
           id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -277,7 +279,60 @@ public static class Migrator
         ALTER TABLE task_view ADD COLUMN rerun_pending TEXT NOT NULL DEFAULT '';
         """;
 
-    /// <summary>P0 期望存在的 9 张表（用于启动自检与测试断言）。</summary>
+    /// <summary>
+    /// V7（极简/非完整库）：把旧 v6 误写为布尔量的 <c>rerun_pending</c> 归一化为空串，并删除未使用的
+    /// <c>scope_lock</c> 表。旧库的历史值 <c>1</c> 无法还原出对应内容哈希，继续保留会被误读成哈希，故统一清空。
+    /// </summary>
+    private const string SchemaV7Normalize = """
+        UPDATE task_view SET rerun_pending = '' WHERE rerun_pending IN ('0', '1');
+        DROP TABLE IF EXISTS scope_lock;
+        """;
+
+    /// <summary>
+    /// V7（完整 v6 库）：重建 <c>task_view</c>，把 <c>rerun_pending</c> 的列类型从 INTEGER 改为 TEXT，
+    /// 同时按 V7 规则归一化历史值。SQLite 不支持修改列类型，只能重建表；索引随旧表删除后重建。
+    /// 重建完成后删除未使用的 <c>scope_lock</c>。
+    /// </summary>
+    private const string SchemaV7Rebuild = """
+        CREATE TABLE task_view_v7 (
+          workspace_id   TEXT NOT NULL,
+          id             TEXT NOT NULL,
+          source_path    TEXT NOT NULL,
+          content_hash   TEXT NOT NULL,
+          title          TEXT NOT NULL,
+          status         TEXT NOT NULL CHECK (status IN ('ready','blocked','done','cancelled','missing')),
+          priority       INTEGER NOT NULL,
+          write_scope    TEXT NOT NULL,
+          payload        TEXT NOT NULL,
+          seen_at        TEXT NOT NULL,
+          updated_at     TEXT NOT NULL,
+          role_id        TEXT NOT NULL DEFAULT 'implementer',
+          depends_on     TEXT,
+          approval_state TEXT NOT NULL DEFAULT 'none'
+            CHECK (approval_state IN ('none','pending','approved','rejected')),
+          rerun_pending  TEXT NOT NULL DEFAULT '',
+          PRIMARY KEY (workspace_id, id)
+        );
+
+        INSERT INTO task_view_v7 (
+          workspace_id, id, source_path, content_hash, title, status, priority, write_scope,
+          payload, seen_at, updated_at, role_id, depends_on, approval_state, rerun_pending)
+        SELECT
+          workspace_id, id, source_path, content_hash, title, status, priority, write_scope,
+          payload, seen_at, updated_at, role_id, depends_on, approval_state,
+          CASE
+            WHEN typeof(rerun_pending) = 'text' AND rerun_pending NOT IN ('', '0', '1') THEN rerun_pending
+            ELSE ''
+          END
+        FROM task_view;
+
+        DROP TABLE task_view;
+        ALTER TABLE task_view_v7 RENAME TO task_view;
+        CREATE INDEX idx_task_view_status ON task_view(workspace_id, status);
+        DROP TABLE IF EXISTS scope_lock;
+        """;
+
+    /// <summary>P0 期望存在的表（用于启动自检与测试断言）。V7 起删除未使用的 <c>scope_lock</c>，共 8 张。</summary>
     public static readonly IReadOnlyList<string> ExpectedTables = new[]
     {
         "task_view",
@@ -287,7 +342,6 @@ public static class Migrator
         "notice",
         "provider_state",
         "scheduler_state",
-        "scope_lock",
         "audit",
     };
 
@@ -351,6 +405,26 @@ public static class Migrator
             version = 6;
         }
 
+        if (version < 7)
+        {
+            // 只有"完整 v6 形态（含 source_path）且 rerun_pending 不是 TEXT"的库需要重建表；
+            // 极简自建库保持原结构，只做值归一化，避免因缺列导致重建失败。
+            var rerunType = await GetColumnTypeAsync(connection, transaction, "task_view", "rerun_pending", cancellationToken)
+                .ConfigureAwait(false);
+            var fullSchema = await HasColumnAsync(connection, transaction, "task_view", "source_path", cancellationToken)
+                .ConfigureAwait(false);
+            var needsRebuild = fullSchema &&
+                               rerunType is not null &&
+                               !rerunType.Contains("TEXT", StringComparison.OrdinalIgnoreCase);
+
+            await ExecuteScriptAsync(
+                connection,
+                transaction,
+                needsRebuild ? SchemaV7Rebuild : SchemaV7Normalize,
+                cancellationToken).ConfigureAwait(false);
+            version = 7;
+        }
+
         using (var stamp = connection.CreateCommand())
         {
             stamp.Transaction = transaction;
@@ -407,6 +481,35 @@ public static class Migrator
         }
 
         return false;
+    }
+
+    /// <summary>读取指定列在迁移事务内的声明类型；表或列不存在时返回 null。</summary>
+    /// <param name="connection">已打开的连接。</param>
+    /// <param name="transaction">迁移事务。</param>
+    /// <param name="table">表名。</param>
+    /// <param name="column">列名。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private static async Task<string?> GetColumnTypeAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string table,
+        string column,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        // PRAGMA 不支持参数化，表名来自编译期常量。
+        command.CommandText = $"PRAGMA table_info({table});";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            if (string.Equals(reader.GetString(1), column, StringComparison.Ordinal))
+            {
+                return reader.IsDBNull(2) ? string.Empty : reader.GetString(2);
+            }
+        }
+
+        return null;
     }
 
     /// <summary>读取当前 schema 版本。</summary>

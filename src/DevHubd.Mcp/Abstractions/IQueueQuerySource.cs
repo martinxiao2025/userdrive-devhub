@@ -53,11 +53,14 @@ public enum DispatchStatus
     /// <summary>已入队。</summary>
     Enqueued,
 
-    /// <summary>同一 dedupe_key 已入队过。</summary>
+    /// <summary>同一 dedupe_key 已入队过（幂等命中，含相同 requestId）。</summary>
     Deduped,
 
     /// <summary>该任务已有未结束的队列项。</summary>
     ActiveExists,
+
+    /// <summary>同一工作区 + 任务的当前内容已交付过（内容哈希一致），默认拒绝重复派发。</summary>
+    DeliveredExists,
 
     /// <summary>同一工作区 + 任务已有待审结果：默认拒绝派发，必须显式 <c>force</c> 覆盖。</summary>
     PendingReview,

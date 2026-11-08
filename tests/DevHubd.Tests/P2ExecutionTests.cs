@@ -416,6 +416,38 @@ public sealed class P2ExecutionTests : IDisposable
     }
 
     /// <summary>
+    /// BudgetExceeded / UserCancelled 都会产出 awaiting_review 结果：任务视图必须同步
+    /// <c>approval_state='pending'</c>，否则视图看不到待审、入队闸门又拦住重派，任务卡在无人可见的状态。
+    /// </summary>
+    [Theory]
+    [InlineData(ModelErrorKinds.BudgetExceeded, DevHubErrorCodes.BudgetExceeded)]
+    [InlineData(ModelErrorKinds.UserCancelled, "USER_CANCELLED")]
+    public async Task Pump_ReviewTerminalFailure_SetsTaskApprovalPendingAsync(string kind, string code)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "需要人工处理", "ready", 10);
+        await PrepareQueueAsync(ct);
+
+        var fake = new FakeModelClient(
+            "openai",
+            (_, _, _) => Task.FromResult(TurnResult.Failed(
+                new ModelError(kind, code, "需要人工处理。"))));
+
+        var coordinator = CreateCoordinator(fake, new ExecutionOptions());
+        await coordinator.PumpAsync(ct);
+
+        await WaitUntilAsync(
+            async () => await CountAsync("SELECT COUNT(*) FROM result WHERE outcome = 'awaiting_review';", ct) == 1,
+            ct,
+            TimeSpan.FromSeconds(10));
+
+        Assert.Equal("awaiting_review", await ScalarStringAsync("SELECT outcome FROM result;", ct));
+        Assert.Equal("pending", await ScalarStringAsync("SELECT approval_state FROM task_view WHERE id = 'T-001';", ct));
+    }
+
+    /// <summary>
     /// 验收 5：MaxParallel=1 时两个任务严格串行；第二次 pump 才能启动第二个任务。
     /// </summary>
     [Fact]

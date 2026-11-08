@@ -112,4 +112,7 @@ public static class DevHubErrorCodes
 
     /// <summary>队列项认领失败（attempt 写入冲突等），该项已推迟、不计入重试预算。</summary>
     public const string ClaimFailed = "CLAIM_FAILED";
+
+    /// <summary>审批已落地，同任务其余非终态队列项被取消（通常是 force 造出的并行项）。</summary>
+    public const string SupersededByDecision = "SUPERSEDED_BY_DECISION";
 }

@@ -11,6 +11,7 @@ using DevHubd.Core.Scheduling;
 using DevHubd.Core.Tasks;
 using DevHubd.Core.Workspaces;
 using DevHubd.Mcp.Abstractions;
+using DevHubd.Mcp.Contracts;
 using DevHubd.Queue;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -547,6 +548,108 @@ public sealed class SchedulerPipelineTests : IDisposable
                 "SELECT COUNT(*) FROM audit WHERE action = 'queue.dispatch_forced' AND detail LIKE '%override=active_exists%';",
                 ct));
         Assert.Equal(1, await CountRowsAsync("SELECT COUNT(*) FROM queue_item WHERE forced = 1;", ct));
+    }
+
+    /// <summary>
+    /// 同内容已交付时手动派发返回 <c>delivered_exists</c>，不能再被吞成 <c>deduped</c>；
+    /// 工具层文本必须与契约一致（snake_case，而不是枚举名小写）。
+    /// </summary>
+    [Fact]
+    public async Task DispatchNow_WhenDeliveredSameContent_ReturnsDeliveredExistsAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "自动交付任务", "ready", 10);
+
+        await _engine.TickAsync(ct);
+        var queueItemId = (await ReadColumnAsync("SELECT id FROM queue_item;", ct)).Single();
+        await InsertDeliveredResultAsync(queueItemId, "res-1", cancellationToken: ct);
+        await ExecuteAsync("UPDATE queue_item SET status = 'succeeded';", ct);
+
+        var dispatcher = new DispatchService(_registry, _queue, _stateStore, new ProviderStateStore(_factory));
+        var outcome = await dispatcher.DispatchNowAsync(
+            "T-001", "alpha", "auto", dryRun: false, force: false, requestId: null, ct);
+
+        Assert.Equal(DispatchStatus.DeliveredExists, outcome.Status);
+        Assert.Equal("delivered_exists", DispatchStatusText.ToText(outcome.Status));
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+    }
+
+    /// <summary>派发状态的文本映射必须与契约逐字一致：多词状态不能用枚举名小写。</summary>
+    [Fact]
+    public void DispatchStatusText_MatchesContractVocabulary()
+    {
+        Assert.Equal("enqueued", DispatchStatusText.ToText(DispatchStatus.Enqueued));
+        Assert.Equal("deduped", DispatchStatusText.ToText(DispatchStatus.Deduped));
+        Assert.Equal("active_exists", DispatchStatusText.ToText(DispatchStatus.ActiveExists));
+        Assert.Equal("delivered_exists", DispatchStatusText.ToText(DispatchStatus.DeliveredExists));
+        Assert.Equal("pending_review", DispatchStatusText.ToText(DispatchStatus.PendingReview));
+        Assert.Equal("would_enqueue", DispatchStatusText.ToText(DispatchStatus.WouldEnqueue));
+    }
+
+    /// <summary>
+    /// 决策落地后，同任务其余非终态队列项（典型是 force 造出的并行项）必须被取消，
+    /// 否则任务已 done 仍会再跑同一内容。
+    /// </summary>
+    [Fact]
+    public async Task Decide_AfterApproval_CancelsForcedParallelItemAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "并行项任务", "ready", 10);
+
+        await _engine.TickAsync(ct);
+        var firstQueue = (await ReadColumnAsync("SELECT id FROM queue_item;", ct)).Single();
+        await InsertAwaitingResultAsync(firstQueue, "res-1", cancellationToken: ct);
+        await ExecuteAsync($"UPDATE queue_item SET status = 'succeeded' WHERE id = '{firstQueue}';", ct);
+
+        var dispatcher = new DispatchService(_registry, _queue, _stateStore, new ProviderStateStore(_factory));
+        var forced = await dispatcher.DispatchNowAsync(
+            "T-001", "alpha", "auto", dryRun: false, force: true, requestId: null, ct);
+        Assert.Equal(DispatchStatus.Enqueued, forced.Status);
+        Assert.Equal(2, await CountQueueItemsAsync(ct));
+
+        var decisions = new ResultDecisionStore(_factory);
+        var decision = await decisions.DecideAsync("res-1", approve: true, "通过", null, ct);
+        Assert.Equal(CoreResultDecisionStatus.Decided, decision.Status);
+
+        Assert.Equal(
+            new[] { "cancelled" },
+            await ReadColumnAsync(
+                $"SELECT status FROM queue_item WHERE id = '{forced.QueueItemId}';",
+                ct));
+        Assert.Equal(
+            new[] { "SUPERSEDED_BY_DECISION" },
+            await ReadColumnAsync(
+                $"SELECT last_error_code FROM queue_item WHERE id = '{forced.QueueItemId}';",
+                ct));
+        Assert.Equal(1, await CountRowsAsync("SELECT COUNT(*) FROM audit WHERE action = 'queue.superseded';", ct));
+        Assert.Equal(
+            new[] { "done" },
+            await ReadColumnAsync("SELECT status FROM task_view WHERE id = 'T-001';", ct));
+    }
+
+    /// <summary>
+    /// 任务已 done 时，历史遗留的非终态队列项也不得再被认领执行（force 并行项的兜底闸门）。
+    /// </summary>
+    [Fact]
+    public async Task ClaimDetailed_WhenTaskDone_ReturnsNullAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "已完成任务", "ready", 10);
+
+        await _engine.TickAsync(ct);
+        Assert.Equal(1, await CountQueueItemsAsync(ct));
+        await ExecuteAsync("UPDATE task_view SET status = 'done', approval_state = 'approved';", ct);
+
+        var claimed = await _queue.ClaimDetailedAsync("worker", TimeSpan.FromSeconds(30), ct);
+
+        Assert.Null(claimed);
+        Assert.Equal(new[] { "pending" }, await ReadColumnAsync("SELECT status FROM queue_item;", ct));
     }
 
     /// <summary>
