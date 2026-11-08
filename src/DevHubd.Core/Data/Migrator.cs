@@ -13,8 +13,8 @@ namespace DevHubd.Core.Data;
 /// </summary>
 public static class Migrator
 {
-    /// <summary>当前 schema 版本。V1 = 9 张表；V2 = attempt.usage_estimated；V3 = attempt.usage_available / rounds_exhausted。</summary>
-    public const int CurrentVersion = 3;
+    /// <summary>当前 schema 版本。V1 = 9 张表；V2 = attempt.usage_estimated；V3 = attempt.usage_available / rounds_exhausted；V4 = 旧行 usage_available 回填。</summary>
+    public const int CurrentVersion = 4;
 
     /// <summary>V1 的全部 DDL 与初始数据。</summary>
     private const string SchemaV1 = """
@@ -161,7 +161,7 @@ public static class Migrator
     /// V3：attempt 增加 <c>usage_available</c> 与 <c>rounds_exhausted</c>。
     /// <para>
     /// <c>usage_available</c>：1 表示 provider 明确返回了用量；0 表示用量不可得（token 列为 NULL）。
-    /// 旧行默认 0，与“token 为 NULL”一致。
+    /// 旧行先统一默认 0，再由 V4 把“已有真实 token”的行回填为 1。
     /// </para>
     /// <para>
     /// <c>rounds_exhausted</c>：1 表示回合耗尽工具轮次预算，最终文本是框架移除工具后的兜底答复，
@@ -171,6 +171,18 @@ public static class Migrator
     private const string SchemaV3 = """
         ALTER TABLE attempt ADD COLUMN usage_available INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE attempt ADD COLUMN rounds_exhausted INTEGER NOT NULL DEFAULT 0;
+        """;
+
+    /// <summary>
+    /// V4：回填 v3 的旧行 <c>usage_available</c>。v3 统一写 0，但 v2 及更早的 BYOK 行可能已经记下真实 token，
+    /// 此时 0 会被误读成“provider 没返回用量”。凡 token 列非空的旧行补标为 1，
+    /// 与契约「usageAvailable=false ⇔ token 为 NULL」保持一致。只更新仍为 0 的行，幂等。
+    /// </summary>
+    private const string SchemaV4 = """
+        UPDATE attempt
+           SET usage_available = 1
+         WHERE usage_available = 0
+           AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL);
         """;
 
     /// <summary>P0 期望存在的 9 张表（用于启动自检与测试断言）。</summary>
@@ -224,6 +236,17 @@ public static class Migrator
             version = 3;
         }
 
+        if (version < 4)
+        {
+            // 兼容极简自建库：缺少 token 列时跳过回填，不阻断迁移。
+            if (await HasColumnAsync(connection, transaction, "attempt", "input_tokens", cancellationToken).ConfigureAwait(false))
+            {
+                await ExecuteScriptAsync(connection, transaction, SchemaV4, cancellationToken).ConfigureAwait(false);
+            }
+
+            version = 4;
+        }
+
         using (var stamp = connection.CreateCommand())
         {
             stamp.Transaction = transaction;
@@ -251,6 +274,35 @@ public static class Migrator
         command.Transaction = transaction;
         command.CommandText = script;
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>判断指定表在迁移事务内是否已有某列（用于兼容极简自建库）。</summary>
+    /// <param name="connection">已打开的连接。</param>
+    /// <param name="transaction">迁移事务。</param>
+    /// <param name="table">表名。</param>
+    /// <param name="column">列名。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private static async Task<bool> HasColumnAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string table,
+        string column,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        // PRAGMA 不支持参数化，表名来自编译期常量。
+        command.CommandText = $"PRAGMA table_info({table});";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            if (string.Equals(reader.GetString(1), column, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>读取当前 schema 版本。</summary>

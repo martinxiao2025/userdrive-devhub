@@ -1,4 +1,5 @@
 using DevHubd.Core.Execution;
+using DevHubd.Core.Models;
 using DevHubd.Core.Providers;
 using DevHubd.Core.Scheduling;
 using DevHubd.Hosting;
@@ -295,7 +296,8 @@ public sealed class SchedulerControlService : ISchedulerControl
                     State = record.State,
                     Breaker = record.Breaker,
                     Detail = record.Detail,
-                    CheckedAt = record.CheckedAt,
+                    // 与 scheduler_status 使用同一归一函数，避免控制面返回 +00:00、状态面返回 Z。
+                    CheckedAt = UtcTime.Normalize(record.CheckedAt),
                 })
                 .ToArray(),
         };

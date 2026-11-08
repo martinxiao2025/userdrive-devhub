@@ -204,7 +204,7 @@ node scripts/smoke-mcp.mjs
 
 - **多轮累加**：工具调用循环会产生多次请求，每轮响应各带一份 `usage`，落库的是整回合累加值，不是最后一轮。
 - **估算标记**：`usage_estimated=1` 表示该数值是近似估算、**不是真实 token**；当前 BYOK 非流式路径只写入 provider 原值（恒为 `0`）。若后续接入不返回 `usage` 的通道，必须显式置 `1` 并在字段说明中标注，不能混入真实值统计。
-- **用量可得性显式标记**：`usageAvailable` 与 token 三列一起返回。`usageAvailable=false` 表示 provider 没有返回 usage（token 为 `null`，**不是 0**）；`true` 表示数值来自 provider 响应。消费方不要用“token 是否为 0”猜缺失。
+- **用量可得性显式标记**：`usageAvailable` 与 token 三列一起返回。`usageAvailable=false` 表示 provider 没有返回 usage（token 为 `null`，**不是 0**）；`true` 表示数值来自 provider 响应。消费方不要用“token 是否为 0”猜缺失。历史行由 schema v4 修正：v3 统一写 0，v4 把 token 非空的旧行回填为 `true`，token 为 `NULL` 的旧行保持 `false`。
 - **查看方式**：
   - `queue_get` → `attempts[]` 的 `toolCalls` / `promptTokens` / `completionTokens` / `totalTokens` / `usageEstimated` / `usageAvailable` / `roundsExhausted`。
   - `result_list` → 每条结果的 `toolCalls` / `promptTokens` / `completionTokens` / `totalTokens` / `usageEstimated` / `usageAvailable` / `roundsExhausted`（取该队列项最近一次 attempt）。
@@ -331,10 +331,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -A
 
 ### 6.1 已真实验证
 
-- `dotnet build DevHubd.sln`：0 警告 0 错误；`dotnet test`：125/125 通过、0 跳过（此前的 5 项启动失败路径用例在停止守护进程、互斥体释放后真机跑通，见下一条）。
+- `dotnet build DevHubd.sln`：0 警告 0 错误；`dotnet test`：126/126 通过、0 跳过（此前的 5 项启动失败路径用例在停止守护进程、互斥体释放后真机跑通，见下一条）。
 - `node scripts/validate-plugin.mjs`（4 项 PASS）、`node scripts/check-encoding.mjs`（156 个文件）、`node scripts/smoke-mcp.mjs`（真实握手 + `tools/list` + `tools/call` + `resources/read`）全部通过。
 - 真实 BYOK 回合（2026-11-08）：provider `openai`，端点 `https://api.deepseek.com`，模型 `deepseek-flash`；任务 REAL-001 / REAL-002 / REAL-003 均产出 `awaiting_review` 结果，工作区只改 `out/` 下目标文件。
-- schema 升级：已有 V1 库启动后 `user_version` 由 1 升到 2（新增 `attempt.usage_estimated`），`scheduler_status.host.schemaVersion=2`。2026-11-08 增补：真实数据目录的 v2 库启动后自动升到 v3（新增 `attempt.usage_available`、`attempt.rounds_exhausted`），日志 `数据库就绪…（schema v3）`，冒烟返回 `schema=v3`，旧行默认 0。
+- schema 升级：已有 V1 库启动后 `user_version` 由 1 升到 2（新增 `attempt.usage_estimated`），`scheduler_status.host.schemaVersion=2`。2026-11-08 增补：v3 新增 `attempt.usage_available`、`attempt.rounds_exhausted`；v4 回填旧行 `usage_available`（token 非空即标 1，token 为 `NULL` 保持 0）。真实数据目录启动日志为 `数据库就绪…（schema v4）`，冒烟返回 `schema=v4`。
+- v2 → v4 迁移安全核对（2026-11-08，**真实 v2 库副本** `%TEMP%\devhub-migrate-check\devhub.db`，先 `VACUUM INTO` 出干净副本，全程只动副本）：迁移前 `user_version=2`、`integrity_check=ok`、`foreign_key_violations=0`；各表行数 task_view=5、queue_item=5、attempt=6、result=5、notice=5、provider_state=2、scheduler_state=1、scope_lock=0、audit=1。迁移后 `MigrateAsync` 返回 4，行数逐表完全一致，既有主键 **missing=0**（9 张表全部），`integrity_check=ok`、外键无违规；旧行 `rounds_exhausted` 全为 0，`usage_available` 与 token 是否为空严格对应（6 条旧 attempt 中 4 条有 token 被标 1、2 条 token 为 `NULL` 保持 0）；重复迁移幂等返回 4。结论 `PASS`，不以“启动成功 + schema v4”替代行数与主键证据。
+- 真实 BYOK 回合复验（REAL-006，2026-11-08，当前代码 `Microsoft.Extensions.AI` 重构后）：provider `openai`（`https://api.deepseek.com` / `deepseek-flash`），队列项 `7ce12702856e45d49d1ea363fa8acf27`，`attempt=1`、`outcome=succeeded`、`toolCalls=2`、`promptTokens=3050`、`completionTokens=312`、`totalTokens=3362`、`usageEstimated=false`、`usageAvailable=true`、`roundsExhausted=false`；直接读 SQLite 的 `attempt` 行为 `input_tokens=3050, output_tokens=312, usage_available=1, rounds_exhausted=0`，与 `queue_get` 一致；结果为 `awaiting_review`（`resultId=aab6bf06aea94714accd80a789449521`），产物 `work/7ce1270…/out/summary-u5-byok.md`。
+- 真实 `vscode.lm` 回合复验（REAL-007，2026-11-08）：provider `vscode`，队列项 `4aef09fb14114a4ca9a4234b7080d27c`，`attempt=1`、`outcome=succeeded`、`toolCalls=3`、`usageAvailable=false`、`roundsExhausted=false`；该通道取不到 usage，`attempt` 的 `input_tokens`/`output_tokens` 为 **`NULL`**（不是 0），`usage_estimated=0`，`queue_get` 不返回 token 字段，未做任何估算；结果为 `awaiting_review`（`resultId=ebaa2fe3987843dbabef2b383aeaa15c`），产物 `work/4aef09f…/out/summary-u5-lm.md`。桥可用前提：VS Code 窗口必须以**受信任工作区**（或 `--disable-workspace-trust`）打开，否则扩展被限制模式跳过、`lm-bridge.json` 不生成、`vscode` 恒为 `down`。
+- 契约一致性回归（2026-11-08）：`scheduler_control` 返回的 `providers[].checkedAt` 原先仍是 `+00:00`，与 B1 “统一 `Z`” 不一致；已改为与 `scheduler_status` 共用 `UtcTime.Normalize`，真机返回 `2026-11-08T04:50:25.9859966Z`。
 - usage 落库核对（REAL-003，新真实回合）：provider 3 轮累计 `prompt_tokens=3087`、`completion_tokens=360`、`total=3447`，`usageMissing=False`；直接读 SQLite 得 `input_tokens=3087, output_tokens=360, usage_estimated=0`；`queue_get`、`result_list`、`scheduler_status.tokens` 三处读回一致，未做任何估算。
 - 按 §1.1 命令自包含发布：产物 103.7 MiB，`-Action start/status/stop` 与 MCP 冒烟连续走通（`startupMs=1966`，停止后 `runtime.json` 被移除、`status` 返回 3）。
 - 启动失败路径真机复跑（2026-11-08，先 `-Action stop` 停掉守护进程并确认 `runtime.json` 移除、`/health` 不可达）：`StartupExitCodeTests` 的退出码 2/3/4/5 四项与 `LoggingTests.SecondInstance_WritesErrorLogWithLockPath` 全部执行且通过，全量通过、0 跳过。

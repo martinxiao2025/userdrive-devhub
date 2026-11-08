@@ -173,7 +173,8 @@ public sealed class DevHubHostState : ISchedulerStatusSource
                 WithoutUsage = group.Count(attempt => attempt.InputTokens == null && attempt.OutputTokens == null),
                 Estimated = group.Count(attempt => attempt.UsageEstimated),
             })
-            .FirstOrDefaultAsync(cancellationToken)
+            // GroupBy(1) 至多一行，用 SingleOrDefault 表达“聚合结果唯一”，也避免 EF 对无排序 First 的警告。
+            .SingleOrDefaultAsync(cancellationToken)
             .ConfigureAwait(false);
 
         if (aggregate is null)

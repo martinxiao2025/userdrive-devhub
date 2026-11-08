@@ -146,7 +146,52 @@ public sealed class MigratorTests : IDisposable
         Assert.True(await HasColumnAsync(factory, "attempt", "rounds_exhausted", ct));
     }
 
-    /// <summary>已有 V1 库升级时必须逐级补 V2/V3，不重建表，并保持 user_version 递增。</summary>
+    /// <summary>
+    /// V4 必须回填“已有真实 token、但 v3 默认写成 0”的旧行：让 <c>usage_available</c> 与
+    /// 契约「false ⇔ token 为 NULL」一致；token 为 NULL 的行保持 0。
+    /// </summary>
+    [Fact]
+    public async Task Migrate_V4_BackfillsUsageAvailableForLegacyTokenRowsAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var factory = new SqliteConnectionFactory(Path.Combine(_directory, "devhub.db"));
+
+        // 先建到最新，再人为退回 v3 并写入两条“旧行”：一条有真实 token，一条没有。
+        await Migrator.MigrateAsync(factory, ct);
+
+        using (var connection = await factory.OpenAsync(ct))
+        {
+            using var seed = connection.CreateCommand();
+            seed.CommandText = """
+                PRAGMA foreign_keys = OFF;
+                INSERT INTO queue_item (id, workspace_id, task_id, task_hash, dedupe_key, status, priority, available_at, created_at, updated_at)
+                VALUES ('q1', 'ws', 'T1', 'h', 'k', 'succeeded', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                INSERT INTO attempt (id, queue_item_id, attempt_no, provider, started_at, input_tokens, output_tokens, usage_estimated, usage_available, rounds_exhausted)
+                VALUES ('a1', 'q1', 1, 'openai', '2026-01-01T00:00:00Z', 100, 20, 0, 0, 0);
+                INSERT INTO attempt (id, queue_item_id, attempt_no, provider, started_at, input_tokens, output_tokens, usage_estimated, usage_available, rounds_exhausted)
+                VALUES ('a2', 'q1', 2, 'vscode', '2026-01-01T00:00:00Z', NULL, NULL, 0, 0, 0);
+                PRAGMA user_version = 3;
+                """;
+            await seed.ExecuteNonQueryAsync(ct);
+        }
+
+        Assert.Equal(Migrator.CurrentVersion, await Migrator.MigrateAsync(factory, ct));
+
+        using var verify = await factory.OpenAsync(ct);
+        using var command = verify.CreateCommand();
+        command.CommandText = "SELECT id, usage_available FROM attempt ORDER BY id;";
+        using var reader = await command.ExecuteReaderAsync(ct);
+
+        Assert.True(await reader.ReadAsync(ct));
+        Assert.Equal("a1", reader.GetString(0));
+        Assert.Equal(1L, reader.GetInt64(1));
+
+        Assert.True(await reader.ReadAsync(ct));
+        Assert.Equal("a2", reader.GetString(0));
+        Assert.Equal(0L, reader.GetInt64(1));
+    }
+
+    /// <summary>已有 V1 库升级时必须逐级补 V2/V3/V4，不重建表，并保持 user_version 递增。</summary>
     [Fact]
     public async Task Migrate_FromV1_UpgradesToLatestAsync()
     {

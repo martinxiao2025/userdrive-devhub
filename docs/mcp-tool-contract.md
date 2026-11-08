@@ -6,7 +6,7 @@
 `tests/DevHubd.Tests/ToolSurfaceSnapshotTests.cs` 对工具名、参数名、枚举词表与关键字段做快照，
 任何改动都会先让测试失败，必须同步更新本文件。
 
-- 契约版本：**schema v3**（数据目录 `devhub.db` 的 `user_version`）
+- 契约版本：**schema v4**（数据目录 `devhub.db` 的 `user_version`）
 - 更新时间：2026-11-08
 
 ---
@@ -214,6 +214,17 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 
 ## 6. 变更记录
 
+### v4 — 2026-11-08（数据修正，无字段变化）
+
+**回填旧行 `usage_available`**
+
+- 背景：v3 给既有 `attempt` 行统一写 `usage_available=0`，但更早的 BYOK 行已经记录了真实 token；
+  此时 0 会被误读成“provider 没返回用量”，与上文“`usageAvailable=false` ⇔ token 为 `null`”冲突。
+- 处理：`input_tokens` / `output_tokens` 任一非空的旧行补标为 1；token 为 `NULL` 的行保持 0。
+- 幂等：只更新仍为 0 的行；启动时自动把 `user_version` 从 3 升到 4。
+- 影响：`queue_get.attempts[]` / `result_list.items[]` 中，历史 BYOK 行会从 `usageAvailable=false`
+  变为 `true`，token 数值不变；历史 `vscode` 行（token 为 `null`）保持 `false`。
+
 ### v3 — 2026-11-08（破坏性 + 行为变化）
 
 **B1 时间格式统一 UTC + `Z`**
@@ -256,7 +267,7 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 **数据库**
 
 - `attempt` 新增 `usage_available`、`rounds_exhausted`（`INTEGER NOT NULL DEFAULT 0`）。
-- 启动时自动从 v2 迁移到 v3，无需手工操作；旧行默认 0（用量不可得 / 未耗尽）。
+- 启动时自动从 v2 迁移到 v3，无需手工操作；旧行先统一为 0，随后由 v4 把已有真实 token 的行回填为 1。
 
 ### v2 — 2026-10
 

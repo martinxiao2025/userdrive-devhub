@@ -199,7 +199,8 @@ public sealed class ResultStore
                 Failures = group.Count(result => result.Outcome == "failed"),
                 AwaitingReview = group.Count(result => result.Outcome == "awaiting_review"),
             })
-            .FirstOrDefaultAsync(cancellationToken)
+            // GroupBy(1) 至多一行，用 SingleOrDefault 表达“聚合结果唯一”，也避免 EF 对无排序 First 的警告。
+            .SingleOrDefaultAsync(cancellationToken)
             .ConfigureAwait(false);
 
         return digest is null
