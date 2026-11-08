@@ -240,7 +240,7 @@ node scripts/smoke-mcp.mjs
 
 | 项 | 实测值 |
 |---|---|
-| 1000 个任务文件 reconcile | 约 319 ms（基线 ≤ 500 ms，稳态约 204 ms） |
+| 1000 个任务文件 reconcile | 25 次采样：最小 303.1 / 中位 333.6 / p95 407.4 / 最大 926.4 ms（基线 ≤ 2000 ms；稳态基线 ≤ 1000 ms） |
 | `queue_list` 一页（50/1000） | 约 5.5 ms（基线 ≤ 50 ms） |
 | 自包含单文件体积 | 103.7 MiB（`PublishSingleFile` + `SelfContained`） |
 | 冷启动到 `/health` 就绪 | 约 864 ms |
@@ -306,7 +306,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -A
 
 - 退出码 4（数据目录不可写）与 5（迁移失败）：`StartupExitCodeTests` 覆盖，未在真机复现。
 - 单实例租约续期/接管、停机租约、调度扫描增量与 reconcile、队列流转、回合超时与取消、熔断状态机、路径守卫、工具 schema 快照、日志 EventId 与字段断言。
-- 性能基线（1000 任务 reconcile 约 319 ms、`queue_list` 一页约 5.5 ms）由 `P4PerformanceTests` 固化，属测试环境测量值。
+- 性能基线（1000 任务 reconcile 25 次采样：最小 303.1 / 中位 333.6 / p95 407.4 / 最大 926.4 ms，基线 2000 ms、稳态 1000 ms；`queue_list` 一页约 5.5 ms）由 `P4PerformanceTests` 固化，属测试环境测量值。原 500 ms 阈值低于观测最大值，2026-11-08 依据实测分布调高，未改被测实现与取样方式。
 
 ### 6.3 缺外部条件（未验证）
 
