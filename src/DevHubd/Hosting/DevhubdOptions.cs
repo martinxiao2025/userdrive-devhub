@@ -25,7 +25,13 @@ public sealed class DevHubdOptions
     /// </summary>
     public bool AllowAutoDelivery { get; private init; }
 
-    /// <summary>默认扫描间隔（秒）；数据库中的 <c>scheduler_state.interval_seconds</c> 优先。</summary>
+    /// <summary>
+    /// 本次启动是否显式指定了 <c>--interval</c>。显式指定时启动后写回
+    /// <c>scheduler_state.interval_seconds</c>；未指定时沿用库值（默认 30 秒）。
+    /// </summary>
+    public bool IntervalSpecified { get; private init; }
+
+    /// <summary>扫描间隔（秒）；仅在 <see cref="IntervalSpecified"/> 为 true 时写回数据库。</summary>
     public int IntervalSeconds { get; private init; } = 30;
 
     /// <summary>
@@ -46,6 +52,7 @@ public sealed class DevHubdOptions
         var dataDirectory = Environment.GetEnvironmentVariable("DEVHUB_DATA_DIR");
         var allowAuto = false;
         var interval = 30;
+        var intervalSpecified = false;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -59,6 +66,7 @@ public sealed class DevHubdOptions
                     break;
                 case "--interval":
                     interval = ParseRequiredInt(args, ref i, "--interval");
+                    intervalSpecified = true;
                     break;
                 case "--allow-auto-delivery":
                     allowAuto = true;
@@ -83,6 +91,7 @@ public sealed class DevHubdOptions
             McpPort = port,
             DataDirectory = dataDirectory,
             AllowAutoDelivery = allowAuto,
+            IntervalSpecified = intervalSpecified,
             IntervalSeconds = interval,
             SchedulerEnabled = !string.Equals(
                 Environment.GetEnvironmentVariable("DEVHUB_SCHEDULER"),

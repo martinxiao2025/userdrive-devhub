@@ -127,6 +127,60 @@ public sealed class P2ExecutionTests : IDisposable
     }
 
     /// <summary>
+    /// M1b：交付档位只看运行时单例（<see cref="EffectiveDeliveryMode"/>），不看启动配置。
+    /// 即使 Execution:DeliveryMode 仍是 dispatch_only，运行时单例为 auto 且任务声明 auto，也必须 delivered。
+    /// </summary>
+    [Fact]
+    public async Task Pump_RuntimeModeAuto_DeliversRegardlessOfConfigAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "自动交付", "ready", 10, delivery: "auto");
+        await PrepareQueueAsync(ct);
+
+        var fake = new FakeModelClient(
+            "openai",
+            (_, _, _) => Task.FromResult(TurnResult.Done("已完成。", 0, new TokenUsage(1, 1, false), Array.Empty<string>())));
+
+        // 配置保持默认 dispatch_only，只把运行时单例设为 auto。
+        var coordinator = CreateCoordinator(
+            fake,
+            new ExecutionOptions(),
+            deliveryMode: new EffectiveDeliveryMode("auto"));
+
+        await coordinator.PumpAsync(ct);
+        await WaitUntilAsync(async () => await CountAsync("SELECT COUNT(*) FROM result;", ct) == 1, ct);
+
+        Assert.Equal("delivered", await ScalarStringAsync("SELECT outcome FROM result;", ct));
+    }
+
+    /// <summary>M1b 反向：运行时单例为 dispatch_only 时，任务即便声明 auto 也只进 awaiting_review。</summary>
+    [Fact]
+    public async Task Pump_RuntimeModeDispatchOnly_KeepsAwaitingReviewAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "待审", "ready", 10, delivery: "auto");
+        await PrepareQueueAsync(ct);
+
+        var fake = new FakeModelClient(
+            "openai",
+            (_, _, _) => Task.FromResult(TurnResult.Done("已完成。", 0, new TokenUsage(1, 1, false), Array.Empty<string>())));
+
+        var coordinator = CreateCoordinator(
+            fake,
+            new ExecutionOptions { DeliveryMode = "auto" },
+            deliveryMode: new EffectiveDeliveryMode("dispatch_only"));
+
+        await coordinator.PumpAsync(ct);
+        await WaitUntilAsync(async () => await CountAsync("SELECT COUNT(*) FROM result;", ct) == 1, ct);
+
+        Assert.Equal("awaiting_review", await ScalarStringAsync("SELECT outcome FROM result;", ct));
+    }
+
+    /// <summary>
     /// 验收 2：鉴权失败按 provider 隔离——openai 进入 auth + open，vscode 状态不受影响；
     /// 且资源类失败不消耗 attempt。
     /// </summary>
@@ -323,12 +377,14 @@ public sealed class P2ExecutionTests : IDisposable
         FakeModelClient fake,
         ExecutionOptions options,
         ILogger<TurnRunner>? turnLogger = null,
-        ILogger<ExecutionCoordinator>? coordinatorLogger = null)
+        ILogger<ExecutionCoordinator>? coordinatorLogger = null,
+        EffectiveDeliveryMode? deliveryMode = null)
     {
         var normalized = options.Normalize();
         var runner = new TurnRunner(
             new ModelClientRegistry(new[] { fake }),
             normalized,
+            deliveryMode ?? new EffectiveDeliveryMode(normalized.DeliveryMode),
             new DevHubPaths(_directory),
             NullLoggerFactory.Instance,
             turnLogger ?? NullLogger<TurnRunner>.Instance);
@@ -386,7 +442,13 @@ public sealed class P2ExecutionTests : IDisposable
     /// <param name="title">标题。</param>
     /// <param name="status">状态。</param>
     /// <param name="priority">优先级。</param>
-    private static void WriteTask(string workspaceRoot, string id, string title, string status, int priority)
+    private static void WriteTask(
+        string workspaceRoot,
+        string id,
+        string title,
+        string status,
+        int priority,
+        string delivery = "review")
     {
         var payload = new
         {
@@ -394,7 +456,7 @@ public sealed class P2ExecutionTests : IDisposable
             title,
             status,
             priority,
-            delivery = "review",
+            delivery,
             writeScope = Array.Empty<string>(),
             prompt = "执行该任务",
         };

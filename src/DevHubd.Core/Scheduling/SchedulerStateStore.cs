@@ -154,6 +154,26 @@ public sealed class SchedulerStateStore
             .ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// 写回扫描间隔（<c>--interval</c> 显式指定时使用）。
+    /// 未显式指定时不会调用本方法，库值保持原样。
+    /// </summary>
+    /// <param name="seconds">间隔秒数（下限已由启动参数校验保证）。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    public async Task SetIntervalAsync(int seconds, CancellationToken cancellationToken = default)
+    {
+        var now = Now();
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        await db.SchedulerStates
+            .Where(state => state.Id == 1)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(state => state.IntervalSeconds, seconds)
+                    .SetProperty(state => state.UpdatedAt, now),
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
     /// <summary>写一条审计记录。</summary>
     /// <param name="actor">操作者（如 mcp:claude）。</param>
     /// <param name="action">动作名。</param>

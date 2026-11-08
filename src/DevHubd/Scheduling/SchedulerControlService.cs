@@ -23,14 +23,16 @@ public sealed class SchedulerControlService : ISchedulerControl
     private readonly ProviderStateStore _providerStates;
     private readonly ModelClientRegistry _clients;
     private readonly DevHubdOptions _options;
+    private readonly EffectiveDeliveryMode _deliveryMode;
     private readonly ILogger<SchedulerControlService> _logger;
 
-    /// <summary>注入状态存取、唤醒信号、provider 状态、客户端注册表、启动选项与日志器。</summary>
+    /// <summary>注入状态存取、唤醒信号、provider 状态、客户端注册表、启动选项、运行时档位与日志器。</summary>
     /// <param name="stateStore">调度状态存取。</param>
     /// <param name="wake">唤醒信号。</param>
     /// <param name="providerStates">provider 状态存取。</param>
     /// <param name="clients">模型客户端注册表。</param>
     /// <param name="options">启动选项（决定档位锁与环境硬关）。</param>
+    /// <param name="deliveryMode">运行时交付档位单例，写库成功后同步更新。</param>
     /// <param name="logger">日志器。</param>
     public SchedulerControlService(
         SchedulerStateStore stateStore,
@@ -38,6 +40,7 @@ public sealed class SchedulerControlService : ISchedulerControl
         ProviderStateStore providerStates,
         ModelClientRegistry clients,
         DevHubdOptions options,
+        EffectiveDeliveryMode deliveryMode,
         ILogger<SchedulerControlService> logger)
     {
         _stateStore = stateStore;
@@ -45,6 +48,7 @@ public sealed class SchedulerControlService : ISchedulerControl
         _providerStates = providerStates;
         _clients = clients;
         _options = options;
+        _deliveryMode = deliveryMode;
         _logger = logger;
     }
 
@@ -159,6 +163,10 @@ public sealed class SchedulerControlService : ISchedulerControl
 
         var before = await _stateStore.ReadAsync(cancellationToken).ConfigureAwait(false);
         await _stateStore.SetModeAsync(normalized, cancellationToken).ConfigureAwait(false);
+
+        // 写库成功后同步运行时单例：执行侧、健康检查与 limits 立即看到新档位，
+        // 不再出现"库已切换、执行仍按配置跑"的空转。
+        _deliveryMode.Set(normalized);
         await _stateStore.AuditAsync(Actor, "scheduler.set_mode", "scheduler_state", $"mode={normalized}", cancellationToken)
             .ConfigureAwait(false);
 

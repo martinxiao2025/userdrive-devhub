@@ -88,6 +88,7 @@ public sealed class SchedulerControlServiceTests : IDisposable
             new ProviderStateStore(_factory),
             new ModelClientRegistry(Array.Empty<IModelClient>()),
             DevHubdOptions.FromArgsAndEnvironment(Array.Empty<string>()),
+            new EffectiveDeliveryMode("dispatch_only"),
             NullLogger<SchedulerControlService>.Instance);
     }
 

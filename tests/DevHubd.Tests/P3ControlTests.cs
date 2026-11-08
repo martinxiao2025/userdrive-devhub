@@ -29,6 +29,7 @@ public sealed class P3ControlTests : IAsyncLifetime
     private SqliteConnectionFactory _factory = null!;
     private SchedulerStateStore _stateStore = null!;
     private ProviderStateStore _providerStates = null!;
+    private EffectiveDeliveryMode _deliveryMode = null!;
 
     /// <summary>准备临时数据库。</summary>
     public async ValueTask InitializeAsync()
@@ -38,6 +39,7 @@ public sealed class P3ControlTests : IAsyncLifetime
         await Migrator.MigrateAsync(_factory, TestContext.Current.CancellationToken);
         _stateStore = new SchedulerStateStore(_factory);
         _providerStates = new ProviderStateStore(_factory);
+        _deliveryMode = new EffectiveDeliveryMode("dispatch_only");
     }
 
     /// <summary>清理临时目录。</summary>
@@ -55,15 +57,15 @@ public sealed class P3ControlTests : IAsyncLifetime
         return ValueTask.CompletedTask;
     }
 
-    /// <summary>上报的 deliveryMode 必须等于实际执行配置，而不是命令行解锁标记。</summary>
+    /// <summary>上报的 deliveryMode 必须来自运行时单例，而不是命令行解锁标记或配置初值。</summary>
     [Fact]
-    public async Task Limits_DeliveryMode_MatchesExecutionConfigAsync()
+    public async Task Limits_DeliveryMode_MatchesRuntimeModeAsync()
     {
         var options = DevHubdOptions.FromArgsAndEnvironment(Array.Empty<string>());
         Assert.False(options.AllowAutoDelivery);
 
-        var execution = new ExecutionOptions { DeliveryMode = "auto" }.Normalize();
-        var limits = await new DevHubd.Endpoints.LimitsSource(execution, options)
+        var execution = new ExecutionOptions().Normalize();
+        var limits = await new DevHubd.Endpoints.LimitsSource(execution, new EffectiveDeliveryMode("auto"), options)
             .GetAsync(TestContext.Current.CancellationToken);
 
         Assert.Equal("auto", limits.Mode);
@@ -95,7 +97,32 @@ public sealed class P3ControlTests : IAsyncLifetime
         Assert.True(snapshot.Changed);
         Assert.Equal("auto", snapshot.Mode);
         Assert.Equal("auto", (await _stateStore.ReadAsync(ct)).Mode);
+
+        // M1b：写库成功后运行时单例必须同步，执行侧不能继续按旧档位跑。
+        Assert.Equal("auto", _deliveryMode.Value);
         Assert.Equal(1, await CountAuditAsync("scheduler.set_mode", ct));
+    }
+
+    /// <summary>
+    /// M6：只有显式 <c>--interval</c> 才标记为需要写回，写回后库值与读回值一致。
+    /// </summary>
+    [Fact]
+    public async Task Interval_ExplicitFlag_PersistsToStateAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+
+        var implicitOptions = DevHubdOptions.FromArgsAndEnvironment(Array.Empty<string>());
+        Assert.False(implicitOptions.IntervalSpecified);
+
+        var explicitOptions = DevHubdOptions.FromArgsAndEnvironment(new[] { "--interval", "45" });
+        Assert.True(explicitOptions.IntervalSpecified);
+        Assert.Equal(45, explicitOptions.IntervalSeconds);
+
+        Assert.Equal(30, (await _stateStore.ReadAsync(ct)).IntervalSeconds);
+
+        await _stateStore.SetIntervalAsync(explicitOptions.IntervalSeconds, ct);
+
+        Assert.Equal(45, (await _stateStore.ReadAsync(ct)).IntervalSeconds);
     }
 
     /// <summary>熔断未打开时重置返回 NOT_PAUSED。</summary>
@@ -225,6 +252,7 @@ public sealed class P3ControlTests : IAsyncLifetime
             _providerStates,
             new ModelClientRegistry(clients),
             options,
+            _deliveryMode,
             NullLogger<SchedulerControlService>.Instance);
 
     /// <summary>统计指定动作的审计条数。</summary>

@@ -89,6 +89,16 @@ internal static partial class DevHubLog
     [LoggerMessage(EventId = 1106, Level = LogLevel.Warning, Message = "用户配置问题：{Problem}")]
     public static partial void UserConfigProblem(ILogger logger, string problem);
 
+    /// <summary>运行时交付档位确定：记录最终生效值与来源（config / scheduler_state）。</summary>
+    [LoggerMessage(EventId = 1107, Level = LogLevel.Information,
+        Message = "交付档位已确定：deliveryMode={DeliveryMode} source={Source}")]
+    public static partial void DeliveryModeResolved(ILogger logger, string deliveryMode, string source);
+
+    /// <summary>启动参数 <c>--interval</c> 已写回 <c>scheduler_state.interval_seconds</c>。</summary>
+    [LoggerMessage(EventId = 1108, Level = LogLevel.Information,
+        Message = "扫描间隔已写回：intervalSeconds={IntervalSeconds}")]
+    public static partial void IntervalPersisted(ILogger logger, int intervalSeconds);
+
     /// <summary>健康检查探库失败，<c>/health</c> 返回 503。</summary>
     [LoggerMessage(EventId = 1200, Level = LogLevel.Warning,
         Message = "健康检查失败，/health 返回 503。database={Database}")]

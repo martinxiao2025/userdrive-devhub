@@ -28,13 +28,13 @@ public static class HealthEndpoints
 
     /// <summary>健康检查处理逻辑：探一次数据库并返回结构化的状态。</summary>
     /// <param name="host">宿主信息。</param>
-    /// <param name="execution">实际生效的执行参数。</param>
+    /// <param name="deliveryMode">运行时交付档位（与 <c>scheduler_state.mode</c> 同源）。</param>
     /// <param name="contextFactory">EF Core 上下文工厂。</param>
     /// <param name="loggerFactory">日志工厂。</param>
     /// <param name="cancellationToken">请求取消令牌。</param>
     private static async Task<IResult> HandleAsync(
         HostInfo host,
-        DevHubd.Core.Execution.ExecutionOptions execution,
+        DevHubd.Core.Execution.EffectiveDeliveryMode deliveryMode,
         IDbContextFactory<DevHubDbContext> contextFactory,
         ILoggerFactory loggerFactory,
         CancellationToken cancellationToken)
@@ -62,7 +62,7 @@ public static class HealthEndpoints
                 startedAt = host.StartedAt.ToString("O"),
                 uptimeSeconds = host.UptimeSeconds,
                 mcp = new { url = $"http://{host.Options.BindAddress}:{host.Options.McpPort}/mcp", port = host.Options.McpPort },
-                deliveryMode = execution.DeliveryMode,
+                deliveryMode = deliveryMode.Value,
                 database = new { path = host.Paths.DatabasePath, schemaVersion = version, tables },
             });
         }

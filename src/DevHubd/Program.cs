@@ -111,6 +111,8 @@ internal static class Program
             return Exit(logger, ExitCodes.DataDirectoryNotWritable);
         }
 
+        // 先记下迁移前库文件是否存在：新库用配置档位做种子，老库以库内档位为准。
+        var databaseExisted = File.Exists(paths.DatabasePath);
         var factory = new SqliteConnectionFactory(paths.DatabasePath);
         int schemaVersion;
         try
@@ -157,6 +159,9 @@ internal static class Program
         builder.Services.AddSingleton(paths);
         builder.Services.AddSingleton(factory);
         builder.Services.AddSingleton(hostInfo);
+
+        // 运行时交付档位单例：配置只作初始值，随后由 scheduler_state.mode 校正。
+        builder.Services.AddSingleton(new EffectiveDeliveryMode(userConfig.Execution.DeliveryMode));
 
         // 数据访问走 EF Core；连接串与裸连接工厂一致，PRAGMA 由拦截器在每次连接打开时执行。
         // 注意：不走 EF Migrations/Runtime（schema 由 Migrator 独占管理），只注册上下文工厂。
@@ -250,6 +255,29 @@ internal static class Program
 
         var app = builder.Build();
 
+        // M1b：scheduler_state.mode 是运行时档位的权威来源。
+        // 新库把配置值写入种子；老库以库值为准，配置只作初始值（避免升级后被静默改写）。
+        var stateStore = app.Services.GetRequiredService<SchedulerStateStore>();
+        var effectiveDeliveryMode = app.Services.GetRequiredService<EffectiveDeliveryMode>();
+        if (databaseExisted)
+        {
+            var persisted = await stateStore.ReadAsync().ConfigureAwait(false);
+            effectiveDeliveryMode.Set(persisted.Mode);
+            DevHubLog.DeliveryModeResolved(logger, effectiveDeliveryMode.Value, "scheduler_state");
+        }
+        else
+        {
+            await stateStore.SetModeAsync(effectiveDeliveryMode.Value).ConfigureAwait(false);
+            DevHubLog.DeliveryModeResolved(logger, effectiveDeliveryMode.Value, "config");
+        }
+
+        // M6：只有显式传 --interval 才写回库，未传时沿用既有 interval_seconds。
+        if (options.IntervalSpecified)
+        {
+            await stateStore.SetIntervalAsync(options.IntervalSeconds).ConfigureAwait(false);
+            DevHubLog.IntervalPersisted(logger, options.IntervalSeconds);
+        }
+
         app.MapHealthEndpoints();
         app.MapInternalApiEndpoints();
         app.MapDevHubdMcp();
@@ -263,7 +291,7 @@ internal static class Program
                 RuntimeFileWriter.Write(
                     paths,
                     options,
-                    userConfig.Execution.DeliveryMode,
+                    effectiveDeliveryMode.Value,
                     startedAt,
                     apiToken);
                 DevHubLog.RuntimeFileWritten(logger, paths.RuntimeFilePath);

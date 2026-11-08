@@ -43,25 +43,29 @@ public sealed class TurnRunner
 
     private readonly ModelClientRegistry _registry;
     private readonly ExecutionOptions _options;
+    private readonly EffectiveDeliveryMode _deliveryMode;
     private readonly DevHubPaths _paths;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<TurnRunner> _logger;
 
-    /// <summary>注入模型注册表、执行配置、路径、日志工厂与日志器。</summary>
+    /// <summary>注入模型注册表、执行配置、运行时档位、路径、日志工厂与日志器。</summary>
     /// <param name="registry">模型客户端注册表。</param>
     /// <param name="options">执行配置。</param>
+    /// <param name="deliveryMode">运行时交付档位（唯一来源，已由 <c>scheduler_state.mode</c> 校正）。</param>
     /// <param name="paths">运行时路径。</param>
     /// <param name="loggerFactory">用于创建工具执行器日志器。</param>
     /// <param name="logger">日志器。</param>
     public TurnRunner(
         ModelClientRegistry registry,
         ExecutionOptions options,
+        EffectiveDeliveryMode deliveryMode,
         DevHubPaths paths,
         ILoggerFactory loggerFactory,
         ILogger<TurnRunner> logger)
     {
         _registry = registry;
         _options = options;
+        _deliveryMode = deliveryMode;
         _paths = paths;
         _loggerFactory = loggerFactory;
         _logger = logger;
@@ -219,11 +223,12 @@ public sealed class TurnRunner
     }
 
     /// <summary>
-    /// 计算实际交付档位：全局 <c>auto</c> 且任务声明 <c>auto</c> 才交付；任务可收紧但不可放宽。
+    /// 计算实际交付档位：运行时档位为 <c>auto</c> 且任务声明 <c>auto</c> 才交付；任务可收紧但不可放宽。
+    /// 运行时档位来自 <see cref="EffectiveDeliveryMode"/>，与 <c>scheduler_state.mode</c> 保持一致。
     /// </summary>
     /// <param name="task">任务文档。</param>
     private string ResolveDeliveryOutcome(TaskDocument task) =>
-        string.Equals(_options.DeliveryMode, "auto", StringComparison.Ordinal) &&
+        string.Equals(_deliveryMode.Value, "auto", StringComparison.Ordinal) &&
         string.Equals(task.Delivery, "auto", StringComparison.Ordinal)
             ? "delivered"
             : "awaiting_review";
