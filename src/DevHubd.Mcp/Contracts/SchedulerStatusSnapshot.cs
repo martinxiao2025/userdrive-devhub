@@ -50,6 +50,28 @@ public sealed record SchedulerStatusSnapshot
 
     /// <summary>角色快照与并发占用（来自 <c>role_view</c>，见架构增量方案 §4.2）。</summary>
     public IReadOnlyList<RoleStatus> Roles { get; init; } = Array.Empty<RoleStatus>();
+
+    /// <summary>执行边界：两个交付档位下模型是否执行、读根与写根各在哪里。</summary>
+    public ExecutionBoundary Execution { get; init; } = new();
+}
+
+/// <summary>
+/// 执行边界。两个档位下模型都会执行回合，区别只在写根与结果去向：
+/// auto 写工作区（受 writeScope 约束）并直接交付；dispatch_only 只写隔离目录，结果待人工复核。
+/// </summary>
+public sealed record ExecutionBoundary
+{
+    /// <summary>模型是否仍执行回合。两个档位都为 true，dispatch_only 只是不改工作区。</summary>
+    public bool ModelRuns { get; init; } = true;
+
+    /// <summary>读根：固定为 <c>workspace</c>，只读，<c>read_file</c> / <c>list_dir</c> / <c>search</c> 可读源码与既有文件。</summary>
+    public string ReadRoot { get; init; } = "workspace";
+
+    /// <summary>写根：auto 为 <c>workspace</c>；dispatch_only 为 <c>isolation</c>（<c>work/&lt;queueItemId&gt;</c>）。</summary>
+    public string WriteRoot { get; init; } = "isolation";
+
+    /// <summary>结果去向：delivered / awaiting_review。</summary>
+    public string ResultDelivery { get; init; } = "awaiting_review";
 }
 
 /// <summary>单个角色的声明摘要与当前占用。</summary>

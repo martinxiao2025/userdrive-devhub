@@ -40,8 +40,8 @@ public sealed class TurnRunner
         """
         你是 devhubd 的定时任务执行器。请严格按任务指令完成工作，并遵守以下约束：
         1. 只能使用提供的工具；工具入参路径必须是相对路径。
-        2. 读取与写入使用同一根，读写范围由系统强制校验，越界会被拒绝。
-        3. 当前交付档位为 {0}：{1}
+        2. {0}
+        3. 当前交付档位为 {1}
         4. 不要尝试提交、推送、合并或运行命令。
         5. 完成后用简洁中文总结你做了什么；如果没有写入任何文件，请明确说明。
         """;
@@ -139,11 +139,12 @@ public sealed class TurnRunner
         var deliveryOutcome = ResolveDeliveryOutcome(task, schedulerState.Mode);
         var workDirectory = deliveryOutcome == "delivered" ? null : CreateWorkDirectory(item.Id);
 
-        // 读写同根：dispatch_only 下模型在隔离目录内读写，auto 档位下读写工作区根。
-        // 同根保证模型能读到自己在上一回合写入的内容（跨回合续写、检查产物都依赖这一点）。
-        var executionRoot = workDirectory ?? workspace.Root;
+        // 读根固定为工作区（只读），写根由交付档位决定：
+        // dispatch_only 写该队列项的隔离目录，auto 写工作区并受 writeScope 约束。
+        var writeRoot = workDirectory ?? workspace.Root;
         var workspaceContext = new TurnWorkspace(
-            executionRoot,
+            workspace.Root,
+            writeRoot,
             task.WriteScope,
             EnforceScope: deliveryOutcome == "delivered");
 
@@ -182,7 +183,7 @@ public sealed class TurnRunner
             item.Id,
             item.WorkspaceId,
             item.TaskId,
-            BuildSystemPrompt(deliveryOutcome, task, workspace, executionRoot),
+            BuildSystemPrompt(deliveryOutcome, task, workspace, writeRoot),
             prompt,
             dispatcher.Describe(),
             budget,
@@ -371,31 +372,33 @@ public sealed class TurnRunner
             .ToArray();
     }
 
-    /// <summary>构造系统提示词，明确交付档位、写作用域与敏感路径边界。</summary>
-    /// <param name="deliveryOutcome">交付档位。</param>
+    /// <summary>构造系统提示词，明确读根、写根、交付档位与敏感路径边界。</summary>
+    /// <param name="deliveryOutcome">交付档位：delivered / awaiting_review。</param>
     /// <param name="task">任务文档。</param>
-    /// <param name="workspace">工作区。</param>
-    /// <param name="executionRoot">本回合读写同根的根目录。</param>
+    /// <param name="workspace">工作区（读根）。</param>
+    /// <param name="writeRoot">本回合写根：auto 为工作区根，dispatch_only 为隔离工作目录。</param>
     private static string BuildSystemPrompt(
         string deliveryOutcome,
         TaskDocument task,
         WorkspaceDefinition workspace,
-        string executionRoot)
+        string writeRoot)
     {
-        var delivery = deliveryOutcome == "delivered"
-            ? "auto（可在 writeScope 内直接写工作区，但仍不提交、不推送、不合并）"
-            : "dispatch_only（只写隔离目录，结果交人工复核，不改工作区）";
+        var delivered = deliveryOutcome == "delivered";
+        var delivery = delivered
+            ? "auto（可在 writeScope 内直接写工作区，结果直接交付，但仍不提交、不推送、不合并）"
+            : "dispatch_only（模型照常执行回合，但写入只落该队列项的隔离目录，结果进入 awaiting_review 等人工复核，不改工作区）";
 
         var scope = task.WriteScope.Count == 0 ? "（未声明，视为只读）" : string.Join(", ", task.WriteScope);
         var sensitive = string.Join(", ", _sensitivePromptSegments);
-        var rootNote = deliveryOutcome == "delivered"
-            ? $"读写根为工作区 {executionRoot}"
-            : $"读写根为隔离工作目录 {executionRoot}";
+        var roots = delivered
+            ? $"读根与写根同为工作区 {workspace.Root}：读工具只能读工作区，写工具只能在任务 writeScope（{scope}）内写工作区"
+            : $"读根为工作区 {workspace.Root}（只读），可用 read_file / list_dir / search 读取源码与既有文件；" +
+              $"写根为隔离工作目录 {writeRoot}，write_file / apply_patch 只能写该目录，读工具看不到隔离目录中的产物";
 
         return string.Format(
             SystemPromptTemplate,
-            delivery,
-            $"{rootNote}（读与写使用同一根），任务 writeScope 为 {scope}，敏感路径（{sensitive}、.git、*.pem、*.key）一律拒绝。");
+            $"{roots}；敏感路径（{sensitive}、.git、*.pem、*.key）一律拒绝，越界由进程强制拦截。",
+            delivery);
     }
 
     /// <summary>

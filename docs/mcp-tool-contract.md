@@ -91,6 +91,7 @@
 | `providers[]` | array | `provider` / `state` / `detail` / `checkedAt`（UTC + Z） |
 | `tokens` | object | 累计用量；`attemptsWithUsage` / `attemptsWithoutUsage` / `estimatedAttempts` 分列 |
 | `roles[]` | array | 角色快照：`id` / `name` / `delivery` / `maxParallel` / `running`（v5 起） |
+| `execution` | object | 执行边界：`modelRuns` / `readRoot` / `writeRoot` / `resultDelivery`（见 §5） |
 | `mcp` | object | `host` / `port` / `path`；端口固定 3091 |
 | `host` | object | `version` / `pid` / `schemaVersion` / `dataDirectory` / `startedAt`（UTC + Z） |
 | `unread` | object | 未读结果计数 |
@@ -285,9 +286,27 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 `roundsExhausted` 只表示“预算用完”，不改变状态；自动化流程应把 `roundsExhausted=true`
 视同需要人工复核，不得当成“任务已完成”。
 
-**读写根**：同一回合内 `read_file` / `list_dir` 与 `write_file` 使用**同一个根**：
-`delivered`（auto）档位为工作区根，`dispatch_only` 档位为该队列项的隔离工作目录。
-模型因此能读到自己在上一回合写入的文件；相对路径同时用于读和写，不再出现“写进了隔离目录、却从工作区读”的错位。
+**读 / 写 / 执行边界**（两个档位一处说清，不留隐式差别）：
+
+| 方面 | `auto`（结果 `delivered`） | `dispatch_only`（结果 `awaiting_review`） |
+|---|---|---|
+| 读 | `read_file` / `list_dir` / `search` 读**工作区根**（只读） | 同左：同样读**工作区根**，可读源码与既有文件 |
+| 写 | `write_file` / `apply_patch` 写**工作区根**，且必须落在任务 `writeScope` 内（否则 `SCOPE_DENIED`） | 只写该队列项的**隔离目录** `work/<queueItemId>`；不写工作区，`writeScope` 不参与校验 |
+| 执行 | 模型执行回合 | 模型**同样执行回合**，只是产物不出隔离目录 |
+| 结果 | 直接 `delivered` | `awaiting_review`，需 `result_approve` / `result_reject` |
+
+- 实现位置：`TurnRunner.RunAsync` 组装 `TurnWorkspace(ReadRoot, WriteRoot, WriteScope, EnforceScope)`，
+  读根恒为 `workspace.Root`，写根为 `workDirectory ?? workspace.Root`；`ToolDispatcher` 的读工具用
+  `ReadRoot`，写工具用 `WriteRoot`。
+- 越界防护：所有路径先经 `PathGuard.ResolveInside` —— 拒绝空路径、绝对路径、`..`、敏感路径
+  （`.git` / `.ssh` / `secrets` / `.env*` / `*.pem` / `*.key` / `*.pfx` / `*.p12`）、根外路径与符号链接/junction 逃逸；
+  auto 档位额外校验 `writeScope`。验证方式见 `PathGuardTests` 的
+  `ToolDispatcher_DispatchOnly_ReadsWorkspaceAndWritesIsolationAsync`（可读工作区文件、写入只落隔离目录、
+  `../` 与绝对路径越界读被拒绝、敏感路径被拒绝）。
+- 边界差异：`dispatch_only` 下读工具**看不到**隔离目录里的产物（读根是工作区）；模型需要确认产物时
+  以回合总结中的相对路径为准，人工从 `work/<queueItemId>` 复核。
+- `scheduler_status.execution` 把上述边界显式暴露给调用方：
+  `{ modelRuns: true, readRoot: "workspace", writeRoot: "workspace" | "isolation", resultDelivery: "delivered" | "awaiting_review" }`。
 
 **重试预算口径**：预算只看 `attempt` 表中**非 `NEEDS_INPUT` 且非资源类失败**的回合数：
 
@@ -326,7 +345,21 @@ COUNT(attempt WHERE queue_item_id = ?
 
 ## 6. 变更记录
 
-### B 变体补充 — 2026-11-08（答案注入恢复回合、资源类豁免预算、读写同根）
+### 读写边界修正 — 2026-11-08（dispatch_only 读放开、写仍受控）
+
+- **读放开**：`TurnWorkspace` 恢复 `ReadRoot` / `WriteRoot` 双根。读根恒为工作区根，
+  `read_file` / `list_dir` / `search` 在 `dispatch_only` 下也能读源码与既有文件；路径校验不放松，
+  越界（`..`、绝对路径、符号链接逃逸）与敏感路径照旧拒绝。
+- **写仍受控**：写根在 `dispatch_only` 为该队列项的隔离目录 `work/<queueItemId>`，auto 为工作区根并受
+  `writeScope` 约束。`write_file` / `apply_patch` 不会写工作区。
+- **语义显式化**：`dispatch_only` 的本意是“产物不直接落工作区、结果待人工复核”，不是“模型不动手”；
+  模型仍执行回合。该边界写入 `scheduler_status.execution`（`modelRuns` / `readRoot` / `writeRoot` /
+  `resultDelivery`）与系统提示词，不再靠工具可见范围暗示。
+- **一处说清**：契约 §5「读 / 写 / 执行边界」表格列出两个档位在读、写、执行、结果四方面的确切边界。
+- 测试：`ToolDispatcher_DispatchOnly_ReadsWorkspaceAndWritesIsolationAsync` 覆盖可读工作区文件、
+  写入只落隔离目录、`../` 与绝对路径越界读被拒绝、敏感路径被拒绝；auto 档位沿用 `SCOPE_DENIED` 用例。
+
+### B 变体补充 — 2026-11-08（答案注入恢复回合、资源类豁免预算）
 
 - **答案注入**：`TurnRunner` 在每次回合开始读取该队列项已回答的问题单
   （`InputRequestStore.ListAnsweredForQueueItemAsync`），按提问时间升序以「## 此前的人工回答」
@@ -336,10 +369,9 @@ COUNT(attempt WHERE queue_item_id = ?
 - **资源类失败豁免重试预算**：`ModelErrorKinds.BudgetExempt`（auth / quota / no_model / bridge_down）
   同时用于认领 SQL 与 `ExecutionStore.CountConsumingAttemptsAsync`，与旧文档口径一致。
   上一版变更记录中「资源类失败现在也消耗预算」的描述作废，以本条为准。
-- **读写根统一**：`TurnWorkspace` 收敛为单一 `Root`，`read_file` / `list_dir` / `write_file`
-  使用同一根；`dispatch_only` 下模型可读到自己在隔离目录里上一回合写入的文件。
+- ~~**读写根统一**：`TurnWorkspace` 收敛为单一 `Root`~~ —— 已作废，改为上方「读写边界修正」
+  （读根=工作区、写根=隔离目录，双根）。
 - 测试：`Pump_AfterAnswer_ResumesWithNewAttemptAndProducesResultAsync` 断言恢复回合 prompt 含答案；
-  `ToolDispatcher_ReviewMode_WritesOnlyUnderWorkDirectoryAsync` 覆盖“写后能读/列”；
   资源失败用例连续 4 个 auth 回合仍可认领（`max_attempts=3` 不被闸门挡死）。
 
 ### B 变体修复 — 2026-11-08（attempt 单调、预算改按回合数、tick 单项隔离）

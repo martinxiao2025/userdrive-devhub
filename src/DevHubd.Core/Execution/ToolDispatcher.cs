@@ -7,13 +7,16 @@ using Microsoft.Extensions.Logging;
 namespace DevHubd.Core.Execution;
 
 /// <summary>
-/// 一个回合的读写上下文：读写必须同根，保证模型能读到自己在上一回合写入的内容。
+/// 一个回合的文件边界：读根与写根分离。
+/// 读根固定为工作区根（只读），写根由交付档位决定，保证 dispatch_only 下模型能读源码、写入仍被隔离。
 /// </summary>
-/// <param name="Root">读写根：auto 档位为工作区根，dispatch_only 档位为隔离工作目录。</param>
+/// <param name="ReadRoot">读根：工作区根；<c>read_file</c> / <c>list_dir</c> / <c>search</c> 只能读它之下。</param>
+/// <param name="WriteRoot">写根：auto 档位为工作区根，dispatch_only 档位为该队列项的隔离目录。</param>
 /// <param name="WriteScope">任务声明的写作用域；null 表示不限制（隔离目录场景）。</param>
-/// <param name="EnforceScope">是否强制 writeScope 校验。</param>
+/// <param name="EnforceScope">是否强制 writeScope 校验（仅 auto 档位为 true）。</param>
 public sealed record TurnWorkspace(
-    string Root,
+    string ReadRoot,
+    string WriteRoot,
     IReadOnlyList<string>? WriteScope,
     bool EnforceScope);
 
@@ -35,19 +38,19 @@ public sealed class ToolDispatcher : IToolDispatcher
     {
         new(
             "read_file",
-            "读取工作区内的文本文件。路径必须相对工作区根。",
+            "读取工作区（只读根）内的文本文件。只能读工作区根之下，越界与敏感路径会被拒绝。",
             """{"type":"object","properties":{"path":{"type":"string","description":"相对工作区根的路径"}},"required":["path"],"additionalProperties":false}"""),
         new(
             "list_dir",
-            "列出工作区内的目录项，深度不超过 4。",
+            "列出工作区（只读根）内的目录项，深度不超过 4。",
             """{"type":"object","properties":{"path":{"type":"string","description":"相对工作区根的目录，默认 ."},"depth":{"type":"integer","minimum":1,"maximum":4}},"additionalProperties":false}"""),
         new(
             "search",
-            "在工作区内做文本检索，最多返回 100 条命中。",
+            "在工作区（只读根）内做文本检索，最多返回 100 条命中。",
             """{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string","description":"相对工作区根，默认 ."},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["query"],"additionalProperties":false}"""),
         new(
             "write_file",
-            "写入文本文件。仅允许写作用域内；敏感路径与超预算写入会被拒绝。",
+            "写入文本文件。auto 档位写入工作区且受 writeScope 限制；dispatch_only 档位只写该队列项的隔离目录。敏感路径与超预算写入会被拒绝。",
             """{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false}"""),
         new(
             "apply_patch",
@@ -287,7 +290,7 @@ public sealed class ToolDispatcher : IToolDispatcher
             .ToArray();
     }
 
-    /// <summary>读文件：工作区内、不超过预算的读取上限。</summary>
+    /// <summary>读文件：只读根（工作区）内、不超过预算的读取上限。</summary>
     /// <param name="input">入参。</param>
     /// <param name="cancellationToken">取消令牌。</param>
     private async Task<ToolExecutionResult> ReadFileAsync(JsonElement input, CancellationToken cancellationToken)
@@ -297,7 +300,7 @@ public sealed class ToolDispatcher : IToolDispatcher
             return ToolExecutionResult.Fail(DevHubErrorCodes.InvalidArgument, "缺少 path 参数。");
         }
 
-        var check = PathGuard.ResolveRead(_workspace.Root, relativePath);
+        var check = PathGuard.ResolveRead(_workspace.ReadRoot, relativePath);
         if (!check.Success)
         {
             return ToolExecutionResult.Fail(check.ErrorCode!, check.ErrorMessage!);
@@ -327,14 +330,14 @@ public sealed class ToolDispatcher : IToolDispatcher
         }
     }
 
-    /// <summary>列目录：工作区内、深度不超过 4。</summary>
+    /// <summary>列目录：只读根（工作区）内、深度不超过 4。</summary>
     /// <param name="input">入参。</param>
     private ToolExecutionResult ListDirectory(JsonElement input)
     {
         var relativePath = TryGetString(input, "path", out var value) ? value : ".";
         var depth = TryGetInt32(input, "depth", out var requested) ? Math.Clamp(requested, 1, 4) : 1;
 
-        var check = PathGuard.ResolveRead(_workspace.Root, relativePath);
+        var check = PathGuard.ResolveRead(_workspace.ReadRoot, relativePath);
         if (!check.Success)
         {
             return ToolExecutionResult.Fail(check.ErrorCode!, check.ErrorMessage!);
@@ -391,7 +394,7 @@ public sealed class ToolDispatcher : IToolDispatcher
         }
     }
 
-    /// <summary>文本检索：工作区内、最多 100 条命中。</summary>
+    /// <summary>文本检索：只读根（工作区）内、最多 100 条命中。</summary>
     /// <param name="input">入参。</param>
     /// <param name="cancellationToken">取消令牌。</param>
     private async Task<ToolExecutionResult> SearchAsync(JsonElement input, CancellationToken cancellationToken)
@@ -404,7 +407,7 @@ public sealed class ToolDispatcher : IToolDispatcher
         var relativePath = TryGetString(input, "path", out var path) ? path : ".";
         var limit = TryGetInt32(input, "limit", out var requested) ? Math.Clamp(requested, 1, MaxSearchResults) : MaxSearchResults;
 
-        var check = PathGuard.ResolveRead(_workspace.Root, relativePath);
+        var check = PathGuard.ResolveRead(_workspace.ReadRoot, relativePath);
         if (!check.Success)
         {
             return ToolExecutionResult.Fail(check.ErrorCode!, check.ErrorMessage!);
@@ -437,7 +440,7 @@ public sealed class ToolDispatcher : IToolDispatcher
                 break;
             }
 
-            var relative = Path.GetRelativePath(_workspace.Root, file);
+            var relative = Path.GetRelativePath(_workspace.ReadRoot, file);
             if (PathGuard.IsSensitive(relative))
             {
                 continue;
@@ -477,7 +480,7 @@ public sealed class ToolDispatcher : IToolDispatcher
         return ToolExecutionResult.Ok(results.Count == 0 ? "（无命中）" : string.Join('\n', results));
     }
 
-    /// <summary>写文件：写根内 + 作用域 + 预算。</summary>
+    /// <summary>写文件：写根（dispatch_only 为隔离目录）内 + 作用域 + 预算。</summary>
     /// <param name="input">入参。</param>
     /// <param name="cancellationToken">取消令牌。</param>
     private async Task<ToolExecutionResult> WriteFileAsync(JsonElement input, CancellationToken cancellationToken)
@@ -496,7 +499,7 @@ public sealed class ToolDispatcher : IToolDispatcher
         }
 
         var check = PathGuard.ResolveWrite(
-            _workspace.Root,
+            _workspace.WriteRoot,
             relativePath,
             _workspace.WriteScope,
             _workspace.EnforceScope);
@@ -541,7 +544,7 @@ public sealed class ToolDispatcher : IToolDispatcher
         }
 
         var check = PathGuard.ResolveWrite(
-            _workspace.Root,
+            _workspace.WriteRoot,
             relativePath,
             _workspace.WriteScope,
             _workspace.EnforceScope);

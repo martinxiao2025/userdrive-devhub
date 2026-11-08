@@ -65,6 +65,16 @@ public sealed class DevHubHostState : ISchedulerStatusSource
         var tokens = await ReadTokenCountersAsync(db, cancellationToken).ConfigureAwait(false);
         var roles = await ReadRolesAsync(db, cancellationToken).ConfigureAwait(false);
 
+        // 执行边界随档位变化：读根恒为工作区，dispatch_only 的写根是隔离目录且结果待审。
+        var auto = string.Equals(scheduler.Mode, "auto", StringComparison.Ordinal);
+        var execution = new ExecutionBoundary
+        {
+            ModelRuns = true,
+            ReadRoot = "workspace",
+            WriteRoot = auto ? "workspace" : "isolation",
+            ResultDelivery = auto ? "delivered" : "awaiting_review",
+        };
+
         return new SchedulerStatusSnapshot
         {
             Enabled = scheduler.Enabled,
@@ -80,6 +90,7 @@ public sealed class DevHubHostState : ISchedulerStatusSource
             Tokens = tokens,
             Providers = providers,
             Roles = roles,
+            Execution = execution,
             Mcp = new McpBindingStatus { Bound = true, Port = _host.Options.McpPort },
             Host = new HostStatus
             {

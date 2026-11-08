@@ -152,11 +152,18 @@ public sealed class ToolSurfaceSnapshotTests
         foreach (var key in new[]
                  {
                      "enabled", "mode", "phase", "intervalSeconds", "counters", "queue",
-                     "providers", "mcp", "host", "unread",
+                     "providers", "mcp", "host", "unread", "execution",
                  })
         {
             Assert.True(root.TryGetProperty(key, out _), $"缺少字段：{key}");
         }
+
+        // 执行边界必须明确表达：模型仍执行回合，读根恒为工作区，写根随档位变化。
+        var execution = root.GetProperty("execution");
+        Assert.True(execution.GetProperty("modelRuns").GetBoolean());
+        Assert.Equal("workspace", execution.GetProperty("readRoot").GetString());
+        Assert.Equal("isolation", execution.GetProperty("writeRoot").GetString());
+        Assert.Equal("awaiting_review", execution.GetProperty("resultDelivery").GetString());
 
         // null 字段按约定不序列化。
         Assert.False(root.TryGetProperty("pauseReason", out _));

@@ -12,25 +12,33 @@ namespace DevHubd.Tests;
 public sealed class PathGuardTests : IDisposable
 {
     private readonly string _root;
+    private readonly string _workRoot;
     private readonly BudgetLimits _budget = new(4, TimeSpan.FromMinutes(1), 5, 10, 1024 * 1024, 1024 * 1024);
 
-    /// <summary>创建临时工作区。</summary>
+    /// <summary>创建临时工作区与工作区外的隔离目录。</summary>
     public PathGuardTests()
     {
         _root = Path.Combine(Path.GetTempPath(), "devhubd-tests", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(Path.Combine(_root, "src"));
+
+        // 隔离目录放在工作区之外，避免读写根重叠掩盖越界问题。
+        _workRoot = Path.Combine(Path.GetTempPath(), "devhubd-tests", Guid.NewGuid().ToString("N") + "-work");
+        Directory.CreateDirectory(_workRoot);
     }
 
     /// <summary>清理临时目录。</summary>
     public void Dispose()
     {
-        try
+        foreach (var directory in new[] { _root, _workRoot })
         {
-            Directory.Delete(_root, recursive: true);
-        }
-        catch (IOException)
-        {
-            // 忽略：临时目录由系统回收。
+            try
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+            catch (IOException)
+            {
+                // 忽略：临时目录由系统回收。
+            }
         }
     }
 
@@ -91,49 +99,80 @@ public sealed class PathGuardTests : IDisposable
         Assert.Equal("SCOPE_DENIED", result.ErrorCode);
     }
 
-    /// <summary>隔离目录模式（不强制作用域）下，越界写入仍被拒绝，且读工具能看到本回合写入。</summary>
+    /// <summary>
+    /// dispatch_only：读根为工作区（可读源码与既有文件），写根为该队列项的隔离目录；
+    /// 越界读、越界写、绝对路径与敏感路径一律拒绝。
+    /// </summary>
     [Fact]
-    public async Task ToolDispatcher_ReviewMode_WritesOnlyUnderWorkDirectoryAsync()
+    public async Task ToolDispatcher_DispatchOnly_ReadsWorkspaceAndWritesIsolationAsync()
     {
         var ct = TestContext.Current.CancellationToken;
-        var workDirectory = Path.Combine(_root, "work");
-        Directory.CreateDirectory(workDirectory);
+        var source = Path.Combine(_root, "src", "app.cs");
+        await File.WriteAllTextAsync(source, "class App { }", ct);
 
         var dispatcher = new ToolDispatcher(
-            new TurnWorkspace(workDirectory, WriteScope: null, EnforceScope: false),
+            new TurnWorkspace(_root, _workRoot, WriteScope: null, EnforceScope: false),
             _budget,
             NullLogger<ToolDispatcher>.Instance);
 
+        // 读工作区既有文件：dispatch_only 下同样必须能读源码。
+        using var read = JsonDocument.Parse("""{"path":"src/app.cs"}""");
+        var readResult = await dispatcher.ExecuteAsync("turn-1", "read_file", read.RootElement, ct);
+        Assert.True(readResult.Success, readResult.ErrorMessage);
+        Assert.Equal("class App { }", readResult.Output);
+
+        // 列工作区目录同理（读根不是隔离目录）。
+        using var list = JsonDocument.Parse("""{"path":"src"}""");
+        var listResult = await dispatcher.ExecuteAsync("turn-1", "list_dir", list.RootElement, ct);
+        Assert.True(listResult.Success, listResult.ErrorMessage);
+        Assert.Contains("app.cs", listResult.Output, StringComparison.Ordinal);
+
+        // 写仍只落隔离目录，工作区不出现同名文件。
         using var inside = JsonDocument.Parse("""{"path":"out/report.md","content":"ok"}""");
         var written = await dispatcher.ExecuteAsync("turn-1", "write_file", inside.RootElement, ct);
         Assert.True(written.Success, written.ErrorMessage);
-        Assert.True(File.Exists(Path.Combine(workDirectory, "out", "report.md")));
+        Assert.True(File.Exists(Path.Combine(_workRoot, "out", "report.md")));
         Assert.False(File.Exists(Path.Combine(_root, "out", "report.md")));
 
-        // 读写同根：list_dir / read_file 必须能看到同一回合写入的文件。
-        using var list = JsonDocument.Parse("""{"path":"out"}""");
-        var listed = await dispatcher.ExecuteAsync("turn-1", "list_dir", list.RootElement, ct);
-        Assert.True(listed.Success, listed.ErrorMessage);
-        Assert.Contains("report.md", listed.Output, StringComparison.Ordinal);
+        // 读工具看不到隔离目录里的产物：避免模型误以为产物已进工作区。
+        using var readBack = JsonDocument.Parse("""{"path":"out/report.md"}""");
+        var readBackResult = await dispatcher.ExecuteAsync("turn-1", "read_file", readBack.RootElement, ct);
+        Assert.False(readBackResult.Success);
+        Assert.Equal("FILE_NOT_FOUND", readBackResult.ErrorCode);
 
-        using var read = JsonDocument.Parse("""{"path":"out/report.md"}""");
-        var readBack = await dispatcher.ExecuteAsync("turn-1", "read_file", read.RootElement, ct);
-        Assert.True(readBack.Success, readBack.ErrorMessage);
-        Assert.Equal("ok", readBack.Output);
+        // 越界读：../ 被拒绝。
+        using var escapeRead = JsonDocument.Parse("""{"path":"../outside.txt"}""");
+        var escapeReadResult = await dispatcher.ExecuteAsync("turn-1", "read_file", escapeRead.RootElement, ct);
+        Assert.False(escapeReadResult.Success);
+        Assert.Equal("PATH_ESCAPE", escapeReadResult.ErrorCode);
 
+        // 越界读：绝对路径被拒绝。
+        using var absoluteRead = JsonDocument.Parse(
+            JsonSerializer.Serialize(new { path = Path.Combine(_root, "src", "app.cs") }));
+        var absoluteReadResult = await dispatcher.ExecuteAsync("turn-1", "read_file", absoluteRead.RootElement, ct);
+        Assert.False(absoluteReadResult.Success);
+        Assert.Equal("PATH_INVALID", absoluteReadResult.ErrorCode);
+
+        // 敏感路径即使在工作区内也不可读。
+        using var sensitiveRead = JsonDocument.Parse("""{"path":"src/.env"}""");
+        var sensitiveReadResult = await dispatcher.ExecuteAsync("turn-1", "read_file", sensitiveRead.RootElement, ct);
+        Assert.False(sensitiveReadResult.Success);
+        Assert.Equal("SENSITIVE_PATH", sensitiveReadResult.ErrorCode);
+
+        // 越界写仍被拒绝（写根是隔离目录）。
         using var outside = JsonDocument.Parse("""{"path":"../escape.md","content":"bad"}""");
         var rejected = await dispatcher.ExecuteAsync("turn-1", "write_file", outside.RootElement, ct);
         Assert.False(rejected.Success);
         Assert.Equal("PATH_ESCAPE", rejected.ErrorCode);
     }
 
-    /// <summary>auto 档位下，写作用域外的写入被拒绝且不落盘。</summary>
+    /// <summary>auto 档位下读根与写根同为工作区，写作用域外的写入被拒绝且不落盘。</summary>
     [Fact]
     public async Task ToolDispatcher_AutoMode_RejectsWriteOutsideScopeAsync()
     {
         var ct = TestContext.Current.CancellationToken;
         var dispatcher = new ToolDispatcher(
-            new TurnWorkspace(_root, new[] { "src" }, EnforceScope: true),
+            new TurnWorkspace(_root, _root, new[] { "src" }, EnforceScope: true),
             _budget,
             NullLogger<ToolDispatcher>.Instance);
 
