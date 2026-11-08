@@ -6,7 +6,7 @@
 `tests/DevHubd.Tests/ToolSurfaceSnapshotTests.cs` 对工具名、参数名、枚举词表与关键字段做快照，
 任何改动都会先让测试失败，必须同步更新本文件。
 
-- 契约版本：**schema v4**（数据目录 `devhub.db` 的 `user_version`）
+- 契约版本：**schema v5**（数据目录 `devhub.db` 的 `user_version`）
 - 更新时间：2026-11-08
 
 ---
@@ -65,6 +65,7 @@
 | provider 熔断状态 | `closed` / `open` / `half_open` |
 | 结果终态（`result.outcome`） | `delivered` / `awaiting_review` / `failed` |
 | 任务状态（`devhub://tasks`） | `ready` / `blocked` / `done` / `cancelled` / `missing` |
+| 问题单状态（`input_request.*`） | `open` / `answered` / `expired` / `cancelled` / `all`（仅过滤用） |
 
 ---
 
@@ -182,6 +183,48 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 
 错误码：`INVALID_ARGUMENT`（既无 ids 也无 all=true，retryable=true）
 
+### 3.8 `input_request_list`（只读）
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `workspaceId` | string? | null | 按工作区过滤 |
+| `taskId` | string? | null | 按任务过滤 |
+| `status` | string | `open` | `open/answered/expired/cancelled/all` |
+| `limit` | int | 20 | 1–100 |
+| `cursor` | string? | null | 上一页 `nextCursor` |
+
+返回 `items[]`：`id/workspaceId/taskId/queueItemId/roleId/status/question/missingInputs/optionCount/createdAt/expiresAt/answeredAt` 与 `nextCursor`。
+错误码：`INVALID_STATUS`、`INVALID_LIMIT`、`INVALID_CURSOR`。
+
+### 3.9 `input_request_get`（只读）
+
+参数：`id`（必填）。
+返回：`id/workspaceId/taskId/queueItemId/roleId/status/question/context/options[]/missingInputs/allowFreeText/createdAt/expiresAt/answeredAt/answer/answerOptionId/answerSource/answeredBy/related[]`。
+`context` 为 JSON 文本（摘要、相对路径、已脱敏片段），`related[]` 为同任务最近 5 条其他问题单。
+错误码：`UNKNOWN_INPUT_REQUEST`。
+
+### 3.10 `input_request_answer`
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `id` | string | 是 | 问题单 id |
+| `answer` | string | 是 | 1–4000 字符 |
+| `optionId` | string? | 否 | 必须属于该问题单的 `options` |
+| `answeredBy` | string? | 否 | 缺省 `mcp`，写入 `answered_by` 与审计 |
+| `idempotencyKey` | string? | 否 | 写入审计便于追踪重试；幂等本身由相同答案保证 |
+
+返回：`{ id, status:"answered"|"duplicate", resumedQueueItemId, nextScanAt, acceptedAt }`。
+回答在同一事务内清除队列项 `hold_kind/hold_ref` 并置 `available_at=now`，随后请求一次调度唤醒。
+错误码：`UNKNOWN_INPUT_REQUEST`、`INPUT_REQUEST_CLOSED`、`INVALID_ANSWER`、`ANSWER_CONFLICT`。
+幂等：相同答案重复提交返回首次结果（`status=duplicate`）；不同答案返回 `ANSWER_CONFLICT`，不覆盖。
+
+### 3.11 `input_request_cancel`
+
+参数：`id`、`reason?`。
+返回：`{ id, status:"cancelled", queueItemId, cancelledAt }`。
+语义：仅 `open` 可撤销；挂起队列项一并终止（`status=cancelled`、`last_error_code=INPUT_REQUEST_CLOSED`），任务不会在缺少输入时继续执行。
+错误码：`UNKNOWN_INPUT_REQUEST`、`INPUT_REQUEST_CLOSED`。
+
 ---
 
 ## 4. 资源清单（只读）
@@ -215,6 +258,21 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 
 ## 6. 变更记录
 
+### U10 — 2026-11-08（不确定项回流：会话侧取回与回答）
+
+- 工具面新增 4 个问题单工具（共 12 个）：`input_request_list` / `input_request_get` /
+  `input_request_answer` / `input_request_cancel`，参数与返回见 §3.8–§3.11。
+- `input_request_answer` 在**同一事务**内写入答案并清除队列项 `hold_kind/hold_ref`、置 `available_at=now`，
+  提交后请求一次调度唤醒；`nextScanAt` 取自调度状态存储，供调用方判断何时可见重跑。
+- 幂等：相同答案重复提交返回 `status=duplicate` 与首次结果；不同答案返回 `ANSWER_CONFLICT`，不覆盖已答内容。
+- `idempotencyKey` 没有独立列，仅写入 `audit.detail`（`idem=`）便于追踪重试，**不参与幂等判定**。
+- `input_request_cancel` 终止挂起队列项（`status=cancelled`、`last_error_code=INPUT_REQUEST_CLOSED`）；
+  人工撤销即放弃该次任务，同内容不会自动重新入队（直到任务文件内容变化）。
+- 每次 tick 的过期扫描把超时 `open` 置 `expired`，队列项置 `failed` 并写 `last_error_code=INPUT_TIMEOUT`，
+  同时写 `notice.kind='failure'`（标题以「需要输入超时」开头）。
+- `input_request_list` 默认 `status=open`、`limit=20`；`status=all` 表示不过滤。非法 `status`/`limit`/`cursor`
+  分别返回 `INVALID_STATUS`/`INVALID_LIMIT`/`INVALID_CURSOR`。
+
 ### U9 — 2026-11-08（不确定项回流：提问即挂起）
 
 - 模型侧工具面新增 `ask_input`：仅当角色 `canRequestInput=true` 时暴露；每回合最多提问一次，第二次调用返回既有 `requestId` 提示而不重复落库。
@@ -243,54 +301,9 @@ token 与 `roundsExhausted` 取该队列项**最近一次 attempt** 的值，语
 
 ### 待实施 — 2026-11-08（契约先行，未上线）
 
-> 以下**工具**当前实现不存在：调用会返回 `UNKNOWN_TOOL`。schema v5、`scheduler_status.roles`
-> 与 `task_upsert` 已分别在 U7 / U8 上线（见下方变更记录），其余能力按 U9–U12 分单元实施。
+> 以下工具当前实现不存在：调用会返回 `UNKNOWN_TOOL`。schema v5、`scheduler_status.roles`、
+> `task_upsert`、`ask_input` 与问题单四工具已分别在 U7–U10 上线（见下方变更记录），仅剩审批闸门待实施。
 > 方案见 `.trae/documents/架构增量方案-角色调度与不确定项回流.md`。上线时必须同步 `ToolVocabulary`、工具快照测试与本文件。
-
-**`input_request_list`（只读）**
-
-| 参数 | 类型 | 默认 | 说明 |
-|---|---|---|---|
-| `workspaceId` | string? | null | 按工作区过滤 |
-| `taskId` | string? | null | 按任务过滤 |
-| `status` | string | `open` | `open/answered/expired/cancelled/all` |
-| `limit` | int | 20 | 1–100 |
-| `cursor` | string? | null | 上一页 `nextCursor` |
-
-返回 `items[]`：`id/workspaceId/taskId/queueItemId/roleId/status/question/missingInputs/optionCount/createdAt/expiresAt/answeredAt` 与 `nextCursor`。
-错误：`INVALID_STATUS`、`INVALID_LIMIT`、`INVALID_CURSOR`。
-
-**`input_request_get`（只读）**
-
-参数：`id`（必填）。返回：`id/status/workspaceId/taskId/queueItemId/roleId/question/context/options[]/missingInputs/allowFreeText/createdAt/expiresAt/answeredAt/answer/related[]`。
-错误：`UNKNOWN_INPUT_REQUEST`。
-
-**`input_request_answer`**
-
-| 参数 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `id` | string | 是 | 问题单 id |
-| `answer` | string | 是 | 1–4000 字符 |
-| `optionId` | string? | 否 | 必须属于该请求的 `options` |
-| `answeredBy` | string? | 否 | 缺省 `mcp` |
-| `idempotencyKey` | string? | 否 | 幂等键 |
-
-返回：`{ id, status:"answered", resumedQueueItemId, nextScanAt, acceptedAt }`。
-错误：`UNKNOWN_INPUT_REQUEST`、`INPUT_REQUEST_CLOSED`、`INVALID_ANSWER`、`ANSWER_CONFLICT`。
-幂等：相同答案重复提交返回首次结果；不同答案返回 `ANSWER_CONFLICT`，不覆盖。
-
-**`input_request_cancel`**
-
-参数：`id`、`reason?`。返回：`{ id, status:"cancelled", queueItemId, cancelledAt }`。
-错误：`UNKNOWN_INPUT_REQUEST`、`INPUT_REQUEST_CLOSED`。
-
-**`task_upsert`（U8 已实现，从「待实施」移出）**
-
-参数：`id`、`title`、`prompt`、`workspaceId?`、`priority?`、`role?`、`delivery?`、`writeScope?`、`dependsOn?`、`requiresApproval?`、`source?`。
-语义：先按 <code>schemas/task.schema.json</code> 与角色快照校验，再原子写入 `<root>/.devhub/tasks/<id>.json`（临时文件 + rename），由现有扫描器拾取；不直接改数据库。
-返回：`{ taskId, path, contentHash, queued }`。
-错误：`UNKNOWN_WORKSPACE`、`AMBIGUOUS_WORKSPACE`、`INVALID_TASK`、`INVALID_ROLE`、`TASK_CONFLICT`。
-约束：任务存在未结束队列项（`pending/claimed/running`）时拒绝改写；未知角色不降级，直接失败。
 
 **`result_approve` / `result_reject`**
 

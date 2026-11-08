@@ -24,6 +24,10 @@ public sealed class ToolSurfaceSnapshotTests
         ["scheduler_control"] = new[] { "action", "reason", "mode", "provider" },
         ["result_list"] = new[] { "unreadOnly", "limit", "cursor" },
         ["result_ack"] = new[] { "ids", "all" },
+        ["input_request_list"] = new[] { "workspaceId", "taskId", "status", "limit", "cursor" },
+        ["input_request_get"] = new[] { "id" },
+        ["input_request_answer"] = new[] { "id", "answer", "optionId", "answeredBy", "idempotencyKey" },
+        ["input_request_cancel"] = new[] { "id", "reason" },
         ["task_upsert"] = new[]
         {
             "id", "title", "prompt", "workspaceId", "priority", "role", "delivery",
@@ -170,6 +174,7 @@ public sealed class ToolSurfaceSnapshotTests
         Assert.Equal("closed/open/half_open", ToolVocabulary.BreakerStates);
         Assert.Equal("delivered/awaiting_review/failed", ToolVocabulary.ResultOutcomes);
         Assert.Equal("ready/blocked/done/cancelled/missing", ToolVocabulary.TaskStatuses);
+        Assert.Equal("open/answered/expired/cancelled/all", ToolVocabulary.InputStatuses);
     }
 
     /// <summary>

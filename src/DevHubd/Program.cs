@@ -16,6 +16,7 @@ using DevHubd.Core.Tasks;
 using DevHubd.Core.Workspaces;
 using DevHubd.Endpoints;
 using DevHubd.Hosting;
+using DevHubd.Input;
 using DevHubd.Logging;
 using DevHubd.Mcp;
 using DevHubd.Mcp.Abstractions;
@@ -284,6 +285,7 @@ internal static class Program
         builder.Services.AddSingleton<ILimitsSource, LimitsSource>();
         builder.Services.AddSingleton<IDispatchService, DispatchService>();
         builder.Services.AddSingleton<ITaskWriteService, TaskWriteService>();
+        builder.Services.AddSingleton<IInputRequestService, InputRequestService>();
         builder.Services.AddSingleton<ISchedulerControl, SchedulerControlService>();
         builder.Services.AddHostedService<SchedulerBackgroundService>();
 

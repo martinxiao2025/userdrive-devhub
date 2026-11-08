@@ -114,6 +114,10 @@ async function notifyInitialized() {
 /** 期望的工具名（P3 工具面）。 */
 const EXPECTED_TOOLS = [
   'dispatch_now',
+  'input_request_answer',
+  'input_request_cancel',
+  'input_request_get',
+  'input_request_list',
   'queue_get',
   'queue_list',
   'result_ack',

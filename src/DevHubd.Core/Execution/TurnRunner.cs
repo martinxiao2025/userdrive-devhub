@@ -283,9 +283,9 @@ public sealed class TurnRunner
                 roleId,
                 item.TaskHash,
                 prompt.Question,
-                prompt.Context is null ? null : JsonSerializer.Serialize(new { summary = prompt.Context }),
-                prompt.Options.Count == 0 ? null : JsonSerializer.Serialize(prompt.Options),
-                prompt.MissingInputs.Count == 0 ? null : JsonSerializer.Serialize(prompt.MissingInputs),
+                prompt.Context is null ? null : JsonSerializer.Serialize(new { summary = prompt.Context }, JsonSerializerOptions.Web),
+                prompt.Options.Count == 0 ? null : JsonSerializer.Serialize(prompt.Options, JsonSerializerOptions.Web),
+                prompt.MissingInputs.Count == 0 ? null : JsonSerializer.Serialize(prompt.MissingInputs, JsonSerializerOptions.Web),
                 AllowFreeText: true,
                 DateTimeOffset.UtcNow.AddHours(_options.InputTimeoutHours)),
             cancellationToken).ConfigureAwait(false);

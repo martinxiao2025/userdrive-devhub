@@ -29,4 +29,7 @@ public static class ToolVocabulary
 
     /// <summary>任务文件里的交付档位（与全局档位词表不同名，见 §task.schema.json）。</summary>
     public const string TaskDeliveries = "review/auto";
+
+    /// <summary>问题单状态（含过滤用的 <c>all</c>）。</summary>
+    public const string InputStatuses = "open/answered/expired/cancelled/all";
 }

@@ -79,4 +79,19 @@ public static class DevHubErrorCodes
 
     /// <summary>任务内容在等待回答期间已变更，旧问题单被取消。</summary>
     public const string TaskChanged = "TASK_CHANGED";
+
+    /// <summary>等待回答超时：问题单置 expired，任务失败。</summary>
+    public const string InputTimeout = "INPUT_TIMEOUT";
+
+    /// <summary>问题单已是终态（已回答 / 已过期 / 已撤销），不接受回答或撤销。</summary>
+    public const string InputRequestClosed = "INPUT_REQUEST_CLOSED";
+
+    /// <summary>问题单不存在。</summary>
+    public const string UnknownInputRequest = "UNKNOWN_INPUT_REQUEST";
+
+    /// <summary>答案不合法（长度或选项越界）。</summary>
+    public const string InvalidAnswer = "INVALID_ANSWER";
+
+    /// <summary>已回答的问题单收到不同答案，拒绝覆盖。</summary>
+    public const string AnswerConflict = "ANSWER_CONFLICT";
 }

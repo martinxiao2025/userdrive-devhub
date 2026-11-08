@@ -141,6 +141,17 @@ public sealed class SchedulerEngine
                     workspace.Id);
             }
 
+            // 超时问题单不能无限期挂着任务：置 expired 并把挂起队列项置 failed(INPUT_TIMEOUT)。
+            var expired = await _inputRequests.ExpireOverdueAsync(workspace.Id, cancellationToken)
+                .ConfigureAwait(false);
+            if (expired > 0)
+            {
+                _logger.LogWarning(
+                    "问题单等待回答超时 {Count} 条：workspace={WorkspaceId}",
+                    expired,
+                    workspace.Id);
+            }
+
             var enqueue = await _queue
                 .EnqueueReadyTasksAsync(workspace.Id, scheduledProvider, dryRun: false, cancellationToken)
                 .ConfigureAwait(false);
