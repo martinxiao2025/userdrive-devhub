@@ -289,13 +289,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -A
 
 ### 6.1 已真实验证
 
-- `dotnet build DevHubd.sln`：0 警告 0 错误；`dotnet test`：106 项（101 通过 / 5 跳过；跳过项均为启动失败路径，因同机已有 devhubd 实例持有单实例互斥体而无法复现）。
+- `dotnet build DevHubd.sln`：0 警告 0 错误；`dotnet test`：106/106 通过、0 跳过（此前的 5 项启动失败路径用例在停止守护进程、互斥体释放后真机跑通，见下一条）。
 - `node scripts/validate-plugin.mjs`（4 项 PASS）、`node scripts/check-encoding.mjs`（128 个文件）、`node scripts/smoke-mcp.mjs`（真实握手 + `tools/list` + `tools/call` + `resources/read`）全部通过。
 - 真实 BYOK 回合（2026-11-08）：provider `openai`，端点 `https://api.deepseek.com`，模型 `deepseek-flash`；任务 REAL-001 / REAL-002 / REAL-003 均产出 `awaiting_review` 结果，工作区只改 `out/` 下目标文件。
 - schema 升级：已有 V1 库启动后 `user_version` 由 1 升到 2（新增 `attempt.usage_estimated`），`scheduler_status.host.schemaVersion=2`。
 - usage 落库核对（REAL-003，新真实回合）：provider 3 轮累计 `prompt_tokens=3087`、`completion_tokens=360`、`total=3447`，`usageMissing=False`；直接读 SQLite 得 `input_tokens=3087, output_tokens=360, usage_estimated=0`；`queue_get`、`result_list`、`scheduler_status.tokens` 三处读回一致，未做任何估算。
 - 按 §1.1 命令自包含发布：产物 103.7 MiB，`-Action start/status/stop` 与 MCP 冒烟连续走通（`startupMs=1966`，停止后 `runtime.json` 被移除、`status` 返回 3）。
-- 退出码真机复跑：已有实例运行再启动 → 2；先占用 3091 再启动 → 3。
+- 启动失败路径真机复跑（2026-11-08，先 `-Action stop` 停掉守护进程并确认 `runtime.json` 移除、`/health` 不可达）：`StartupExitCodeTests` 的退出码 2/3/4/5 四项与 `LoggingTests.SecondInstance_WritesErrorLogWithLockPath` 全部执行且通过，全量 106/106、0 跳过。
 - VSIX 安装到 VS Code Stable：`code --install-extension` 成功，扩展宿主日志出现 `_doActivateExtension userdrive.devhub-bridge, activationEvent: 'onStartupFinished'`，无报错。
 - 通知闭环：向 `notice` 表造 3 条新通知，VS Code 通知中心各弹一次且标题不重复；ack 后数据库 `acked_at` 写入、`globalState["devhub.noticeSeq"]` 从 0 推进到 3；随后用 `sinceSeq=0` 查询不再返回已确认项。
 - 守护进程侧 `/health` + pid 校验：发现文件 pid 与桥 pid 一致 → `providers = vscode:ready`；把发现文件 pid 改为 30929 → `provider=vscode state=down detail=发现文件 pid=30929 与桥实际 pid=30928 不一致，判定为残留文件`。
@@ -307,7 +307,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\devhub-daemon.ps1 -A
 
 ### 6.2 仅单测覆盖
 
-- 退出码 4（数据目录不可写）与 5（迁移失败）：`StartupExitCodeTests` 覆盖，未在真机复现。
 - 单实例租约续期/接管、停机租约、调度扫描增量与 reconcile、队列流转、回合超时与取消、熔断状态机、路径守卫、工具 schema 快照、日志 EventId 与字段断言。
 - 性能基线（1000 任务 reconcile 25 次采样：最小 303.1 / 中位 333.6 / p95 407.4 / 最大 926.4 ms，基线 2000 ms、稳态 1000 ms；`queue_list` 一页约 5.5 ms）由 `P4PerformanceTests` 固化，属测试环境测量值。原 500 ms 阈值低于观测最大值，2026-11-08 依据实测分布调高，未改被测实现与取样方式。
 
