@@ -165,26 +165,47 @@ internal static class Program
         builder.Services.AddSingleton<SchedulerEngine>();
         builder.Services.AddSingleton<SchedulerWakeSignal>();
 
-        // P2：执行闭环。HttpClient 的超时由回合预算控制，因此客户端本身不设超时。
+        // P2：执行闭环。HTTP 客户端统一用具名客户端：地址、超时、UA 与连接池只在这里配置。
+        // 超时语义：HttpClient.Timeout = InfiniteTimeSpan，真正的时间预算由回合级 CancellationToken
+        // 与 RequestTimeoutSeconds 控制，两者互不覆盖。
+        var userAgent = $"devhubd/{version}";
+        builder.Services.AddHttpClient(OpenAiCompatibleModelClient.HttpClientName, client =>
+        {
+            // BaseUrl 来自用户配置（末尾斜杠补齐），请求侧使用相对路径 chat/completions。
+            client.BaseAddress = new Uri($"{userConfig.OpenAi.BaseUrl.TrimEnd('/')}/");
+            client.Timeout = Timeout.InfiniteTimeSpan;
+            client.DefaultRequestHeaders.UserAgent.ParseAdd(userAgent);
+        }).ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
+        {
+            PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+            ConnectTimeout = TimeSpan.FromSeconds(10),
+            MaxConnectionsPerServer = 4,
+        });
+
+        builder.Services.AddHttpClient(VsCodeLmBridgeClient.HttpClientName, client =>
+        {
+            // 桥端口在运行时发现，地址是绝对 URL，不需要 BaseAddress。
+            client.Timeout = Timeout.InfiniteTimeSpan;
+            client.DefaultRequestHeaders.UserAgent.ParseAdd(userAgent);
+        }).ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
+        {
+            PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+            ConnectTimeout = TimeSpan.FromSeconds(3),
+            MaxConnectionsPerServer = 2,
+        });
+
         builder.Services.AddSingleton(userConfig.OpenAi);
         builder.Services.AddSingleton(userConfig.Execution);
         builder.Services.AddSingleton<IApiKeyProvider>(apiKeys);
         builder.Services.AddSingleton(internalApi);
-        builder.Services.AddSingleton(new HttpClient(new SocketsHttpHandler
-        {
-            PooledConnectionLifetime = TimeSpan.FromMinutes(5),
-        })
-        {
-            Timeout = Timeout.InfiniteTimeSpan,
-        });
         builder.Services.AddSingleton<IModelClient>(serviceProvider => new OpenAiCompatibleModelClient(
-            serviceProvider.GetRequiredService<HttpClient>(),
+            serviceProvider.GetRequiredService<IHttpClientFactory>(),
             serviceProvider.GetRequiredService<OpenAiModelOptions>(),
             serviceProvider.GetRequiredService<IApiKeyProvider>(),
             serviceProvider.GetRequiredService<ILogger<OpenAiCompatibleModelClient>>()));
         builder.Services.AddSingleton<TurnDispatcherRegistry>();
         builder.Services.AddSingleton<IModelClient>(serviceProvider => new VsCodeLmBridgeClient(
-            serviceProvider.GetRequiredService<HttpClient>(),
+            serviceProvider.GetRequiredService<IHttpClientFactory>(),
             serviceProvider.GetRequiredService<DevHubPaths>(),
             serviceProvider.GetRequiredService<InternalApiOptions>(),
             serviceProvider.GetRequiredService<TurnDispatcherRegistry>(),

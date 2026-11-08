@@ -97,7 +97,7 @@ public sealed class OpenAiUsageTests
     {
         using var http = new HttpClient(handler);
         var client = new OpenAiCompatibleModelClient(
-            http,
+            new TestHttpClientFactory(http),
             new OpenAiModelOptions { BaseUrl = "https://example.invalid/v1", Model = "test-model" },
             new StaticApiKeyProvider("test-key"),
             NullLogger<OpenAiCompatibleModelClient>.Instance);

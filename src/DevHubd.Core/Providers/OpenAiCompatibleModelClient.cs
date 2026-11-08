@@ -33,23 +33,26 @@ public sealed class OpenAiCompatibleModelClient : IModelClient
         "TODO",
     };
 
+    /// <summary>具名 HttpClient：BaseAddress / 超时 / User-Agent / 连接池在宿主组合根集中配置。</summary>
+    public const string HttpClientName = "openai-chat";
+
     private readonly HttpClient _http;
     private readonly OpenAiModelOptions _options;
     private readonly IApiKeyProvider _apiKeys;
     private readonly ILogger<OpenAiCompatibleModelClient> _logger;
 
-    /// <summary>注入 HTTP 客户端、配置、key 提供者与日志器。</summary>
-    /// <param name="http">HTTP 客户端（超时由回合预算控制）。</param>
+    /// <summary>注入 HTTP 客户端工厂、配置、key 提供者与日志器。</summary>
+    /// <param name="httpClientFactory">HTTP 客户端工厂（由宿主提供具名客户端）。</param>
     /// <param name="options">端点与模型配置；不含 key。</param>
     /// <param name="apiKeys">API key 提供者（仅环境变量）。</param>
     /// <param name="logger">日志器。</param>
     public OpenAiCompatibleModelClient(
-        HttpClient http,
+        IHttpClientFactory httpClientFactory,
         OpenAiModelOptions options,
         IApiKeyProvider apiKeys,
         ILogger<OpenAiCompatibleModelClient> logger)
     {
-        _http = http;
+        _http = httpClientFactory.CreateClient(HttpClientName);
         _options = options;
         _apiKeys = apiKeys;
         _logger = logger;
@@ -323,7 +326,8 @@ public sealed class OpenAiCompatibleModelClient : IModelClient
         using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeoutSource.CancelAfter(timeout);
 
-        using var message = new HttpRequestMessage(HttpMethod.Post, $"{_options.BaseUrl}/chat/completions")
+        // 相对路径 + 具名客户端的 BaseAddress：端点地址只在宿主组合根配置一处。
+        using var message = new HttpRequestMessage(HttpMethod.Post, "chat/completions")
         {
             Content = new StringContent(payload.ToJsonString(_jsonOptions), Encoding.UTF8, "application/json"),
         };

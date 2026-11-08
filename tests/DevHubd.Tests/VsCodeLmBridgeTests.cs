@@ -152,7 +152,7 @@ public sealed class VsCodeLmBridgeTests : IAsyncLifetime
 
         using var http = new HttpClient(new StallingBridgeHandler()) { Timeout = Timeout.InfiniteTimeSpan };
         var client = new VsCodeLmBridgeClient(
-            http,
+            new TestHttpClientFactory(http),
             _paths,
             new InternalApiOptions("http://127.0.0.1:3091", "internal-token"),
             new TurnDispatcherRegistry(),
@@ -189,7 +189,7 @@ public sealed class VsCodeLmBridgeTests : IAsyncLifetime
 
     /// <summary>构造桥客户端。</summary>
     private VsCodeLmBridgeClient CreateClient() => new(
-        new HttpClient { Timeout = Timeout.InfiniteTimeSpan },
+        new TestHttpClientFactory(new HttpClient { Timeout = Timeout.InfiniteTimeSpan }),
         _paths,
         new InternalApiOptions("http://127.0.0.1:3091", "internal-token"),
         new TurnDispatcherRegistry(),

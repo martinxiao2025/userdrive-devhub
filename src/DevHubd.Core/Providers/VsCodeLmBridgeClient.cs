@@ -33,20 +33,23 @@ public sealed class VsCodeLmBridgeClient : IModelClient
     private readonly TurnDispatcherRegistry _turns;
     private readonly ILogger<VsCodeLmBridgeClient> _logger;
 
-    /// <summary>注入 HTTP 客户端、路径、内部 API 参数、回合注册表与日志器。</summary>
-    /// <param name="http">HTTP 客户端（由宿主提供，不设默认超时）。</param>
-    /// <param name="paths">运行时路径（含 <c>lm-bridge.json</c>）。</param>
-    /// <param name="internalApi">宿主内部 API 的参数。</param>
-    /// <param name="turns">活跃回合注册表。</param>
+    /// <summary>具名 HttpClient：桥端口在运行时发现，地址用绝对 URL，因此不设 BaseAddress。</summary>
+    public const string HttpClientName = "lm-bridge";
+
+    /// <summary>注入 HTTP 客户端工厂、路径、内部 API 配置、回合注册表与日志器。</summary>
+    /// <param name="httpClientFactory">HTTP 客户端工厂（由宿主提供具名客户端）。</param>
+    /// <param name="paths">运行时路径。</param>
+    /// <param name="internalApi">内部 API 配置。</param>
+    /// <param name="turns">回合注册表。</param>
     /// <param name="logger">日志器。</param>
     public VsCodeLmBridgeClient(
-        HttpClient http,
+        IHttpClientFactory httpClientFactory,
         DevHubPaths paths,
         InternalApiOptions internalApi,
         TurnDispatcherRegistry turns,
         ILogger<VsCodeLmBridgeClient> logger)
     {
-        _http = http;
+        _http = httpClientFactory.CreateClient(HttpClientName);
         _paths = paths;
         _internalApi = internalApi;
         _turns = turns;

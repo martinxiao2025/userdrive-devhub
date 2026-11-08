@@ -229,7 +229,7 @@ public sealed class UserConfigTests : IDisposable
         {
             using var http = new HttpClient();
             var client = new OpenAiCompatibleModelClient(
-                http,
+                new TestHttpClientFactory(http),
                 new OpenAiModelOptions { ApiKeyEnvironmentVariable = name },
                 new EnvironmentApiKeyProvider(name),
                 NullLogger<OpenAiCompatibleModelClient>.Instance);
