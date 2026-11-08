@@ -126,7 +126,9 @@ public static class PathGuard
             return PathCheckResult.Fail("PATH_INVALID", $"路径非法：{exception.Message}");
         }
 
-        if (!fullPath.StartsWith(rootFull, StringComparison.OrdinalIgnoreCase))
+        // 根目录自身（如 "."、"./"）规范化后不带尾分隔符，直接 StartsWith 会把合法的根路径误判为越界；
+        // 判定包含关系前统一补齐尾分隔符，路径本身仍返回未补分隔符的形式。
+        if (!EnsureTrailingSeparator(fullPath).StartsWith(rootFull, StringComparison.OrdinalIgnoreCase))
         {
             return PathCheckResult.Fail("PATH_ESCAPE", $"路径越界，必须位于 {root} 内：{relativePath}");
         }
@@ -147,7 +149,7 @@ public static class PathGuard
             return PathCheckResult.Fail("PATH_ESCAPE", $"路径经过符号链接或 junction，已拒绝：{relativePath}");
         }
 
-        return PathCheckResult.Ok(fullPath);
+        return PathCheckResult.Ok(TrimTrailingSeparator(fullPath));
     }
 
     /// <summary>判断绝对路径是否落在某个作用域前缀内。</summary>
@@ -161,6 +163,8 @@ public static class PathGuard
             return false;
         }
 
+        // 作用域前缀同样按带尾分隔符比较：writeScope 为 "." 或根目录自身时不误判。
+        var fullPathWithSeparator = EnsureTrailingSeparator(fullPath);
         foreach (var scope in writeScope)
         {
             if (string.IsNullOrWhiteSpace(scope))
@@ -171,7 +175,7 @@ public static class PathGuard
             var scopeFull = EnsureTrailingSeparator(
                 Path.GetFullPath(Path.Combine(rootFull, Normalize(scope))));
 
-            if (fullPath.StartsWith(scopeFull, StringComparison.OrdinalIgnoreCase))
+            if (fullPathWithSeparator.StartsWith(scopeFull, StringComparison.OrdinalIgnoreCase))
             {
                 return true;
             }
@@ -188,6 +192,12 @@ public static class PathGuard
         var current = rootFull;
         foreach (var segment in relativePath.Split('/', StringSplitOptions.RemoveEmptyEntries))
         {
+            // "." 指向当前目录（根目录自身），不是可逃逸节点，跳过以免把根误判为符号链接。
+            if (segment == ".")
+            {
+                continue;
+            }
+
             current = Path.Combine(current, segment);
 
             if (Directory.Exists(current))
@@ -218,5 +228,19 @@ public static class PathGuard
     /// <summary>确保路径以目录分隔符结尾，避免 <c>C:\work</c> 误匹配 <c>C:\workshop</c>。</summary>
     /// <param name="path">绝对路径。</param>
     private static string EnsureTrailingSeparator(string path) =>
-        path.EndsWith(Path.DirectorySeparatorChar) ? path : path + Path.DirectorySeparatorChar;
+        path.EndsWith(Path.DirectorySeparatorChar) || path.EndsWith(Path.AltDirectorySeparatorChar)
+            ? path
+            : path + Path.DirectorySeparatorChar;
+
+    /// <summary>
+    /// 去掉非根路径的尾分隔符，保证同一目录不同写法（<c>.</c>、<c>./</c>、<c>src/</c>）返回一致结果；
+    /// 盘符根或共享根（<c>C:\</c>、<c>/</c>）保留原样，避免退化成 <c>C:</c>。
+    /// </summary>
+    /// <param name="path">绝对路径。</param>
+    private static string TrimTrailingSeparator(string path)
+    {
+        var trimmed = path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var root = Path.GetPathRoot(path) ?? string.Empty;
+        return trimmed.Length <= root.Length ? path : trimmed;
+    }
 }

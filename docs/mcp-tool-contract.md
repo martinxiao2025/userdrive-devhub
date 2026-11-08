@@ -358,6 +358,10 @@ COUNT(attempt WHERE queue_item_id = ?
 - **一处说清**：契约 §5「读 / 写 / 执行边界」表格列出两个档位在读、写、执行、结果四方面的确切边界。
 - 测试：`ToolDispatcher_DispatchOnly_ReadsWorkspaceAndWritesIsolationAsync` 覆盖可读工作区文件、
   写入只落隔离目录、`../` 与绝对路径越界读被拒绝、敏感路径被拒绝；auto 档位沿用 `SCOPE_DENIED` 用例。
+- **路径规范化修复**：`PathGuard` 的包含判定改为在补齐尾分隔符后再比较，`list_dir "."` / `"./"` / `.\`
+  与带尾分隔符的子目录不再误报 `PATH_ESCAPE`；根目录自身仍受越界与敏感路径校验约束（`..`、`../` 仍被拒绝）。
+  直接使用 `.` 的用例：`ResolveRead_RootDirectory_IsAccepted`、`ResolveRead_SubdirectoryWithTrailingSeparator_IsAccepted`、
+  `ToolDispatcher_ListDirDot_ListsWorkspaceRootAsync`。
 
 ### B 变体补充 — 2026-11-08（答案注入恢复回合、资源类豁免预算）
 

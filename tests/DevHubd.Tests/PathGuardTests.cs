@@ -99,6 +99,61 @@ public sealed class PathGuardTests : IDisposable
         Assert.Equal("SCOPE_DENIED", result.ErrorCode);
     }
 
+    /// <summary>根目录自身必须可读：<c>.</c>、<c>./</c>、<c>.\</c> 都解析为根，不再误报 PATH_ESCAPE。</summary>
+    [Theory]
+    [InlineData(".")]
+    [InlineData("./")]
+    [InlineData(".\\")]
+    public void ResolveRead_RootDirectory_IsAccepted(string path)
+    {
+        var result = PathGuard.ResolveRead(_root, path);
+
+        Assert.True(result.Success, result.ErrorMessage);
+        Assert.Equal(
+            Path.GetFullPath(_root),
+            Path.GetFullPath(result.FullPath!),
+            ignoreCase: true);
+    }
+
+    /// <summary>子目录带尾分隔符或 <c>.</c> 后缀时也应正确解析到该目录。</summary>
+    [Theory]
+    [InlineData("src/")]
+    [InlineData("src\\")]
+    [InlineData("src/.")]
+    public void ResolveRead_SubdirectoryWithTrailingSeparator_IsAccepted(string path)
+    {
+        var result = PathGuard.ResolveRead(_root, path);
+
+        Assert.True(result.Success, result.ErrorMessage);
+        Assert.Equal(
+            Path.GetFullPath(Path.Combine(_root, "src")),
+            Path.GetFullPath(result.FullPath!),
+            ignoreCase: true);
+    }
+
+    /// <summary>指向根目录的越界路径仍必须被拒绝，不能借 <c>.</c> 规范化放行。</summary>
+    [Theory]
+    [InlineData("..")]
+    [InlineData("../")]
+    [InlineData("..\\")]
+    [InlineData("../outside.txt")]
+    public void ResolveRead_RootEscape_IsRejected(string path)
+    {
+        var result = PathGuard.ResolveRead(_root, path);
+
+        Assert.False(result.Success);
+        Assert.Equal("PATH_ESCAPE", result.ErrorCode);
+    }
+
+    /// <summary>writeScope 为 <c>.</c> 时表示整个工作区根，作用域校验不能因尾分隔符误判。</summary>
+    [Fact]
+    public void ResolveWrite_ScopeDot_AllowsWorkspaceRoot()
+    {
+        var result = PathGuard.ResolveWrite(_root, "a.txt", new[] { "." }, enforceScope: true);
+
+        Assert.True(result.Success, result.ErrorMessage);
+    }
+
     /// <summary>
     /// dispatch_only：读根为工作区（可读源码与既有文件），写根为该队列项的隔离目录；
     /// 越界读、越界写、绝对路径与敏感路径一律拒绝。
@@ -164,6 +219,31 @@ public sealed class PathGuardTests : IDisposable
         var rejected = await dispatcher.ExecuteAsync("turn-1", "write_file", outside.RootElement, ct);
         Assert.False(rejected.Success);
         Assert.Equal("PATH_ESCAPE", rejected.ErrorCode);
+    }
+
+    /// <summary>list_dir 直接传 <c>.</c> 必须列出工作区根，而不是误报 PATH_ESCAPE；该输入不得回避。</summary>
+    [Fact]
+    public async Task ToolDispatcher_ListDirDot_ListsWorkspaceRootAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await File.WriteAllTextAsync(Path.Combine(_root, "README.md"), "hi", ct);
+
+        var dispatcher = new ToolDispatcher(
+            new TurnWorkspace(_root, _workRoot, WriteScope: null, EnforceScope: false),
+            _budget,
+            NullLogger<ToolDispatcher>.Instance);
+
+        using var list = JsonDocument.Parse("""{"path":"."}""");
+        var listed = await dispatcher.ExecuteAsync("turn-3", "list_dir", list.RootElement, ct);
+        Assert.True(listed.Success, listed.ErrorMessage);
+        Assert.Contains("src/", listed.Output, StringComparison.Ordinal);
+        Assert.Contains("README.md", listed.Output, StringComparison.Ordinal);
+
+        // "." 是目录而不是文件：read_file 应报 FILE_NOT_FOUND，证明路径先被正确接受而非判成越界。
+        using var read = JsonDocument.Parse("""{"path":"."}""");
+        var readResult = await dispatcher.ExecuteAsync("turn-3", "read_file", read.RootElement, ct);
+        Assert.False(readResult.Success);
+        Assert.Equal("FILE_NOT_FOUND", readResult.ErrorCode);
     }
 
     /// <summary>auto 档位下读根与写根同为工作区，写作用域外的写入被拒绝且不落盘。</summary>
