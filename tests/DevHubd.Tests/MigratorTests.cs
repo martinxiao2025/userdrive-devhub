@@ -386,6 +386,53 @@ public sealed class MigratorTests : IDisposable
         Assert.Contains("rerun_pending", exception.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// 第七轮 3：v7 旧库升级到 v8 必须只加 <c>queue_item.lease_token</c>（TEXT NOT NULL DEFAULT ''），
+    /// 不重建表、不改行数，既有行默认空串。
+    /// </summary>
+    [Fact]
+    public async Task Migrate_V8_AddsLeaseTokenToLegacyV7Async()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var factory = new SqliteConnectionFactory(Path.Combine(_directory, "devhub.db"));
+
+        using (var connection = await factory.OpenAsync(ct))
+        {
+            using var seed = connection.CreateCommand();
+            seed.CommandText = """
+                CREATE TABLE queue_item (
+                  id               TEXT PRIMARY KEY,
+                  status           TEXT NOT NULL DEFAULT 'pending',
+                  lease_owner      TEXT,
+                  lease_expires_at TEXT);
+                INSERT INTO queue_item (id, status) VALUES ('Q1', 'pending');
+                INSERT INTO queue_item (id, status) VALUES ('Q2', 'succeeded');
+                PRAGMA user_version = 7;
+                """;
+            await seed.ExecuteNonQueryAsync(ct);
+        }
+
+        Assert.Equal(Migrator.CurrentVersion, await Migrator.MigrateAsync(factory, ct));
+        Assert.Equal(8, Migrator.CurrentVersion);
+
+        using var verify = await factory.OpenAsync(ct);
+        using (var info = verify.CreateCommand())
+        {
+            info.CommandText =
+                "SELECT type, \"notnull\", dflt_value FROM pragma_table_info('queue_item') WHERE name = 'lease_token';";
+            using var reader = await info.ExecuteReaderAsync(ct);
+            Assert.True(await reader.ReadAsync(ct));
+            Assert.Equal("TEXT", reader.GetString(0));
+            Assert.Equal(1L, reader.GetInt64(1));
+            Assert.Equal("''", reader.GetString(2));
+        }
+
+        Assert.Equal(2L, await ScalarLongAsync(verify, "SELECT COUNT(*) FROM queue_item;", ct));
+        Assert.Equal(
+            2L,
+            await ScalarLongAsync(verify, "SELECT COUNT(*) FROM queue_item WHERE lease_token = '';", ct));
+    }
+
     /// <summary>已有 V1 库升级时必须逐级补 V2/V3/V4，不重建表，并保持 user_version 递增。</summary>
     [Fact]
     public async Task Migrate_FromV1_UpgradesToLatestAsync()

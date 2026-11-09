@@ -17,9 +17,10 @@ public static class Migrator
     /// 当前 schema 版本。V1 = 9 张表；V2 = attempt.usage_estimated；V3 = attempt.usage_available / rounds_exhausted；
     /// V4 = 旧行 usage_available 回填；V5 = 角色快照、任务角色/依赖/审批列、队列挂起列与问题单表；
     /// V6 = queue_item.forced（force 派发标记）与 task_view.rerun_pending（待审期间再执行需求的内容哈希）；
-    /// V7 = 把误写为 INTEGER 的 <c>task_view.rerun_pending</c> 归一化为内容哈希形态，并删除未接入实现的 scope_lock。
+    /// V7 = 把误写为 INTEGER 的 <c>task_view.rerun_pending</c> 归一化为内容哈希形态，并删除未接入实现的 scope_lock；
+    /// V8 = queue_item.lease_token（每轮租约令牌，区分同进程的先后租约）。
     /// </summary>
-    public const int CurrentVersion = 7;
+    public const int CurrentVersion = 8;
 
     /// <summary>V1 的全部 DDL 与初始数据。</summary>
     private const string SchemaV1 = """
@@ -332,6 +333,15 @@ public static class Migrator
         DROP TABLE IF EXISTS scope_lock;
         """;
 
+    /// <summary>
+    /// V8：<c>queue_item.lease_token</c>。执行者 owner 是进程级常量，租约回收后同一进程重认领会得到
+    /// 完全相同的 owner；只有每次认领重新生成的令牌才能区分"上一轮租约"与"这一轮租约"。
+    /// 旧行默认空串（等价于"从未认领 / 不持有租约"）。
+    /// </summary>
+    private const string SchemaV8LeaseToken = """
+        ALTER TABLE queue_item ADD COLUMN lease_token TEXT NOT NULL DEFAULT '';
+        """;
+
     /// <summary>P0 期望存在的表（用于启动自检与测试断言）。V7 起删除未使用的 <c>scope_lock</c>，共 8 张。</summary>
     public static readonly IReadOnlyList<string> ExpectedTables = new[]
     {
@@ -433,6 +443,21 @@ public static class Migrator
             version = 7;
         }
 
+        if (version < 8)
+        {
+            // 兼容极简自建库（可能根本没有 queue_item）与手工加过该列的库：
+            // 表不存在或列已存在时只推进版本号，避免 ALTER 报错。
+            if (await TableExistsAsync(connection, transaction, "queue_item", cancellationToken).ConfigureAwait(false) &&
+                !await HasColumnAsync(connection, transaction, "queue_item", "lease_token", cancellationToken)
+                    .ConfigureAwait(false))
+            {
+                await ExecuteScriptAsync(connection, transaction, SchemaV8LeaseToken, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            version = 8;
+        }
+
         using (var stamp = connection.CreateCommand())
         {
             stamp.Transaction = transaction;
@@ -460,6 +485,25 @@ public static class Migrator
         command.Transaction = transaction;
         command.CommandText = script;
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>判断指定表在迁移事务内是否存在（用于兼容极简自建库）。</summary>
+    /// <param name="connection">已打开的连接。</param>
+    /// <param name="transaction">迁移事务。</param>
+    /// <param name="table">表名。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private static async Task<bool> TableExistsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string table,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = $name LIMIT 1;";
+        command.Parameters.AddWithValue("$name", table);
+        var value = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        return value is not null;
     }
 
     /// <summary>判断指定表在迁移事务内是否已有某列（用于兼容极简自建库）。</summary>

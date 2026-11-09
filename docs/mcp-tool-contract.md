@@ -6,7 +6,7 @@
 `tests/DevHubd.Tests/ToolSurfaceSnapshotTests.cs` 对工具名、参数名、枚举词表与关键字段做快照，
 任何改动都会先让测试失败，必须同步更新本文件。
 
-- 契约版本：**schema v7**（数据目录 `devhub.db` 的 `user_version`）
+- 契约版本：**schema v8**（数据目录 `devhub.db` 的 `user_version`）
 - 更新时间：2026-11-09
 
 ---
@@ -379,6 +379,26 @@ COUNT(attempt WHERE queue_item_id = ?
 ---
 
 ## 6. 变更记录
+
+### 第七轮核验修正（schema v8）— 2026-11-09
+
+- **attempt 终态只由先写者决定**：回收器可能先写 `abandoned/LEASE_EXPIRED`，旧回合的收尾
+  （`abandoned/lease_lost/SUPERSEDED_BY_DECISION`）随后才到。`CompleteAttemptAsync` 改为
+  `WHERE ended_at IS NULL` 的条件更新，已终态的行不再被整行覆盖。语义边界：
+  `LEASE_EXPIRED` = 租约自然过期、无人续租；`SUPERSEDED_BY_DECISION` = 决策已落地或租约被接管。
+- **基础设施原因不消耗重试预算**：`abandoned` 中 `LEASE_EXPIRED`、`PROCESS_RESTART`、`SHUTDOWN`
+  与 `error_kind=lease_lost` 不计入消耗性尝试；认领 SQL 与 `CountConsumingAttemptsAsync` 共用这一口径。
+- **租约令牌（v8）**：`queue_item.lease_token TEXT NOT NULL DEFAULT ''`。认领时生成新令牌，
+  续租、置 running、成功落库、取消收尾、回收与 supersede 清理都带令牌；
+  状态、`lease_owner` 与令牌三者同时匹配才允许迁移，否则视为过期回合并丢弃结果。
+  旧 v7 库升级只加列，既有行默认 `''`，行数不变。
+- **`MarkRunningAsync` 守卫**：supersede 落在"认领已提交、置 running 未执行"之间时，
+  条件更新失败、回合不启动，避免把已 `cancelled` 的行改回 `running/NULL` 永久卡住。
+- 测试：`Reclaim_WhenStaleCompletionArrives_KeepsFirstAttemptTerminalStateAsync`、
+  `Claim_AfterLeaseExpiryAndModelError_StillHasRetryBudgetAsync`、
+  `Settle_WithStaleLeaseToken_DoesNotOverwriteNewLeaseAsync`、
+  `MarkRunning_WhenCancelledBetweenClaimAndMark_ReturnsFalseAsync`、
+  `Migrate_V8_AddsLeaseTokenToLegacyV7Async`。
 
 ### 第五轮核验修正（schema v7）— 2026-11-09
 

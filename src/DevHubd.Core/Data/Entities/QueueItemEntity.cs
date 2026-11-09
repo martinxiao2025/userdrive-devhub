@@ -57,6 +57,12 @@ public sealed class QueueItemEntity
     /// <summary>租约到期时间；未认领为 null。</summary>
     public string? LeaseExpiresAt { get; set; }
 
+    /// <summary>
+    /// 本轮租约令牌（schema v8）：每次认领重新生成，回收/终态时清空。
+    /// owner 是进程级常量，同进程重认领会得到同一 owner，必须靠令牌区分新旧租约。
+    /// </summary>
+    public string LeaseToken { get; set; } = string.Empty;
+
     /// <summary>最近一次错误码。</summary>
     public string? LastErrorCode { get; set; }
 

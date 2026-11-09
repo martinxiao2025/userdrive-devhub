@@ -205,6 +205,7 @@ public sealed class DevHubDbContext : DbContext
         entity.Property(item => item.AvailableAt).HasColumnName("available_at");
         entity.Property(item => item.LeaseOwner).HasColumnName("lease_owner");
         entity.Property(item => item.LeaseExpiresAt).HasColumnName("lease_expires_at");
+        entity.Property(item => item.LeaseToken).HasColumnName("lease_token").HasDefaultValue(string.Empty);
         entity.Property(item => item.LastErrorCode).HasColumnName("last_error_code");
         entity.Property(item => item.LastError).HasColumnName("last_error");
         entity.Property(item => item.CreatedAt).HasColumnName("created_at");

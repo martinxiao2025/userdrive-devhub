@@ -195,6 +195,7 @@ public sealed class ResultDecisionStore
                 SET status = 'cancelled',
                     lease_owner = NULL,
                     lease_expires_at = NULL,
+                    lease_token = '',
                     hold_kind = NULL,
                     hold_ref = NULL,
                     last_error_code = {0},

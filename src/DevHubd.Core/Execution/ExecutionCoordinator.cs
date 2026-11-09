@@ -139,7 +139,20 @@ public sealed class ExecutionCoordinator
                     break;
                 }
 
-                await _store.MarkRunningAsync(claimed.Item.Id, Now(), cancellationToken).ConfigureAwait(false);
+                // 认领与置 running 之间可能被决策取消，或已被回收后重新认领：
+                // 条件更新失败时不能启动回合，否则会把已 cancelled 的行改回 running 且租约为空。
+                var marked = await _store
+                    .MarkRunningAsync(claimed.Item.Id, _ownerId, claimed.LeaseToken, Now(), cancellationToken)
+                    .ConfigureAwait(false);
+                if (!marked)
+                {
+                    await CancelSupersededAttemptAsync(claimed, outcome: null).ConfigureAwait(false);
+                    _logger.LogWarning(
+                        "队列项在置 running 前已失效，跳过执行：queueItemId={QueueItemId} attempt={Attempt}",
+                        claimed.Item.Id,
+                        claimed.Item.Attempt);
+                    continue;
+                }
 
                 IncrementRoleActive(claimed.Item.RoleId);
                 countedRoleId = claimed.Item.RoleId;
@@ -302,8 +315,9 @@ public sealed class ExecutionCoordinator
     }
 
     /// <summary>
-    /// 心跳循环：续租失败即把 attempt 落为 <c>abandoned + SUPERSEDED_BY_DECISION</c>，
-    /// 同时取消回合；返回 false 表示租约丢失。
+    /// 心跳循环：续租失败（状态/持有者/令牌任一不匹配）即取消回合，并尝试把 attempt 落为
+    /// <c>abandoned + SUPERSEDED_BY_DECISION</c>；若回收器已先写成 <c>LEASE_EXPIRED</c>，
+    /// 条件更新不会覆盖它。返回 false 表示租约丢失。
     /// </summary>
     /// <param name="claimed">已认领项（需要 attempt id 落终态）。</param>
     /// <param name="stop">用于取消回合的令牌源。</param>
@@ -323,7 +337,12 @@ public sealed class ExecutionCoordinator
                     .ConfigureAwait(false);
 
                 var renewed = await _queue
-                    .HeartbeatAsync(item.Id, _ownerId, TimeSpan.FromSeconds(_options.LeaseSeconds), linked.Token)
+                    .HeartbeatAsync(
+                        item.Id,
+                        _ownerId,
+                        claimed.LeaseToken,
+                        TimeSpan.FromSeconds(_options.LeaseSeconds),
+                        linked.Token)
                     .ConfigureAwait(false);
 
                 if (!renewed)
@@ -360,7 +379,9 @@ public sealed class ExecutionCoordinator
         {
             // 落库前复核所有权：决策可能在上一次心跳成功之后、回合结束之前把该项置 cancelled。
             // 无条件写 succeeded 会把它改回去并写出第二个结果，绕过 supersede。
-            if (!await _store.TrySetSucceededAsync(item.Id, _ownerId, now, cancellationToken).ConfigureAwait(false))
+            if (!await _store
+                    .TrySetSucceededAsync(item.Id, _ownerId, claimed.LeaseToken, now, cancellationToken)
+                    .ConfigureAwait(false))
             {
                 await CancelSupersededAttemptAsync(claimed, outcome).ConfigureAwait(false);
                 _logger.LogWarning(
@@ -443,6 +464,9 @@ public sealed class ExecutionCoordinator
     /// <para>
     /// <c>attempt.outcome</c> 的 CHECK 只允许 succeeded/failed/abandoned，因此用 abandoned 承载取消档；
     /// 此处只写本进程独占的 attempt 行，绝不回写已易主的 queue_item。
+    /// 写入是条件更新（<c>ended_at IS NULL</c>）：如果回收器已先写成 <c>LEASE_EXPIRED</c>，
+    /// 本次收尾不会覆盖它。两者语义边界是"租约自然过期" vs "决策落地/租约被接管"，
+    /// 先到达者为准，不互相顶替。
     /// </para>
     /// </summary>
     /// <param name="claimed">已认领项。</param>
@@ -780,7 +804,7 @@ public sealed class ExecutionCoordinator
                 "abandoned",
                 null,
                 ModelErrorKinds.UserCancelled,
-                "SHUTDOWN",
+                DevHubErrorCodes.Shutdown,
                 0,
                 null,
                 null,
@@ -792,8 +816,25 @@ public sealed class ExecutionCoordinator
             now,
             cancellationToken).ConfigureAwait(false);
 
-        await _store.SetTerminalAsync(claimed.Item.Id, "cancelled", "SHUTDOWN", message, now, cancellationToken)
+        // 所有权闸门：停机与心跳可能并发；租约已被回收/续给别的回合时不再覆盖队列终态。
+        var cancelled = await _store
+            .TrySetCancelledAsync(
+                claimed.Item.Id,
+                _ownerId,
+                claimed.LeaseToken,
+                DevHubErrorCodes.Shutdown,
+                message,
+                now,
+                cancellationToken)
             .ConfigureAwait(false);
+
+        if (!cancelled)
+        {
+            _logger.LogWarning(
+                "停机收尾时队列项已不再由本回合持有，跳过终态覆盖：queueItemId={QueueItemId} attempt={Attempt}",
+                claimed.Item.Id,
+                claimed.Item.Attempt);
+        }
     }
 
     /// <summary>provider 熔断时退回队列：不消耗 attempt。</summary>

@@ -4,6 +4,7 @@ using System.Text.Json;
 using DevHubd.Core.Data;
 using DevHubd.Core.Data.Entities;
 using DevHubd.Core.Execution;
+using DevHubd.Core.Models;
 using DevHubd.Core.Tasks;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
@@ -499,9 +500,10 @@ public sealed class QueueService
     }
 
     /// <summary>
-    /// 原子认领并返回 attempt id，供执行器回写 attempt 终态。
+    /// 原子认领并返回 attempt id 与租约令牌，供执行器续租、回写终态。
     /// 认领条件包含"已消耗重试预算的回合数 &lt; max_attempts"，避免用尽预算的项被反复认领；
-    /// 预算口径为 <c>error_code</c> 为空或非 <c>NEEDS_INPUT</c> 的 attempt 数。
+    /// 预算口径与 <see cref="ExecutionStore.CountConsumingAttemptsAsync"/> 一致：排除提问挂起、
+    /// 资源类失败与基础设施原因（租约过期/丢失、进程重启、停机）的 attempt。
     /// </summary>
     /// <remarks>
     /// 这里刻意保留原生 SQL，不能改写成普通 LINQ：
@@ -526,6 +528,18 @@ public sealed class QueueService
         var nowValue = DateTimeOffset.UtcNow;
         var now = nowValue.ToString("O", CultureInfo.InvariantCulture);
         var expires = nowValue.Add(lease).ToString("O", CultureInfo.InvariantCulture);
+
+        // 每轮认领生成新令牌：owner 是进程级常量，回收后同进程重认领会得到同一 owner，
+        // 只有令牌能证明"旧回合的结果"不属于"新租约"。
+        var leaseToken = Guid.NewGuid().ToString("N");
+
+        // 预算谓词与 CountConsumingAttemptsAsync 共用同一口径，避免两边漂移。
+        var exemptKinds = string.Join(", ", ModelErrorKinds.BudgetExempt.Select(kind => $"'{kind}'"));
+        var exemptCodes = string.Join(
+            ", ",
+            new[] { DevHubErrorCodes.NeedsInput }
+                .Concat(DevHubErrorCodes.InfrastructureAbandonCodes)
+                .Select(code => $"'{code}'"));
 
         // 角色并发已满时不认领该角色的项：避免"认领后才等待"浪费 attempt，
         // 也不让一个满额角色堵住其它角色。
@@ -555,20 +569,24 @@ public sealed class QueueService
                 SET status = 'claimed',
                     lease_owner = $owner,
                     lease_expires_at = $expires,
+                    lease_token = $token,
                     attempt = attempt + 1,
                     updated_at = $now
                 WHERE id = (
                     SELECT id FROM queue_item
                     WHERE status = 'pending'
                       AND available_at <= $now
-                      -- 重试预算按"非 NEEDS_INPUT 回合数"判定：提问挂起不消耗预算，
-                      -- 资源类失败（auth / quota / no_model / bridge_down）由 provider 自身不可用导致，
-                      -- 同样不计入预算；其余每个真实回合（含进行中、失败、成功）各计 1 次。
+                      -- 重试预算按"消耗性回合数"判定：提问挂起不消耗预算；
+                      -- 资源类失败（auth / quota / no_model / bridge_down）由 provider 自身不可用导致；
+                      -- 基础设施原因（租约过期/丢失 lease_lost、进程重启、停机）也不是任务的错。
+                      -- 其余每个真实回合（含进行中、失败、成功）各计 1 次。
                       AND (
                             SELECT COUNT(*) FROM attempt a
                             WHERE a.queue_item_id = queue_item.id
-                              AND (a.error_code IS NULL OR a.error_code <> 'NEEDS_INPUT')
-                              AND (a.error_kind IS NULL OR a.error_kind NOT IN ('auth', 'quota', 'no_model', 'bridge_down'))
+                              AND (a.error_code IS NULL OR a.error_code NOT IN ({exemptCodes}))
+                              AND (a.error_kind IS NULL OR (
+                                    a.error_kind NOT IN ({exemptKinds})
+                                    AND a.error_kind <> '{ModelErrorKinds.LeaseLost}'))
                           ) < max_attempts
                       AND hold_kind IS NULL
                       -- 任务已在决策落地后进入 done/cancelled：即使队列项仍是非终态（例如 force
@@ -589,6 +607,7 @@ public sealed class QueueService
                           last_error_code, last_error, created_at, updated_at;
                 """;
             AddParameter(command, "$owner", ownerId);
+            AddParameter(command, "$token", leaseToken);
             AddParameter(command, "$expires", expires);
             AddParameter(command, "$now", now);
             for (var index = 0; index < excluded.Length; index++)
@@ -630,17 +649,22 @@ public sealed class QueueService
         }
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-        return item is null || attemptId is null ? null : new ClaimedQueueItem(item, attemptId);
+        return item is null || attemptId is null ? null : new ClaimedQueueItem(item, attemptId, leaseToken);
     }
 
-    /// <summary>续租：只有当前持有者能续期。</summary>
+    /// <summary>
+    /// 续租：只有"状态 + 持有者 + 本轮租约令牌"三者同时匹配才续期。
+    /// 令牌条件排除 owner 相同但已换租约的情况（回收后同进程重认领）。
+    /// </summary>
     /// <param name="queueItemId">队列项 id。</param>
     /// <param name="ownerId">持有者标识。</param>
+    /// <param name="leaseToken">本轮租约令牌。</param>
     /// <param name="lease">新的租约时长。</param>
     /// <param name="cancellationToken">取消令牌。</param>
     public async Task<bool> HeartbeatAsync(
         string queueItemId,
         string ownerId,
+        string leaseToken,
         TimeSpan lease,
         CancellationToken cancellationToken = default)
     {
@@ -652,6 +676,7 @@ public sealed class QueueService
             .Where(item =>
                 item.Id == queueItemId &&
                 item.LeaseOwner == ownerId &&
+                item.LeaseToken == leaseToken &&
                 (item.Status == "claimed" || item.Status == "running"))
             .ExecuteUpdateAsync(
                 setters => setters
@@ -663,7 +688,15 @@ public sealed class QueueService
         return affected == 1;
     }
 
-    /// <summary>回收租约过期的队列项：相关 attempt 记为 abandoned，队列项回到 pending。</summary>
+    /// <summary>
+    /// 回收租约过期的队列项：仍处于执行中（<c>ended_at IS NULL</c>）的 attempt 记为
+    /// <c>abandoned + LEASE_EXPIRED</c>，队列项回到 pending 并清空租约与令牌。
+    /// <para>
+    /// <c>LEASE_EXPIRED</c> 只表示租约自然失效，与 <c>SUPERSEDED_BY_DECISION</c>（有决策落地、
+    /// 旧回合被主动作废）语义不同，不能互相顶替。attempt 的终态写入是条件更新，
+    /// 回收后迟到的旧心跳/旧回合收尾不会覆盖这里的结论。
+    /// </para>
+    /// </summary>
     /// <param name="cancellationToken">取消令牌。</param>
     /// <returns>被回收的队列项数量。</returns>
     public async Task<int> ReclaimExpiredAsync(CancellationToken cancellationToken = default)
@@ -690,7 +723,7 @@ public sealed class QueueService
                     setters => setters
                         .SetProperty(attempt => attempt.EndedAt, now)
                         .SetProperty(attempt => attempt.Outcome, "abandoned")
-                        .SetProperty(attempt => attempt.ErrorCode, "LEASE_EXPIRED"),
+                        .SetProperty(attempt => attempt.ErrorCode, DevHubErrorCodes.LeaseExpired),
                     cancellationToken)
                 .ConfigureAwait(false);
         }
@@ -701,7 +734,8 @@ public sealed class QueueService
                     .SetProperty(item => item.Status, "pending")
                     .SetProperty(item => item.LeaseOwner, (string?)null)
                     .SetProperty(item => item.LeaseExpiresAt, (string?)null)
-                    .SetProperty(item => item.LastErrorCode, "LEASE_EXPIRED")
+                    .SetProperty(item => item.LeaseToken, string.Empty)
+                    .SetProperty(item => item.LastErrorCode, DevHubErrorCodes.LeaseExpired)
                     .SetProperty(item => item.LastError, "租约过期，已自动回收")
                     .SetProperty(item => item.UpdatedAt, now),
                 cancellationToken)

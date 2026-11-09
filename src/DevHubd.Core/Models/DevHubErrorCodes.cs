@@ -110,9 +110,33 @@ public static class DevHubErrorCodes
     /// <summary>进程重启导致上一个进程的回合中断（attempt 兜底为 abandoned）。</summary>
     public const string ProcessRestart = "PROCESS_RESTART";
 
+    /// <summary>
+    /// 租约到期且无人续租，由调度器回收：只说明"这一轮租约自然失效"，
+    /// 不代表任何决策，也不代表旧回合被谁主动作废。与 <see cref="SupersededByDecision"/> 互斥。
+    /// </summary>
+    public const string LeaseExpired = "LEASE_EXPIRED";
+
+    /// <summary>进程停机导致回合中断（attempt 记 abandoned，队列项置 cancelled）。</summary>
+    public const string Shutdown = "SHUTDOWN";
+
     /// <summary>队列项认领失败（attempt 写入冲突等），该项已推迟、不计入重试预算。</summary>
     public const string ClaimFailed = "CLAIM_FAILED";
 
-    /// <summary>审批已落地，同任务其余非终态队列项被取消（通常是 force 造出的并行项）。</summary>
+    /// <summary>
+    /// 决策已落地或租约已被他人接管，旧回合被主动作废（attempt 记 abandoned + lease_lost）。
+    /// 与 <see cref="LeaseExpired"/> 的区别：后者是租约自然过期，前者是"有人已经做出选择"。
+    /// </summary>
     public const string SupersededByDecision = "SUPERSEDED_BY_DECISION";
+
+    /// <summary>
+    /// 基础设施原因造成的 abandoned 回合错误码：租约过期/丢失、进程重启、停机。
+    /// 这些回合没有把任务推进到可判定成败的状态，不由任务买单，不计入消耗性重试预算。
+    /// 认领预算谓词与 <c>ExecutionStore.CountConsumingAttemptsAsync</c> 共用这一集合。
+    /// </summary>
+    public static readonly string[] InfrastructureAbandonCodes =
+    {
+        LeaseExpired,
+        ProcessRestart,
+        Shutdown,
+    };
 }

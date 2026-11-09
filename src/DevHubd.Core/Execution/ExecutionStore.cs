@@ -72,32 +72,56 @@ public sealed class ExecutionStore
     {
     }
 
-    /// <summary>把队列项置为 running（认领后的执行开始）。</summary>
+    /// <summary>
+    /// 把队列项置为 running（认领后的执行开始）。只有"状态 <c>claimed</c> + 持有者 + 本轮令牌"
+    /// 三者同时匹配才迁移：否则说明认领与置 running 之间该项已被决策取消、或被回收后重新认领，
+    /// 无条件写入会把已 <c>cancelled</c> 的行改回 <c>running</c> 且租约为空，永远回收不到。
+    /// </summary>
     /// <param name="queueItemId">队列项 id。</param>
+    /// <param name="ownerId">执行者标识（租约持有者）。</param>
+    /// <param name="leaseToken">本轮租约令牌。</param>
     /// <param name="now">时间戳。</param>
     /// <param name="cancellationToken">取消令牌。</param>
-    public async Task MarkRunningAsync(
+    /// <returns>true 表示本次调用完成了 claimed → running 迁移。</returns>
+    public async Task<bool> MarkRunningAsync(
         string queueItemId,
+        string ownerId,
+        string leaseToken,
         string now,
         CancellationToken cancellationToken = default)
     {
         await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
-        await db.QueueItems
-            .Where(item => item.Id == queueItemId)
+        var affected = await db.QueueItems
+            .Where(item =>
+                item.Id == queueItemId &&
+                item.Status == "claimed" &&
+                item.LeaseOwner == ownerId &&
+                item.LeaseToken == leaseToken)
             .ExecuteUpdateAsync(
                 setters => setters
                     .SetProperty(item => item.Status, "running")
                     .SetProperty(item => item.UpdatedAt, now),
                 cancellationToken)
             .ConfigureAwait(false);
+
+        return affected == 1;
     }
 
-    /// <summary>写入 attempt 终态。</summary>
+    /// <summary>
+    /// 写入 attempt 终态，先写者胜：只有 <c>ended_at IS NULL</c> 的行会被更新。
+    /// <para>
+    /// 回收器可能已经把同一 attempt 写成 <c>abandoned + LEASE_EXPIRED</c>，随后旧回合的收尾/
+    /// 旧心跳才到达；无条件整行覆盖会把 <c>ended_at</c> 和错误语义一起改写（实测已发生）。
+    /// 条件更新保证已经终态的行不再被覆盖。调用方需要区分"自己写成功"与"别人已先写"时，
+    /// 用返回的 bool 判断即可。
+    /// </para>
+    /// </summary>
     /// <param name="attemptId">attempt id。</param>
     /// <param name="completion">终态参数。</param>
     /// <param name="now">时间戳。</param>
     /// <param name="cancellationToken">取消令牌。</param>
-    public async Task CompleteAttemptAsync(
+    /// <returns>true 表示本次调用写入了终态；false 表示 attempt 不存在或已终态。</returns>
+    public async Task<bool> CompleteAttemptAsync(
         string attemptId,
         AttemptCompletion completion,
         string now,
@@ -105,31 +129,28 @@ public sealed class ExecutionStore
     {
         await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
 
-        var attempt = await db.Attempts
-            .FirstOrDefaultAsync(item => item.Id == attemptId, cancellationToken)
+        var affected = await db.Attempts
+            .Where(attempt => attempt.Id == attemptId && attempt.EndedAt == null)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(attempt => attempt.EndedAt, now)
+                    .SetProperty(attempt => attempt.Outcome, completion.Outcome)
+                    // 只有确实拿到模型名时才覆盖，等价于 COALESCE($model, model)。
+                    .SetProperty(attempt => attempt.Model, attempt => completion.Model ?? attempt.Model)
+                    .SetProperty(attempt => attempt.ErrorKind, completion.ErrorKind)
+                    .SetProperty(attempt => attempt.ErrorCode, completion.ErrorCode)
+                    .SetProperty(attempt => attempt.ToolCalls, completion.ToolCalls)
+                    .SetProperty(attempt => attempt.InputTokens, completion.InputTokens)
+                    .SetProperty(attempt => attempt.OutputTokens, completion.OutputTokens)
+                    .SetProperty(attempt => attempt.UsageEstimated, completion.UsageEstimated)
+                    .SetProperty(attempt => attempt.UsageAvailable, completion.UsageAvailable)
+                    .SetProperty(attempt => attempt.RoundsExhausted, completion.RoundsExhausted)
+                    .SetProperty(attempt => attempt.FilesChanged, completion.FilesChanged)
+                    .SetProperty(attempt => attempt.Summary, completion.Summary),
+                cancellationToken)
             .ConfigureAwait(false);
 
-        if (attempt is null)
-        {
-            return;
-        }
-
-        attempt.EndedAt = now;
-        attempt.Outcome = completion.Outcome;
-        // 与既有 COALESCE($model, model) 等价：只有确实拿到模型名时才覆盖。
-        attempt.Model = completion.Model ?? attempt.Model;
-        attempt.ErrorKind = completion.ErrorKind;
-        attempt.ErrorCode = completion.ErrorCode;
-        attempt.ToolCalls = completion.ToolCalls;
-        attempt.InputTokens = completion.InputTokens;
-        attempt.OutputTokens = completion.OutputTokens;
-        attempt.UsageEstimated = completion.UsageEstimated;
-        attempt.UsageAvailable = completion.UsageAvailable;
-        attempt.RoundsExhausted = completion.RoundsExhausted;
-        attempt.FilesChanged = completion.FilesChanged;
-        attempt.Summary = completion.Summary;
-
-        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        return affected == 1;
     }
 
     /// <summary>把队列项置为终态（succeeded / dead / cancelled）。</summary>
@@ -155,6 +176,7 @@ public sealed class ExecutionStore
                     .SetProperty(item => item.Status, status)
                     .SetProperty(item => item.LeaseOwner, (string?)null)
                     .SetProperty(item => item.LeaseExpiresAt, (string?)null)
+                    .SetProperty(item => item.LeaseToken, string.Empty)
                     .SetProperty(item => item.LastErrorCode, errorCode)
                     .SetProperty(item => item.LastError, lastError)
                     .SetProperty(item => item.UpdatedAt, now),
@@ -163,18 +185,21 @@ public sealed class ExecutionStore
     }
 
     /// <summary>
-    /// 仅当队列项仍由指定执行者持有且处于 <c>claimed/running</c> 时置为 <c>succeeded</c>。
+    /// 仅当队列项仍由"状态 + 持有者 + 本轮令牌"确认属于本次回合时置为 <c>succeeded</c>。
     /// 条件更新是原子闸门：决策可能在上一次心跳成功后把该项置 <c>cancelled</c>，
-    /// 返回 false 时调用方必须丢弃回合结果，不能覆盖终态。
+    /// 或者租约已被回收并由同进程重新认领（owner 相同、令牌不同）。
+    /// 返回 false 时调用方必须丢弃回合结果，不能覆盖终态或新租约。
     /// </summary>
     /// <param name="queueItemId">队列项 id。</param>
     /// <param name="ownerId">执行者标识（租约持有者）。</param>
+    /// <param name="leaseToken">本轮租约令牌。</param>
     /// <param name="now">时间戳。</param>
     /// <param name="cancellationToken">取消令牌。</param>
     /// <returns>true 表示本次调用完成了终态迁移。</returns>
     public async Task<bool> TrySetSucceededAsync(
         string queueItemId,
         string ownerId,
+        string leaseToken,
         string now,
         CancellationToken cancellationToken = default)
     {
@@ -183,14 +208,60 @@ public sealed class ExecutionStore
             .Where(item =>
                 item.Id == queueItemId &&
                 item.LeaseOwner == ownerId &&
+                item.LeaseToken == leaseToken &&
                 (item.Status == "claimed" || item.Status == "running"))
             .ExecuteUpdateAsync(
                 setters => setters
                     .SetProperty(item => item.Status, "succeeded")
                     .SetProperty(item => item.LeaseOwner, (string?)null)
                     .SetProperty(item => item.LeaseExpiresAt, (string?)null)
+                    .SetProperty(item => item.LeaseToken, string.Empty)
                     .SetProperty(item => item.LastErrorCode, (string?)null)
                     .SetProperty(item => item.LastError, (string?)null)
+                    .SetProperty(item => item.UpdatedAt, now),
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        return affected == 1;
+    }
+
+    /// <summary>
+    /// 仅当队列项仍由"状态 + 持有者 + 本轮令牌"确认属于本次回合时置为 <c>cancelled</c>。
+    /// 停机收尾与心跳可能并发：心跳已经把租约续给别的回合、或回收器已清空租约时，
+    /// 这里返回 false，调用方不再覆盖队列终态（attempt 的终态写入本身已幂等）。
+    /// </summary>
+    /// <param name="queueItemId">队列项 id。</param>
+    /// <param name="ownerId">执行者标识（租约持有者）。</param>
+    /// <param name="leaseToken">本轮租约令牌。</param>
+    /// <param name="errorCode">错误码（通常为 <c>SHUTDOWN</c>）。</param>
+    /// <param name="lastError">错误说明。</param>
+    /// <param name="now">时间戳。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    /// <returns>true 表示本次调用完成了终态迁移。</returns>
+    public async Task<bool> TrySetCancelledAsync(
+        string queueItemId,
+        string ownerId,
+        string leaseToken,
+        string errorCode,
+        string lastError,
+        string now,
+        CancellationToken cancellationToken = default)
+    {
+        await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var affected = await db.QueueItems
+            .Where(item =>
+                item.Id == queueItemId &&
+                item.LeaseOwner == ownerId &&
+                item.LeaseToken == leaseToken &&
+                (item.Status == "claimed" || item.Status == "running"))
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(item => item.Status, "cancelled")
+                    .SetProperty(item => item.LeaseOwner, (string?)null)
+                    .SetProperty(item => item.LeaseExpiresAt, (string?)null)
+                    .SetProperty(item => item.LeaseToken, string.Empty)
+                    .SetProperty(item => item.LastErrorCode, errorCode)
+                    .SetProperty(item => item.LastError, lastError)
                     .SetProperty(item => item.UpdatedAt, now),
                 cancellationToken)
             .ConfigureAwait(false);
@@ -225,6 +296,7 @@ public sealed class ExecutionStore
                     .SetProperty(item => item.Status, "pending")
                     .SetProperty(item => item.LeaseOwner, (string?)null)
                     .SetProperty(item => item.LeaseExpiresAt, (string?)null)
+                    .SetProperty(item => item.LeaseToken, string.Empty)
                     .SetProperty(item => item.AvailableAt, availableAt)
                     .SetProperty(item => item.LastErrorCode, errorCode)
                     .SetProperty(item => item.LastError, lastError)
@@ -234,9 +306,15 @@ public sealed class ExecutionStore
     }
 
     /// <summary>
-    /// 统计该队列项已消耗重试预算的回合数：排除 <c>NEEDS_INPUT</c> 回合，
-    /// 以及 <see cref="ModelErrorKinds.BudgetExempt"/>（auth / quota / no_model / bridge_down）资源类失败。
-    /// 提问挂起与 provider 自身不可用都不该由任务买单；认领闸门与失败重试上限共用这一口径。
+    /// 统计该队列项已消耗重试预算的回合数：排除 <c>NEEDS_INPUT</c> 回合、
+    /// <see cref="ModelErrorKinds.BudgetExempt"/>（auth / quota / no_model / bridge_down）资源类失败，
+    /// 以及基础设施原因（<see cref="DevHubErrorCodes.InfrastructureAbandonCodes"/> 与
+    /// <see cref="ModelErrorKinds.LeaseLost"/>）导致的 abandoned 回合。
+    /// <para>
+    /// 提问挂起、provider 自身不可用、租约过期/丢失、进程重启、停机都不该由任务买单：
+    /// 这些回合没有把任务推进到可判定成败的状态，计进去会让一次基础设施抖动直接吃掉重试预算。
+    /// 认领闸门（<c>QueueService.ClaimDetailedAsync</c>）与失败重试上限共用这一口径。
+    /// </para>
     /// </summary>
     /// <param name="queueItemId">队列项 id。</param>
     /// <param name="cancellationToken">取消令牌。</param>
@@ -245,13 +323,16 @@ public sealed class ExecutionStore
         CancellationToken cancellationToken = default)
     {
         var exemptKinds = ModelErrorKinds.BudgetExempt;
+        var exemptCodes = DevHubErrorCodes.InfrastructureAbandonCodes;
         await using var db = await _contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         return await db.Attempts
             .AsNoTracking()
             .CountAsync(
                 attempt => attempt.QueueItemId == queueItemId &&
                            (attempt.ErrorCode == null || attempt.ErrorCode != DevHubErrorCodes.NeedsInput) &&
-                           (attempt.ErrorKind == null || !exemptKinds.Contains(attempt.ErrorKind)),
+                           (attempt.ErrorCode == null || !exemptCodes.Contains(attempt.ErrorCode)) &&
+                           (attempt.ErrorKind == null || !exemptKinds.Contains(attempt.ErrorKind)) &&
+                           (attempt.ErrorKind == null || attempt.ErrorKind != ModelErrorKinds.LeaseLost),
                 cancellationToken)
             .ConfigureAwait(false);
     }
@@ -282,6 +363,7 @@ public sealed class ExecutionStore
                     .SetProperty(item => item.HoldRef, inputRequestId)
                     .SetProperty(item => item.LeaseOwner, (string?)null)
                     .SetProperty(item => item.LeaseExpiresAt, (string?)null)
+                    .SetProperty(item => item.LeaseToken, string.Empty)
                     .SetProperty(item => item.AvailableAt, now)
                     .SetProperty(item => item.LastErrorCode, (string?)null)
                     .SetProperty(item => item.LastError, (string?)null)

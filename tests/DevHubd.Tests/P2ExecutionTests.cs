@@ -1074,6 +1074,180 @@ public sealed class P2ExecutionTests : IDisposable
         Assert.Equal("SUPERSEDED_BY_DECISION", await ScalarStringAsync("SELECT error_code FROM attempt;", ct));
     }
 
+    /// <summary>
+    /// 第七轮 1：回收器先把 attempt 写成 abandoned/LEASE_EXPIRED 后，旧回合迟到的收尾
+    /// 不得整行覆盖终态（ended_at 与错误语义都要保持"先写者"的结论）。
+    /// </summary>
+    [Fact]
+    public async Task Reclaim_WhenStaleCompletionArrives_KeepsFirstAttemptTerminalStateAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "写一份报告", "ready", 10);
+        await PrepareQueueAsync(ct);
+
+        // 真实时序：短租约 → 过期回收先落终态 → 旧回合/旧心跳的收尾后到。
+        var claimed = await _queue.ClaimDetailedAsync("owner-a", TimeSpan.FromMilliseconds(1), ct);
+        Assert.NotNull(claimed);
+        var itemId = claimed!.Item.Id;
+
+        await Task.Delay(40, ct);
+        Assert.Equal(1, await _queue.ReclaimExpiredAsync(ct));
+
+        var reclaimedEndedAt = await ScalarStringAsync(
+            $"SELECT ended_at FROM attempt WHERE queue_item_id = '{itemId}';", ct);
+        Assert.NotNull(reclaimedEndedAt);
+
+        // 旧回合迟到的收尾：模拟 CompleteAttemptAsync 再次被调用。
+        await _store.CompleteAttemptAsync(
+            claimed.AttemptId,
+            new AttemptCompletion(
+                "abandoned",
+                null,
+                ModelErrorKinds.LeaseLost,
+                DevHubErrorCodes.SupersededByDecision,
+                0,
+                null,
+                null,
+                false,
+                false,
+                false,
+                0,
+                "旧回合迟到收尾。"),
+            DateTimeOffset.UtcNow.AddMinutes(1).ToString("O"),
+            ct);
+
+        Assert.Equal("abandoned", await ScalarStringAsync(
+            $"SELECT outcome FROM attempt WHERE queue_item_id = '{itemId}';", ct));
+        Assert.Equal("LEASE_EXPIRED", await ScalarStringAsync(
+            $"SELECT error_code FROM attempt WHERE queue_item_id = '{itemId}';", ct));
+        Assert.Null(await ScalarStringAsync(
+            $"SELECT error_kind FROM attempt WHERE queue_item_id = '{itemId}';", ct));
+        Assert.Equal(reclaimedEndedAt, await ScalarStringAsync(
+            $"SELECT ended_at FROM attempt WHERE queue_item_id = '{itemId}';", ct));
+    }
+
+    /// <summary>
+    /// 第七轮 2：一次租约过期（abandoned/LEASE_EXPIRED）加一次 model_error 后，
+    /// 消耗性预算仍只算 1 次，max_attempts=2 时队列项必须还能被认领重试。
+    /// </summary>
+    [Fact]
+    public async Task Claim_AfterLeaseExpiryAndModelError_StillHasRetryBudgetAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "写一份报告", "ready", 10);
+        await PrepareQueueAsync(ct);
+
+        var first = await _queue.ClaimDetailedAsync("owner-a", TimeSpan.FromMilliseconds(1), ct);
+        Assert.NotNull(first);
+        var itemId = first!.Item.Id;
+
+        await Task.Delay(40, ct);
+        Assert.Equal(1, await _queue.ReclaimExpiredAsync(ct));
+
+        // 第二次真实回合是 model_error：它消耗预算，租约过期那次不该消耗。
+        await ExecuteAsync(
+            $$"""
+            INSERT INTO attempt (
+                id, queue_item_id, attempt_no, provider, started_at, ended_at, outcome, error_kind, error_code)
+            VALUES (
+                'a2', '{{itemId}}', 2, 'openai', '2026-01-01T00:00:00Z', '2026-01-01T00:00:01Z',
+                'failed', 'model_error', 'MODEL_ERROR');
+
+            UPDATE queue_item
+            SET status = 'pending', attempt = 2, max_attempts = 2,
+                lease_owner = NULL, lease_expires_at = NULL,
+                available_at = '2026-01-01T00:00:00Z', hold_kind = NULL, hold_ref = NULL
+            WHERE id = '{{itemId}}';
+            """,
+            ct);
+
+        Assert.Equal(1, await _store.CountConsumingAttemptsAsync(itemId, ct));
+
+        var retried = await _queue.ClaimDetailedAsync("owner-b", TimeSpan.FromMinutes(5), ct);
+        Assert.NotNull(retried);
+        Assert.Equal(itemId, retried!.Item.Id);
+    }
+
+    /// <summary>
+    /// 第七轮 3：同进程回收后重新认领会得到相同的 owner，但令牌必须不同；
+    /// 旧回合的成功落库、置 running、取消收尾一律因令牌不匹配而失败，不能落到新租约上。
+    /// </summary>
+    [Fact]
+    public async Task Settle_WithStaleLeaseToken_DoesNotOverwriteNewLeaseAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "写一份报告", "ready", 10);
+        await PrepareQueueAsync(ct);
+
+        var first = await _queue.ClaimDetailedAsync("owner-a", TimeSpan.FromMilliseconds(1), ct);
+        Assert.NotNull(first);
+        var itemId = first!.Item.Id;
+
+        await Task.Delay(40, ct);
+        Assert.Equal(1, await _queue.ReclaimExpiredAsync(ct));
+
+        var second = await _queue.ClaimDetailedAsync("owner-a", TimeSpan.FromMinutes(5), ct);
+        Assert.NotNull(second);
+        Assert.NotEqual(string.Empty, first.LeaseToken);
+        Assert.NotEqual(first.LeaseToken, second!.LeaseToken);
+
+        var now = DateTimeOffset.UtcNow.ToString("O");
+        Assert.False(await _store.MarkRunningAsync(itemId, "owner-a", first.LeaseToken, now, ct));
+        Assert.False(await _store.TrySetSucceededAsync(itemId, "owner-a", first.LeaseToken, now, ct));
+        Assert.False(await _store.TrySetCancelledAsync(
+            itemId, "owner-a", first.LeaseToken, DevHubErrorCodes.Shutdown, "旧回合收尾。", now, ct));
+
+        Assert.Equal("claimed", await ScalarStringAsync(
+            $"SELECT status FROM queue_item WHERE id = '{itemId}';", ct));
+        Assert.Equal(second.LeaseToken, await ScalarStringAsync(
+            $"SELECT lease_token FROM queue_item WHERE id = '{itemId}';", ct));
+
+        Assert.True(await _store.TrySetSucceededAsync(itemId, "owner-a", second.LeaseToken, now, ct));
+        Assert.Equal("succeeded", await ScalarStringAsync(
+            $"SELECT status FROM queue_item WHERE id = '{itemId}';", ct));
+    }
+
+    /// <summary>
+    /// 第七轮 4：supersede 落在"认领已提交、MarkRunning 未执行"之间时，
+    /// 置 running 必须因状态/令牌不匹配而失败，不能把已 cancelled 的行改回 running。
+    /// </summary>
+    [Fact]
+    public async Task MarkRunning_WhenCancelledBetweenClaimAndMark_ReturnsFalseAsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = CreateWorkspace("alpha");
+        WriteWorkspaces(("alpha", root));
+        WriteTask(root, "T-001", "写一份报告", "ready", 10);
+        await PrepareQueueAsync(ct);
+
+        var claimed = await _queue.ClaimDetailedAsync("owner-a", TimeSpan.FromMinutes(5), ct);
+        Assert.NotNull(claimed);
+        var itemId = claimed!.Item.Id;
+
+        // 模拟决策 supersede 在认领提交后、MarkRunning 之前落地：置 cancelled 并清空租约。
+        await ExecuteAsync(
+            $"""
+            UPDATE queue_item
+            SET status = 'cancelled', lease_owner = NULL, lease_expires_at = NULL, lease_token = '',
+                last_error_code = '{DevHubErrorCodes.SupersededByDecision}'
+            WHERE id = '{itemId}';
+            """,
+            ct);
+
+        Assert.False(await _store.MarkRunningAsync(
+            itemId, "owner-a", claimed.LeaseToken, DateTimeOffset.UtcNow.ToString("O"), ct));
+        Assert.Equal("cancelled", await ScalarStringAsync(
+            $"SELECT status FROM queue_item WHERE id = '{itemId}';", ct));
+        Assert.Null(await ScalarStringAsync(
+            $"SELECT lease_owner FROM queue_item WHERE id = '{itemId}';", ct));
+    }
+
     /// <summary>轮询等待条件成立；超时返回 false 而不是抛异常。</summary>
     /// <param name="condition">条件。</param>
     /// <param name="cancellationToken">取消令牌。</param>

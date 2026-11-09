@@ -209,6 +209,7 @@ public sealed class InputRequestStore
                     .SetProperty(item => item.HoldRef, (string?)null)
                     .SetProperty(item => item.LeaseOwner, (string?)null)
                     .SetProperty(item => item.LeaseExpiresAt, (string?)null)
+                    .SetProperty(item => item.LeaseToken, string.Empty)
                     .SetProperty(item => item.LastErrorCode, "TASK_CHANGED")
                     .SetProperty(item => item.LastError, "任务内容已变更，旧的问题单已取消。")
                     .SetProperty(item => item.UpdatedAt, now),
@@ -543,6 +544,9 @@ public sealed class InputRequestStore
                     .SetProperty(item => item.Status, "cancelled")
                     .SetProperty(item => item.HoldKind, (string?)null)
                     .SetProperty(item => item.HoldRef, (string?)null)
+                    .SetProperty(item => item.LeaseOwner, (string?)null)
+                    .SetProperty(item => item.LeaseExpiresAt, (string?)null)
+                    .SetProperty(item => item.LeaseToken, string.Empty)
                     .SetProperty(item => item.LastErrorCode, DevHubErrorCodes.InputRequestClosed)
                     .SetProperty(item => item.LastError, "问题单已被人工撤销。")
                     .SetProperty(item => item.UpdatedAt, now),
@@ -653,6 +657,7 @@ public sealed class InputRequestStore
                     .SetProperty(item => item.HoldRef, (string?)null)
                     .SetProperty(item => item.LeaseOwner, (string?)null)
                     .SetProperty(item => item.LeaseExpiresAt, (string?)null)
+                    .SetProperty(item => item.LeaseToken, string.Empty)
                     .SetProperty(item => item.LastErrorCode, DevHubErrorCodes.InputTimeout)
                     .SetProperty(item => item.LastError, "等待回答超时。")
                     .SetProperty(item => item.UpdatedAt, now),

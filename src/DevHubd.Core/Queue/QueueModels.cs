@@ -68,8 +68,11 @@ public sealed record ManualEnqueueResult(
     string Status,
     string? Provider);
 
-/// <summary>认领结果：队列项与本次 attempt id（执行器回写终态时使用）。</summary>
-public sealed record ClaimedQueueItem(QueueItem Item, string AttemptId);
+/// <summary>认领结果：队列项、本次 attempt id 与本轮租约令牌（执行器续租/落库/收尾时使用）。</summary>
+/// <param name="Item">队列项投影。</param>
+/// <param name="AttemptId">本次 attempt id。</param>
+/// <param name="LeaseToken">本轮租约令牌：owner 相同也能区分先后租约，令牌不匹配即视为过期回合。</param>
+public sealed record ClaimedQueueItem(QueueItem Item, string AttemptId, string LeaseToken);
 
 /// <summary>task_view 中任务的最小投影。</summary>
 public sealed record TaskRow(string Id, string Title, string Status, string ContentHash, int Priority);
